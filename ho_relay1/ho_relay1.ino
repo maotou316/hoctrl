@@ -194,7 +194,7 @@ WebServer server(80);
 WiFiClient espClient; // MQTT 客戶端
 PubSubClient mqttClient(espClient);
 
-char mqttServer[32] = "broker.MQTTGO.io"; // 預設 MQTT 伺服器
+char mqttServer[32] = "mqttgo.io"; // 預設 MQTT 伺服器
 const int mqttPort = 1883;
 
 bool relayState = false;

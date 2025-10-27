@@ -13,12 +13,6 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 
 // uPesy ESP32 WROOM DevKit
-
-// 檢查是否支援藍芽
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run `make menuconfig` enable it
-#endif
-
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
 const unsigned long LONG_BLINK = 800;   // 長閃持續時間 (毫秒)
@@ -38,7 +32,7 @@ BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
 
-const char* firmwareVersion = "1.1.1"; // 當前韌體版本
+const char* firmwareVersion = "1.2.0"; // 當前韌體版本
 const char* deviceModel = "hoRelay2"; // 設備型號
 
 // ESP32-C3 GPIO 定義
@@ -64,13 +58,38 @@ int failedAttempts = 0;               // MQTT 重試次數計數器
 bool isAPMode = false;                // AP 模式標誌
 bool relayState = false;              // 繼電器狀態
 
-// WiFi 設定
-char ssid[32] = "";
-char password[32] = "";
-char mqttServer[32] = "broker.MQTTGO.io"; // 預設 MQTT 伺服器
+// WiFi 設定（預設值）
+char ssid[32] = "HBTech";
+char password[32] = "94051311";
 
-// MQTT 相關
-const int mqttPort = 1883;
+// 自訂 MQTT 伺服器設定（透過 App 配置，儲存在 EEPROM）
+char mqttServer[32] = "";
+char mqttUsername[16] = "";
+char mqttPassword[16] = "";
+int mqttPort = 1883;
+
+// MQTT 伺服器配置結構
+struct MqttServerConfig {
+    const char* server;
+    int port;
+    const char* username;
+    const char* password;
+    const char* displayName;
+};
+
+// 5 個預設伺服器配置（所有資訊寫死在這裡）
+const MqttServerConfig DEFAULT_SERVERS[5] = {
+    // 伺服器地址, Port, 帳號, 密碼, 顯示名稱
+    {"mqttgo.io", 1883, NULL, NULL, "台灣 MQTT Go"},
+    {"broker.hoban.tw", 1883, NULL, NULL, "齁斑社企"},  // ← 請修改為實際帳密
+    {"mqtt.eclipseprojects.io", 1883, NULL, NULL, "Eclipse"},
+    {"broker.emqx.io", 1883, NULL, NULL, "EMQX 公共"},
+    {"broker.hivemq.com", 1883, NULL, NULL, "HiveMQ 公共"}
+};
+
+const int SERVER_COUNT = 5;
+int currentServerIndex = 0;         // 當前使用的伺服器索引
+bool useCustomServer = false;       // 是否使用自訂伺服器
 
 WiFiClient espClient; // MQTT 客戶端
 PubSubClient mqttClient(espClient);
@@ -104,25 +123,72 @@ void clearWiFiConfig();
 
 // WiFi 設定相關函數實作
 void saveWiFiConfig() {
-  EEPROM.begin(128);  // 增加 EEPROM 大小以儲存 MQTT 設定
+  EEPROM.begin(128);
+  // 儲存 WiFi 設定
   for (int i = 0; i < 32; i++) {
     EEPROM.write(i, ssid[i]);
     EEPROM.write(i + 32, password[i]);
-    EEPROM.write(i + 64, mqttServer[i]);  // 儲存 MQTT 伺服器設定
   }
+  // 儲存自訂 MQTT 伺服器設定
+  for (int i = 0; i < 32; i++) {
+    EEPROM.write(i + 64, mqttServer[i]);
+  }
+  // 儲存 MQTT 認證資訊
+  for (int i = 0; i < 16; i++) {
+    EEPROM.write(i + 98, mqttUsername[i]);   // 98-113: MQTT 帳號
+    EEPROM.write(i + 114, mqttPassword[i]);  // 114-129: MQTT 密碼
+  }
+  // 儲存 MQTT Port (2 bytes)
+  EEPROM.write(126, mqttPort & 0xFF);        // 低位元組
+  EEPROM.write(127, (mqttPort >> 8) & 0xFF); // 高位元組
+
   EEPROM.commit();
 }
 
 void loadWiFiConfig() {
-  EEPROM.begin(128);  // 增加 EEPROM 大小以讀取 MQTT 設定
+  EEPROM.begin(128);
+
+  // 檢查 EEPROM 是否已初始化（檢查第一個字元是否為可列印字元或 NULL）
+  char firstChar = EEPROM.read(0);
+  bool isEEPROMValid = (firstChar >= 32 && firstChar <= 126) || firstChar == 0;
+
+  if (!isEEPROMValid) {
+    // EEPROM 未初始化或資料無效，使用預設值並儲存
+    Serial.println("EEPROM 未初始化，使用預設 WiFi 設定");
+    // ssid 和 password 已經有預設值（HBTech / 94051311）
+    // mqttServer 等保持空白
+    saveWiFiConfig();  // 將預設值寫入 EEPROM
+    return;
+  }
+
+  // 讀取 WiFi 設定
   for (int i = 0; i < 32; i++) {
     ssid[i] = EEPROM.read(i);
     password[i] = EEPROM.read(i + 32);
-    mqttServer[i] = EEPROM.read(i + 64);  // 讀取 MQTT 伺服器設定
   }
+  // 讀取自訂 MQTT 伺服器設定
+  for (int i = 0; i < 32; i++) {
+    mqttServer[i] = EEPROM.read(i + 64);
+  }
+  // 讀取 MQTT 認證資訊
+  for (int i = 0; i < 16; i++) {
+    mqttUsername[i] = EEPROM.read(i + 98);   // 98-113: MQTT 帳號
+    mqttPassword[i] = EEPROM.read(i + 114);  // 114-129: MQTT 密碼
+  }
+  // 讀取 MQTT Port (2 bytes)
+  mqttPort = EEPROM.read(126) | (EEPROM.read(127) << 8);
+  if (mqttPort == 0 || mqttPort == 0xFFFF) {
+    mqttPort = 1883;  // 預設值
+  }
+
+  // 設置字串結尾
   ssid[31] = '\0';
   password[31] = '\0';
   mqttServer[31] = '\0';
+  mqttUsername[15] = '\0';
+  mqttPassword[15] = '\0';
+
+  Serial.printf("已從 EEPROM 載入 WiFi 設定: %s\n", ssid);
 }
 
 void clearWiFiConfig() {
@@ -214,50 +280,75 @@ class MyCallbacks: public BLECharacteristicCallbacks {
             Serial.println(buffer);
             
             // 建立 JSON 文件
-            StaticJsonDocument<200> doc;
+            StaticJsonDocument<512> doc;  // 增加容量以支援認證資訊
             DeserializationError error = deserializeJson(doc, buffer);
-            
+
             if (!error) {
                 // 檢查是否有 wifi 物件
                 if (doc.containsKey("wifi")) {
                     const char* newSSID = doc["wifi"]["ssid"];
                     const char* newPassword = doc["wifi"]["password"];
-                    const char* newMqttServer = doc["wifi"]["server"];  // 修改這裡
-                    
-                    Serial.println(newMqttServer);
-                    Serial.println(newSSID);
-                    Serial.println(newPassword);
-                    
+                    const char* newMqttServer = doc["wifi"]["server"];
+                    const char* newMqttUsername = doc["wifi"]["mqtt_username"];  // MQTT 帳號（選用）
+                    const char* newMqttPassword = doc["wifi"]["mqtt_password"];  // MQTT 密碼（選用）
+                    int newMqttPort = doc["wifi"]["mqtt_port"] | 1883;  // MQTT 埠（選用，預設 1883）
+
+                    Serial.println("收到設定：");
+                    Serial.printf("SSID: %s\n", newSSID);
+                    Serial.printf("MQTT Server: %s\n", newMqttServer);
+                    Serial.printf("MQTT Port: %d\n", newMqttPort);
+                    if (newMqttUsername) Serial.printf("MQTT Username: %s\n", newMqttUsername);
+
                     if (newSSID && newPassword && newMqttServer) {
-                        // 複製到全域變數
+                        // 複製 WiFi 設定到全域變數
                         strncpy(ssid, newSSID, sizeof(ssid) - 1);
                         strncpy(password, newPassword, sizeof(password) - 1);
                         strncpy(mqttServer, newMqttServer, sizeof(mqttServer) - 1);
                         ssid[sizeof(ssid) - 1] = '\0';
                         password[sizeof(password) - 1] = '\0';
                         mqttServer[sizeof(mqttServer) - 1] = '\0';
-                        
+
+                        // 複製 MQTT 認證資訊（如果提供）
+                        if (newMqttUsername) {
+                            strncpy(mqttUsername, newMqttUsername, sizeof(mqttUsername) - 1);
+                            mqttUsername[sizeof(mqttUsername) - 1] = '\0';
+                        } else {
+                            mqttUsername[0] = '\0';  // 清空
+                        }
+
+                        if (newMqttPassword) {
+                            strncpy(mqttPassword, newMqttPassword, sizeof(mqttPassword) - 1);
+                            mqttPassword[sizeof(mqttPassword) - 1] = '\0';
+                        } else {
+                            mqttPassword[0] = '\0';  // 清空
+                        }
+
+                        mqttPort = newMqttPort;
+                        useCustomServer = true;  // 標記使用自訂伺服器
+
                         saveWiFiConfig();
-                        
+
                         // 建立回應 JSON
-                        StaticJsonDocument<200> response;
+                        StaticJsonDocument<300> response;
                         response["status"] = "success";
-                        response["message"] = "WiFi設定已儲存";
+                        response["message"] = "WiFi 和 MQTT 設定已儲存";
                         response["data"]["ssid"] = ssid;
                         response["data"]["mqttServer"] = mqttServer;
-                        
+                        response["data"]["mqttPort"] = mqttPort;
+                        response["data"]["hasAuth"] = (strlen(mqttUsername) > 0);
+
                         // 序列化 JSON 到字串
-                        char responseBuffer[200];
+                        char responseBuffer[300];
                         serializeJson(response, responseBuffer);
-                        
+
                         // 印出回應
                         Serial.println("回應：");
                         Serial.println(responseBuffer);
-                        
+
                         // 回傳 JSON 回應
                         pCharacteristic->setValue((uint8_t*)responseBuffer, strlen(responseBuffer));
                         pCharacteristic->notify();
-                        
+
                         free(buffer);
                         delay(2000);
                         ESP.restart();
@@ -265,8 +356,8 @@ class MyCallbacks: public BLECharacteristicCallbacks {
                         // 錯誤回應
                         StaticJsonDocument<200> response;
                         response["status"] = "error";
-                        response["message"] = "SSID或密碼格式錯誤";
-                        
+                        response["message"] = "SSID、密碼或伺服器格式錯誤";
+
                         char responseBuffer[200];
                         serializeJson(response, responseBuffer);
                         pCharacteristic->setValue((uint8_t*)responseBuffer, strlen(responseBuffer));
@@ -343,22 +434,28 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     } else if (message == "reset") {
       Serial.println("收到重置命令，執行重置...");
       clearWiFiConfig();  // 清除 WiFi 設定並重啟
+    } else if (message == "FIND_BEST_SERVER") {
+      // 重新測試所有伺服器並選擇最快的
+      Serial.println("收到重新測試伺服器命令");
+      mqttClient.disconnect();
+      delay(1000);
+      smartConnect();
     } else if (message.startsWith("update:")) {
       // 解析更新命令
       StaticJsonDocument<200> doc;
       DeserializationError error = deserializeJson(doc, message.substring(7));
-      
+
       if (!error) {
         const char* newVersion = doc["version"];
         const char* downloadUrl = doc["url"];
-        
+
         if (newVersion && downloadUrl) {
           Serial.println("收到韌體更新請求");
           Serial.print("新版本：");
           Serial.println(newVersion);
           Serial.print("下載網址：");
           Serial.println(downloadUrl);
-          
+
           // 開始更新程序
           startFirmwareUpdate(downloadUrl);
         }
@@ -426,6 +523,18 @@ void handleRoot()
   html += "<div class='mb-3'>";
   html += "<label class='form-label'>MQTT 伺服器：</label>";
   html += "<input type='text' class='form-control' name='mqtt_server' value='" + String(mqttServer) + "' placeholder='輸入 MQTT 伺服器位址'>";
+  html += "</div>";
+  html += "<div class='mb-3'>";
+  html += "<label class='form-label'>MQTT 埠號：</label>";
+  html += "<input type='number' class='form-control' name='mqtt_port' value='" + String(mqttPort) + "' placeholder='1883'>";
+  html += "</div>";
+  html += "<div class='mb-3'>";
+  html += "<label class='form-label'>MQTT 帳號（選用）：</label>";
+  html += "<input type='text' class='form-control' name='mqtt_username' value='" + String(mqttUsername) + "' placeholder='留空表示無需認證'>";
+  html += "</div>";
+  html += "<div class='mb-3'>";
+  html += "<label class='form-label'>MQTT 密碼（選用）：</label>";
+  html += "<input type='password' class='form-control' name='mqtt_password' placeholder='留空表示無需認證'>";
   html += "</div>";
   html += "<button type='submit' class='btn btn-primary'>更新 MQTT 設定</button>";
   html += "</form>";
@@ -605,9 +714,13 @@ void setup()
 
   loadWiFiConfig();
 
+  // 讀取使用自訂伺服器標誌
+  EEPROM.begin(128);
+  useCustomServer = (EEPROM.read(96) == 1);
+  Serial.printf("使用自訂伺服器: %s\n", useCustomServer ? "是" : "否");
 
   const char* deviceId = getDeviceId();  // 獲取設備 ID
-  
+
   if (strlen(ssid) > 0) {
     Serial.println("SSID: " + String(ssid));
     connectToWiFi();
@@ -624,10 +737,10 @@ void setup()
     Serial.println(deviceId);
   }
 
-  // 只有在成功連接到 WiFi 且不是 AP 模式時才連接 MQTT
+  // 只有在成功連接到 WiFi 且不是 AP 模式時才使用智慧連接
   if (WiFi.status() == WL_CONNECTED && !isAPMode)
   {
-    connectToMQTT();
+    smartConnect();  // 使用智慧連接取代 connectToMQTT()
   }
 
   server.on("/", handleRoot);
@@ -709,20 +822,39 @@ void loop()
   if (WiFi.status() == WL_CONNECTED && !isAPMode) {
     static unsigned long lastReconnectAttempt = 0;
     static unsigned long lastKeepAlive = 0;
+    static int reconnectFailCount = 0;
     unsigned long now = millis();
 
-    if (!mqttClient.connected() && failedAttempts < 5) {
-      if (now - lastReconnectAttempt > 5000) {  // 縮短重連間隔到 5 秒
+    if (!mqttClient.connected()) {
+      if (now - lastReconnectAttempt > 10000) {  // 每10秒重連一次
         lastReconnectAttempt = now;
-        Serial.println("MQTT 連接中斷，嘗試重新連接...");
-        connectToMQTT();
+        Serial.println("MQTT 連接中斷，重新連接...");
+
+        reconnectFailCount++;
+
+        // 失敗3次後，切換伺服器
+        if (reconnectFailCount >= 3) {
+          Serial.println("多次重連失敗，切換伺服器...");
+          smartConnect();  // 重新智慧連接
+          reconnectFailCount = 0;
+        } else {
+          // 嘗試連接當前伺服器
+          if (useCustomServer && strlen(mqttServer) > 0) {
+            quickConnectCustom();
+          } else {
+            quickConnect(DEFAULT_SERVERS[currentServerIndex]);
+          }
+        }
       }
-    } else if (mqttClient.connected()) {
+    } else {
       mqttClient.loop();
-      
-      // 每 15 秒發送一次保持連線的狀態更新
+      reconnectFailCount = 0;  // 重置失敗計數
+
+      // 每 15 秒發送一次保持連線的狀態更新（帶伺服器資訊）
       if (now - lastKeepAlive > 15000) {
-        publishStatus();
+        const char* server = useCustomServer && strlen(mqttServer) > 0 ?
+                             mqttServer : DEFAULT_SERVERS[currentServerIndex].server;
+        publishStatusWithServer(server);
         lastKeepAlive = now;
       }
     }
@@ -828,56 +960,247 @@ void publishStatus() {
   }
 }
 
-void connectToMQTT() {
-  if (failedAttempts >= 5) {
-    Serial.println("已達重試上限，暫時停止 MQTT 連接嘗試");
-    return;
+// 發布帶有伺服器資訊的狀態
+void publishStatusWithServer(const char* server) {
+  if (!mqttClient.connected()) return;
+
+  const char* deviceId = getDeviceId();
+  String statusTopic = String("hoban/") + deviceId + "/status";
+
+  StaticJsonDocument<1024> doc;
+  doc["device_id"] = deviceId;
+  doc["status"] = isUpdating ? "updating" : "online";
+  doc["version"] = firmwareVersion;
+  doc["model"] = deviceModel;
+  doc["server"] = server;  // 加入伺服器資訊
+  doc["timestamp"] = millis() / 1000;
+
+  // WiFi 資訊
+  JsonObject wifi = doc.createNestedObject("wifi");
+  wifi["connected"] = (WiFi.status() == WL_CONNECTED);
+  wifi["ssid"] = WiFi.SSID();
+  wifi["rssi"] = WiFi.RSSI();
+  wifi["ip"] = WiFi.localIP().toString();
+
+  // 設備狀態
+  JsonObject device = doc.createNestedObject("device");
+  device["relay"] = digitalRead(relayButton);
+
+  if (isUpdating) {
+    device["update_progress"] = updateProgress;
   }
+
+  char buffer[1024];
+  serializeJson(doc, buffer);
+  mqttClient.publish(statusTopic.c_str(), buffer, true);
+
+  Serial.printf("已發布狀態 (伺服器: %s)\n", server);
+}
+
+// 發布伺服器切換事件
+void publishServerChangeEvent(const char* switchType, const char* server) {
+  if (!mqttClient.connected()) return;
+
+  const char* deviceId = getDeviceId();
+  String statusTopic = String("hoban/") + deviceId + "/status";
+
+  StaticJsonDocument<256> doc;
+  doc["device_id"] = deviceId;
+  doc["status"] = "online";
+  doc["event"] = "server_changed";
+  doc["switch_type"] = switchType;  // "auto" 或 "custom"
+  doc["server"] = server;
+  doc["timestamp"] = millis() / 1000;
+
+  char buffer[256];
+  serializeJson(doc, buffer);
+  mqttClient.publish(statusTopic.c_str(), buffer, true);
+
+  Serial.printf("已發布伺服器切換事件: %s (%s)\n", server, switchType);
+}
+
+// 快速連接：嘗試連接單個伺服器，1秒內成功就返回 true（支援認證）
+bool quickConnect(const MqttServerConfig& config) {
+  Serial.printf("快速測試: %s:%d ... ", config.server, config.port);
+
+  mqttClient.setServer(config.server, config.port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setKeepAlive(30);
+
+  unsigned long startTime = millis();
+  const char* deviceId = getDeviceId();
+  String statusTopic = String("hoban/") + deviceId + "/status";
+
+  // 設定離線訊息
+  StaticJsonDocument<128> offlineDoc;
+  offlineDoc["device_id"] = deviceId;
+  offlineDoc["status"] = "offline";
+  offlineDoc["server"] = config.server;
+  offlineDoc["timestamp"] = millis() / 1000;
+
+  char offlineBuffer[128];
+  serializeJson(offlineDoc, offlineBuffer);
+
+  // 嘗試連接（1秒超時），使用設定的帳密（可能為 NULL）
+  if (mqttClient.connect(deviceId,
+                        config.username,   // 從 config 取得帳號（可為 NULL）
+                        config.password,   // 從 config 取得密碼（可為 NULL）
+                        statusTopic.c_str(), 1, true,
+                        offlineBuffer, true)) {
+    unsigned long connectTime = millis() - startTime;
+
+    // 1秒內成功，直接接受
+    if (connectTime < 1000) {
+      Serial.printf("成功 (%lu ms) ✓\n", connectTime);
+
+      // 訂閱控制主題
+      String controlTopic = String("hoban/") + deviceId + "/control";
+      mqttClient.subscribe(controlTopic.c_str());
+
+      // 發布上線狀態（包含伺服器資訊）
+      publishStatusWithServer(config.server);
+
+      return true;
+    } else {
+      // 超過1秒，斷開並嘗試下一個
+      Serial.printf("太慢 (%lu ms) ✗\n", connectTime);
+      mqttClient.disconnect();
+      return false;
+    }
+  }
+
+  Serial.println("失敗 ✗");
+  return false;
+}
+
+// 快速連接自訂伺服器（使用全域變數中的設定）
+bool quickConnectCustom() {
+  Serial.printf("快速測試自訂伺服器: %s:%d ... ", mqttServer, mqttPort);
 
   mqttClient.setServer(mqttServer, mqttPort);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setKeepAlive(30);
 
+  unsigned long startTime = millis();
   const char* deviceId = getDeviceId();
   String statusTopic = String("hoban/") + deviceId + "/status";
 
-  // 設定離線狀態的 JSON
+  // 設定離線訊息
   StaticJsonDocument<128> offlineDoc;
   offlineDoc["device_id"] = deviceId;
-  offlineDoc["status"] = "offline";  // 只有在設備離線時才會發送
+  offlineDoc["status"] = "offline";
   offlineDoc["server"] = mqttServer;
   offlineDoc["timestamp"] = millis() / 1000;
-  
+
   char offlineBuffer[128];
   serializeJson(offlineDoc, offlineBuffer);
 
+  // 使用自訂伺服器的帳密（如果為空字串則傳 NULL）
+  const char* username = (strlen(mqttUsername) > 0) ? mqttUsername : NULL;
+  const char* password = (strlen(mqttPassword) > 0) ? mqttPassword : NULL;
+
+  // 嘗試連接（1秒超時）
   if (mqttClient.connect(deviceId,
-                        NULL,  // username
-                        NULL,  // password
-                        statusTopic.c_str(),  // LWT topic
-                        1,     // QoS 改為 1
-                        true,  // retain
-                        offlineBuffer,  // LWT message
-                        true   // clean session 改為 true
-                        )) {
-    Serial.println("已連接到 MQTT");
+                        username,
+                        password,
+                        statusTopic.c_str(), 1, true,
+                        offlineBuffer, true)) {
+    unsigned long connectTime = millis() - startTime;
 
-    // 立即發布上線狀態
-    publishStatus();  // 這會發送 "online" 狀態
+    // 1秒內成功，直接接受
+    if (connectTime < 1000) {
+      Serial.printf("成功 (%lu ms) ✓\n", connectTime);
 
-    String controlTopic = String("hoban/") + deviceId + "/control";
-    mqttClient.subscribe(controlTopic.c_str());
+      // 訂閱控制主題
+      String controlTopic = String("hoban/") + deviceId + "/control";
+      mqttClient.subscribe(controlTopic.c_str());
 
-    Serial.print("已訂閱主題: ");
-    Serial.println(controlTopic);
-    failedAttempts = 0;
-  } else {
-    Serial.print("連接失敗，錯誤碼=");
-    Serial.print(mqttClient.state());
-    Serial.print(" 重試次數: ");
-    Serial.println(failedAttempts);
-    failedAttempts++;
+      // 發布上線狀態（包含伺服器資訊）
+      publishStatusWithServer(mqttServer);
+
+      return true;
+    } else {
+      // 超過1秒，斷開並嘗試下一個
+      Serial.printf("太慢 (%lu ms) ✗\n", connectTime);
+      mqttClient.disconnect();
+      return false;
+    }
   }
+
+  Serial.println("失敗 ✗");
+  return false;
+}
+
+// 智慧連接：按優先順序嘗試
+void smartConnect() {
+  Serial.println("=== 開始智慧連接 ===");
+
+  // 1. 如果有自訂伺服器，先試自訂
+  if (useCustomServer && strlen(mqttServer) > 0) {
+    Serial.println("優先嘗試自訂伺服器...");
+    if (quickConnectCustom()) {
+      Serial.println("✓ 已連接到自訂伺服器");
+      publishServerChangeEvent("custom", mqttServer);
+      failedAttempts = 0;
+      return;
+    }
+    Serial.println("自訂伺服器失敗，切換到預設列表");
+  }
+
+  // 2. 嘗試上次成功的伺服器
+  EEPROM.begin(128);
+  int lastSuccessIndex = EEPROM.read(97);  // 讀取上次成功的索引
+
+  if (lastSuccessIndex >= 0 && lastSuccessIndex < SERVER_COUNT) {
+    Serial.printf("嘗試上次成功的伺服器 [%d]: %s\n",
+                  lastSuccessIndex, DEFAULT_SERVERS[lastSuccessIndex].displayName);
+    if (quickConnect(DEFAULT_SERVERS[lastSuccessIndex])) {
+      currentServerIndex = lastSuccessIndex;
+      Serial.printf("✓ 已連接到伺服器: %s\n", DEFAULT_SERVERS[lastSuccessIndex].displayName);
+      failedAttempts = 0;
+      return;
+    }
+  }
+
+  // 3. 循環嘗試所有預設伺服器
+  Serial.println("循環測試所有預設伺服器...");
+  for (int attempt = 0; attempt < SERVER_COUNT * 2; attempt++) {
+    int index = attempt % SERVER_COUNT;
+
+    // 跳過剛才失敗的伺服器
+    if (index == lastSuccessIndex && attempt < SERVER_COUNT) continue;
+
+    Serial.printf("嘗試伺服器 [%d/%d]: %s\n",
+                  attempt + 1, SERVER_COUNT * 2,
+                  DEFAULT_SERVERS[index].displayName);
+
+    if (quickConnect(DEFAULT_SERVERS[index])) {
+      currentServerIndex = index;
+
+      // 儲存成功的伺服器索引
+      EEPROM.begin(128);
+      EEPROM.write(97, index);
+      EEPROM.commit();
+
+      Serial.printf("✓ 已連接並儲存伺服器 [%d]: %s\n",
+                   index, DEFAULT_SERVERS[index].displayName);
+
+      // 發布伺服器切換事件
+      publishServerChangeEvent("auto", DEFAULT_SERVERS[index].server);
+      failedAttempts = 0;
+      return;
+    }
+
+    delay(500);  // 短暫延遲避免過快請求
+  }
+
+  Serial.println("✗ 所有伺服器連接失敗");
+  failedAttempts = 5;  // 設置為最大值，避免持續重試
+}
+
+// 保留原有的 connectToMQTT 函數作為向後兼容（現在內部使用 smartConnect）
+void connectToMQTT() {
+  smartConnect();
 }
 
 // 添加韌體更新處理函數
@@ -1171,17 +1494,51 @@ void handleSetMQTT() {
   if (server.hasArg("mqtt_server")) {
     String newServer = server.arg("mqtt_server");
     newServer.trim();
-    
+
     if (newServer.length() > 0) {
+      // 設定伺服器
       strncpy(mqttServer, newServer.c_str(), sizeof(mqttServer) - 1);
       mqttServer[sizeof(mqttServer) - 1] = '\0';
-      
+
+      // 設定埠號（如果有提供）
+      if (server.hasArg("mqtt_port")) {
+        mqttPort = server.arg("mqtt_port").toInt();
+        if (mqttPort <= 0 || mqttPort > 65535) {
+          mqttPort = 1883;  // 無效埠號使用預設值
+        }
+      }
+
+      // 設定帳號（如果有提供）
+      if (server.hasArg("mqtt_username")) {
+        String username = server.arg("mqtt_username");
+        username.trim();
+        if (username.length() > 0) {
+          strncpy(mqttUsername, username.c_str(), sizeof(mqttUsername) - 1);
+          mqttUsername[sizeof(mqttUsername) - 1] = '\0';
+        } else {
+          mqttUsername[0] = '\0';  // 清空
+        }
+      }
+
+      // 設定密碼（如果有提供）
+      if (server.hasArg("mqtt_password")) {
+        String password = server.arg("mqtt_password");
+        password.trim();
+        if (password.length() > 0) {
+          strncpy(mqttPassword, password.c_str(), sizeof(mqttPassword) - 1);
+          mqttPassword[sizeof(mqttPassword) - 1] = '\0';
+        } else {
+          mqttPassword[0] = '\0';  // 清空
+        }
+      }
+
+      useCustomServer = true;  // 標記使用自訂伺服器
       saveWiFiConfig();  // 儲存新的設定
-      
+
       if (mqttClient.connected()) {
         mqttClient.disconnect();  // 斷開現有連接
       }
-      
+
       String html = "<html><head>";
       html += "<meta charset='UTF-8'>";
       html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
@@ -1191,15 +1548,18 @@ void handleSetMQTT() {
       html += "<div class='card mx-auto' style='max-width: 400px;'>";
       html += "<div class='card-body text-center'>";
       html += "<h2 class='card-title text-success mb-3'>MQTT 設定已更新</h2>";
-      html += "<p class='card-text'>新的伺服器：" + String(mqttServer) + "</p>";
+      html += "<p class='card-text'>伺服器：" + String(mqttServer) + ":" + String(mqttPort) + "</p>";
+      if (strlen(mqttUsername) > 0) {
+        html += "<p class='card-text'>認證：已啟用</p>";
+      }
       html += "<p class='card-text'>系統將在 3 秒後重新連接...</p>";
       html += "<a href='/' class='btn btn-primary'>返回首頁</a>";
       html += "</div></div></div>";
       html += "<script>setTimeout(function(){ window.location.href = '/'; }, 3000);</script>";
       html += "</body></html>";
-      
+
       server.send(200, "text/html", html);
-      
+
       // 延遲後重新連接 MQTT
       delay(1000);
       connectToMQTT();
