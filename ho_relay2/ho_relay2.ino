@@ -32,7 +32,7 @@ BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
 
-const char* firmwareVersion = "1.2.0"; // 當前韌體版本
+const char* firmwareVersion = "1.2.1"; // 當前韌體版本
 const char* deviceModel = "hoRelay2"; // 設備型號
 
 // ESP32-C3 GPIO 定義
@@ -329,16 +329,17 @@ class MyCallbacks: public BLECharacteristicCallbacks {
                         saveWiFiConfig();
 
                         // 建立回應 JSON
-                        StaticJsonDocument<300> response;
+                        StaticJsonDocument<350> response;
                         response["status"] = "success";
                         response["message"] = "WiFi 和 MQTT 設定已儲存";
+                        response["data"]["device_id"] = getDeviceId();  // 加入設備 ID
                         response["data"]["ssid"] = ssid;
                         response["data"]["mqttServer"] = mqttServer;
                         response["data"]["mqttPort"] = mqttPort;
                         response["data"]["hasAuth"] = (strlen(mqttUsername) > 0);
 
                         // 序列化 JSON 到字串
-                        char responseBuffer[300];
+                        char responseBuffer[350];
                         serializeJson(response, responseBuffer);
 
                         // 印出回應
