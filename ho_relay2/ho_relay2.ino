@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
 #include <EEPROM.h>
 #include <PubSubClient.h> // 引入 MQTT 庫
 #include <BLEDevice.h>
@@ -113,8 +112,6 @@ class MyServerCallbacks: public BLEServerCallbacks {
 };
 
 
-// WebServer 實例
-WebServer server(80);
 
 // 函數前向宣告
 void saveWiFiConfig();
@@ -223,9 +220,9 @@ void clearWiFiConfig() {
 
 void blinkLED() {
   unsigned long currentTime = millis();
-  
+
   if (WiFi.status() != WL_CONNECTED && !isAPMode) {
-    // 斷線模式：快速閃爍
+    // WiFi 未連接模式：快速閃爍
     if (currentTime - lastBlinkTime >= QUICK_BLINK) {
       ledState = !ledState;
       digitalWrite(ledOnFace, ledState);
@@ -235,7 +232,7 @@ void blinkLED() {
   } else if (isAPMode) {
     // AP 模式：短短長模式
     unsigned long patternTime = currentTime % (SHORT_BLINK * 2 + SHORT_BLINK * 2 + LONG_BLINK + PATTERN_PAUSE);
-    
+
     if (patternTime < SHORT_BLINK) {
       // 第一個短閃
       digitalWrite(ledOnFace, HIGH);
@@ -261,6 +258,39 @@ void blinkLED() {
       digitalWrite(ledOnFace, LOW);
       digitalWrite(ledOnBoard, LOW);
     }
+  } else if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
+    // WiFi 已連接但 MQTT 未連接：一長二短模式
+    unsigned long patternTime = currentTime % (LONG_BLINK + SHORT_BLINK * 2 + SHORT_BLINK * 2 + SHORT_BLINK * 2 + PATTERN_PAUSE);
+
+    if (patternTime < LONG_BLINK) {
+      // 長閃
+      digitalWrite(ledOnFace, HIGH);
+      digitalWrite(ledOnBoard, HIGH);
+    } else if (patternTime < LONG_BLINK + SHORT_BLINK) {
+      // 長閃後暫停
+      digitalWrite(ledOnFace, LOW);
+      digitalWrite(ledOnBoard, LOW);
+    } else if (patternTime < LONG_BLINK + SHORT_BLINK * 2) {
+      // 第一個短閃
+      digitalWrite(ledOnFace, HIGH);
+      digitalWrite(ledOnBoard, HIGH);
+    } else if (patternTime < LONG_BLINK + SHORT_BLINK * 3) {
+      // 第一個短閃暫停
+      digitalWrite(ledOnFace, LOW);
+      digitalWrite(ledOnBoard, LOW);
+    } else if (patternTime < LONG_BLINK + SHORT_BLINK * 4) {
+      // 第二個短閃
+      digitalWrite(ledOnFace, HIGH);
+      digitalWrite(ledOnBoard, HIGH);
+    } else {
+      // 模式間暫停
+      digitalWrite(ledOnFace, LOW);
+      digitalWrite(ledOnBoard, LOW);
+    }
+  } else {
+    // WiFi 和 MQTT 都已連接：LED 關閉
+    digitalWrite(ledOnFace, LOW);
+    digitalWrite(ledOnBoard, LOW);
   }
 }
 
@@ -465,202 +495,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-void handleRoot()
-{
-  String html = "<html><head>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'>";
-  html += "<style>";
-  html += "body{background:#f8f9fa}.container{max-width:600px;padding:20px}.card{margin-bottom:20px}";
-  html += ".btn-open{background:#34a853;color:#fff}";
-  html += "</style></head><body>";
 
-  html += "<div class='container py-4'>";
-  html += "<h1 class='text-center mb-4 fw-bold'>齁控－動物管制遠端控制系統 v" + String(firmwareVersion) + "</h1>";
 
-  // 設備資訊卡片
-  html += "<div class='card mb-3'>";
-  html += "<div class='card-header bg-primary text-white'>設備資訊</div>";
-  html += "<div class='card-body'>";
-  String deviceId = getDeviceId();
-  html += "<p class='card-text'><strong>設備 ID：</strong>" + deviceId + "</p>";
-  html += "</div></div>";
 
-  // WiFi 資訊卡片
-  html += "<div class='card mb-3'>";
-  html += "<div class='card-header bg-success text-white'>網路狀態</div>";
-  html += "<div class='card-body'>";
-  if (strlen(ssid) > 0)
-  {
-    html += "<p class='card-text'><strong>目前連線：</strong>" + String(ssid) + "</p>";
-    html += "<p class='card-text'><strong>IP 位址：</strong>" + WiFi.localIP().toString() + "</p>";
-  }
-  else
-  {
-    html += "<p class='card-text text-warning'><strong>尚未設定 WiFi</strong></p>";
-  }
-  html += "</div></div>";
-
-  // MQTT 狀態卡片
-  html += "<div class='card mb-3'>";
-  html += "<div class='card-header bg-info text-white'>MQTT 狀態</div>";
-  html += "<div class='card-body'>";
-  html += "<p class='card-text'><strong>伺服器：</strong>" + String(mqttServer) + "</p>";
-  html += "<p class='card-text'><strong>連接狀態：</strong>";
-  
-  if (WiFi.status() == WL_CONNECTED && !isAPMode) {
-    if (mqttClient.connected()) {
-      html += "<span class='badge bg-success'>已連接</span></p>";
-    } else {
-      html += "<span class='badge bg-warning'>未連接</span></p>";
-    }
-  } else {
-    html += "<span class='badge bg-secondary'>WiFi 未連接</span></p>";
-  }
-
-  // 添加 MQTT 設定表單
-  html += "<form action='/setmqtt' method='POST' class='mt-3'>";
-  html += "<div class='mb-3'>";
-  html += "<label class='form-label'>MQTT 伺服器：</label>";
-  html += "<input type='text' class='form-control' name='mqtt_server' value='" + String(mqttServer) + "' placeholder='輸入 MQTT 伺服器位址'>";
-  html += "</div>";
-  html += "<div class='mb-3'>";
-  html += "<label class='form-label'>MQTT 埠號：</label>";
-  html += "<input type='number' class='form-control' name='mqtt_port' value='" + String(mqttPort) + "' placeholder='1883'>";
-  html += "</div>";
-  html += "<div class='mb-3'>";
-  html += "<label class='form-label'>MQTT 帳號（選用）：</label>";
-  html += "<input type='text' class='form-control' name='mqtt_username' value='" + String(mqttUsername) + "' placeholder='留空表示無需認證'>";
-  html += "</div>";
-  html += "<div class='mb-3'>";
-  html += "<label class='form-label'>MQTT 密碼（選用）：</label>";
-  html += "<input type='password' class='form-control' name='mqtt_password' placeholder='留空表示無需認證'>";
-  html += "</div>";
-  html += "<button type='submit' class='btn btn-primary'>更新 MQTT 設定</button>";
-  html += "</form>";
-  
-  html += "</div></div>";
-
-  // WiFi 設定表單
-  html += "<div class='card mb-3'>";
-  html += "<div class='card-header bg-info text-white'>WiFi 設定</div>";
-  html += "<div class='card-body'>";
-  html += "<form action='/setwifi' method='POST'>";
-  html += "<div class='mb-3'>";
-  html += "<label class='form-label'>SSID：</label>";
-  html += "<input type='text' class='form-control' name='ssid' placeholder='請輸入 WiFi 名稱'>";
-  html += "</div>";
-  html += "<div class='mb-3'>";
-  html += "<label class='form-label'>密碼：</label>";
-  html += "<input type='password' class='form-control' name='password' placeholder='請輸入 WiFi 密碼'>";
-  html += "</div>";
-  html += "<button type='submit' class='btn btn-primary'>設定 WiFi</button>";
-  html += "</form>";
-
-  // 加入清除 WiFi 按鈕
-  html += "<hr class='my-3'>";
-  html += "<button onclick=\"if(confirm('確定要清除 WiFi 設定嗎？\\n清除後裝置將重新啟動。')) { location.href='/clearwifi' }\" ";
-  html += "class='btn btn-danger'>清除 WiFi 設定</button>";
-  html += "</div></div>";
-
-  // 控制按鈕
-  html += "<button onclick=\"location.href='/relay/on'\" class='btn btn-open btn-lg w-100 text-white'>開門</button>";
-  html += "<div class='text-center mt-5 small'>齁斑科技</div>";
-  html += "</div>";
-  html += "<script src='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js'></script>";
-  html += "</body></html>";
-
-  server.send(200, "text/html", html);
-}
-
-void handleSetWiFi()
-{
-  if (server.hasArg("ssid") && server.hasArg("password"))
-  {
-    String newSSID = server.arg("ssid");
-    String newPassword = server.arg("password");
-
-    newSSID.toCharArray(ssid, 32);
-    newPassword.toCharArray(password, 32);
-
-    saveWiFiConfig();
-
-    String html = "<html><head>";
-    html += "<meta charset='UTF-8'>";
-    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-    html += "<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'>";
-    html += "</head><body class='bg-light'>";
-    html += "<div class='container py-5'>";
-    html += "<div class='card mx-auto' style='max-width: 400px;'>";
-    html += "<div class='card-body text-center'>";
-    html += "<h2 class='card-title text-success mb-3'>WiFi 設定已儲存</h2>";
-    html += "<p class='card-text'>系統將在 3 秒後重新啟動...</p>";
-    html += "<a href='/' class='btn btn-primary'>返回首頁</a>";
-    html += "</div></div></div>";
-    html += "<script>setTimeout(function(){ window.location.href = '/'; }, 3000);</script>";
-    html += "<script src='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js'></script>";
-    html += "</body></html>";
-
-    server.send(200, "text/html", html);
-    delay(2000);
-    ESP.restart();
-  }
-  else
-  {
-    String html = "<html><head>";
-    html += "<meta charset='UTF-8'>";
-    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-    html += "<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'>";
-    html += "</head><body class='bg-light'>";
-    html += "<div class='container py-5'>";
-    html += "<div class='card mx-auto' style='max-width: 400px;'>";
-    html += "<div class='card-body text-center'>";
-    html += "<h2 class='card-title text-danger mb-3'>錯誤</h2>";
-    html += "<p class='card-text'>缺少 SSID 或密碼</p>";
-    html += "<a href='/' class='btn btn-primary'>返回首頁</a>";
-    html += "</div></div></div>";
-    html += "<script src='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js'></script>";
-    html += "</body></html>";
-    server.send(400, "text/html", html);
-  }
-}
-
-void handleRelayOn()
-{
-  relayState = true;
-  pulseRelay(); // 使用統一的控制函數
-
-  String html = "<html><body>";
-  html += "<h1>已經關門</h1>";
-  html += "<p>你將會在3秒後回到首頁。</p>";
-  html += "<script>window.location.href = '/';</script>";
-  html += "</body></html>";
-
-  server.send(200, "text/html", html);
-}
-
-void handleClearWiFi() {
-  String html = "<html><head>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'>";
-  html += "</head><body class='bg-light'>";
-  html += "<div class='container py-5'>";
-  html += "<div class='card mx-auto' style='max-width:400px'>";
-  html += "<div class='card-body text-center'>";
-  html += "<h2 class='text-danger mb-3'>WiFi 設定已清除</h2>";
-  html += "<p>系統將在 3 秒後重新啟動...</p>";
-  html += "<div class='spinner-border text-primary' role='status'></div>";
-  html += "</div></div></div>";
-  html += "<script>setTimeout(function(){location.href='/'},3000)</script>";
-  html += "</body></html>";
-  
-  server.send(200, "text/html", html);
-  
-  delay(1000);
-  clearWiFiConfig();
-}
 
 void setupBLE() {
   const char* deviceId = getDeviceId();
@@ -744,26 +581,10 @@ void setup()
     smartConnect();  // 使用智慧連接取代 connectToMQTT()
   }
 
-  server.on("/", handleRoot);
-  server.on("/setwifi", HTTP_POST, handleSetWiFi);
-  server.on("/relay/on", handleRelayOn);
-  server.on("/clearwifi", handleClearWiFi);
-  server.on("/setmqtt", HTTP_POST, handleSetMQTT);  // 添加新的路由
-  
-  // 添加韌體更新路由
-  server.on("/update", HTTP_POST, []() {
-    server.sendHeader("Connection", "close");
-    server.send(200, "text/plain", Update.hasError() ? "更新失敗" : "更新成功");
-  }, handleFirmwareUpload);
-
-  server.begin();
-  Serial.println("HTTP 伺服器已啟動。");
 }
 
 void loop()
 {
-  server.handleClient();
-
   // 在 AP 模式下處理 BLE
   if (isAPMode && deviceConnected) {
     delay(10);
@@ -804,18 +625,17 @@ void loop()
         clearWiFiConfig();  // 清除設定並重啟
       }
     }
-  } else if (isAPMode) {
-    isBlinking = true;
-    isBlinking = false;
-    waitingConfirm = false;
-    blinkLED();
   } else {
     // 按鈕放開，重置所有狀態
     buttonPressTime = 0;
     isBlinking = false;
     waitingConfirm = false;
-    digitalWrite(ledOnFace, LOW);  // 確保 LED 關閉
-    digitalWrite(ledOnBoard, LOW);  // 確保 LED 關閉
+    // 不要在這裡關閉 LED，讓 blinkLED() 處理
+  }
+
+  // 當不在按鈕長按流程時，根據連接狀態控制 LED 閃燈
+  if (!isBlinking && !waitingConfirm) {
+    blinkLED();
   }
 
 
@@ -851,8 +671,8 @@ void loop()
       mqttClient.loop();
       reconnectFailCount = 0;  // 重置失敗計數
 
-      // 每 15 秒發送一次保持連線的狀態更新（帶伺服器資訊）
-      if (now - lastKeepAlive > 15000) {
+      // 每 3 秒發送一次保持連線的狀態更新（帶伺服器資訊）
+      if (now - lastKeepAlive > 3000) {
         const char* server = useCustomServer && strlen(mqttServer) > 0 ?
                              mqttServer : DEFAULT_SERVERS[currentServerIndex].server;
         publishStatusWithServer(server);
@@ -1204,118 +1024,7 @@ void connectToMQTT() {
   smartConnect();
 }
 
-// 添加韌體更新處理函數
-void handleFirmwareUpload() {
-  HTTPUpload& upload = server.upload();
-  
-  if (upload.status == UPLOAD_FILE_START) {
-    Serial.println("=== 開始韌體更新 ===");
-    Serial.printf("檔案名稱: %s\n", upload.filename.c_str());
-    Serial.printf("檔案大小: %u bytes\n", upload.totalSize);
-    Serial.printf("可用空間: %u bytes\n", ESP.getFreeSketchSpace());
-    
-    isUpdating = true;
-    updateProgress = 0;
-    digitalWrite(ledOnFace, HIGH);  // 開始更新時點亮 LED
-    
-    // 發送更新開始狀態到 MQTT
-    if (mqttClient.connected()) {
-      String deviceId = getDeviceId();
-      String statusTopic = "hoban/" + deviceId + "/status";
-      mqttClient.publish(statusTopic.c_str(), "updating", true);
-      Serial.println("已發送更新狀態到 MQTT");
-    }
-    
-    if (!Update.begin(upload.totalSize)) {
-      Serial.println("更新初始化失敗！");
-      Serial.printf("錯誤: %s\n", Update.errorString());
-      Update.printError(Serial);
-    } else {
-      Serial.println("更新初始化成功");
-    }
-  } 
-  else if (upload.status == UPLOAD_FILE_WRITE) {
-    Serial.printf("寫入韌體: %u bytes\n", upload.currentSize);
-    
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      Serial.println("寫入韌體失敗！");
-      Serial.printf("錯誤: %s\n", Update.errorString());
-      Update.printError(Serial);
-    }
-    
-    // 計算更新進度
-    updateProgress = (Update.progress() * 100) / Update.size();
-    Serial.printf("更新進度: %d%%\n", updateProgress);
-    
-    // LED 閃爍以指示更新進行中
-    if (millis() % 200 < 100) {  // 快速閃爍
-      digitalWrite(ledOnFace, HIGH);
-    } else {
-      digitalWrite(ledOnFace, LOW);
-    }
-    
-    // 每 10% 發送一次進度
-    if (updateProgress % 10 == 0) {
-      if (mqttClient.connected()) {
-        String deviceId = getDeviceId();
-        String statusTopic = "hoban/" + deviceId + "/status";
-        String progressMsg = "updating:" + String(updateProgress);
-        mqttClient.publish(statusTopic.c_str(), progressMsg.c_str(), true);
-        Serial.printf("已發送進度到 MQTT: %d%%\n", updateProgress);
-      }
-    }
-  } 
-  else if (upload.status == UPLOAD_FILE_END) {
-    Serial.println("韌體上傳完成");
-    Serial.printf("總共寫入: %u bytes\n", upload.totalSize);
-    
-    if (Update.end(true)) {
-      Serial.println("更新成功！準備重新啟動...");
-      digitalWrite(ledOnFace, HIGH);  // 更新成功後 LED 恆亮
-      
-      // 發送更新完成狀態到 MQTT
-      if (mqttClient.connected()) {
-        String deviceId = getDeviceId();
-        String statusTopic = "hoban/" + deviceId + "/status";
-        mqttClient.publish(statusTopic.c_str(), "update_success", true);
-        Serial.println("已發送更新成功狀態到 MQTT");
-      }
-      
-      delay(1000);
-      ESP.restart();
-    } else {
-      Serial.println("更新失敗！");
-      Serial.printf("錯誤: %s\n", Update.errorString());
-      Update.printError(Serial);
-      digitalWrite(ledOnFace, LOW);  // 更新失敗後關閉 LED
-      
-      // 發送更新失敗狀態到 MQTT
-      if (mqttClient.connected()) {
-        String deviceId = getDeviceId();
-        String statusTopic = "hoban/" + deviceId + "/status";
-        mqttClient.publish(statusTopic.c_str(), "update_failed", true);
-        Serial.println("已發送更新失敗狀態到 MQTT");
-      }
-    }
-    isUpdating = false;
-  }
-  else if (upload.status == UPLOAD_FILE_ABORTED) {
-    Serial.println("更新被中止！");
-    Update.end();
-    digitalWrite(ledOnFace, LOW);
-    isUpdating = false;
-    
-    // 發送更新失敗狀態到 MQTT
-    if (mqttClient.connected()) {
-      String deviceId = getDeviceId();
-      String statusTopic = "hoban/" + deviceId + "/status";
-      mqttClient.publish(statusTopic.c_str(), "update_aborted", true);
-      Serial.println("已發送更新中止狀態到 MQTT");
-    }
-  }
-}
-
-// 添加韌體下載和更新函數
+// 韌體下載和更新函數（透過 MQTT 觸發）
 void startFirmwareUpdate(const char* downloadUrl) {
   if (isUpdating) {
     Serial.println("更新已在進行中，無法開始新的更新");
@@ -1491,83 +1200,3 @@ void startFirmwareUpdate(const char* downloadUrl) {
   }
 }
 
-void handleSetMQTT() {
-  if (server.hasArg("mqtt_server")) {
-    String newServer = server.arg("mqtt_server");
-    newServer.trim();
-
-    if (newServer.length() > 0) {
-      // 設定伺服器
-      strncpy(mqttServer, newServer.c_str(), sizeof(mqttServer) - 1);
-      mqttServer[sizeof(mqttServer) - 1] = '\0';
-
-      // 設定埠號（如果有提供）
-      if (server.hasArg("mqtt_port")) {
-        mqttPort = server.arg("mqtt_port").toInt();
-        if (mqttPort <= 0 || mqttPort > 65535) {
-          mqttPort = 1883;  // 無效埠號使用預設值
-        }
-      }
-
-      // 設定帳號（如果有提供）
-      if (server.hasArg("mqtt_username")) {
-        String username = server.arg("mqtt_username");
-        username.trim();
-        if (username.length() > 0) {
-          strncpy(mqttUsername, username.c_str(), sizeof(mqttUsername) - 1);
-          mqttUsername[sizeof(mqttUsername) - 1] = '\0';
-        } else {
-          mqttUsername[0] = '\0';  // 清空
-        }
-      }
-
-      // 設定密碼（如果有提供）
-      if (server.hasArg("mqtt_password")) {
-        String password = server.arg("mqtt_password");
-        password.trim();
-        if (password.length() > 0) {
-          strncpy(mqttPassword, password.c_str(), sizeof(mqttPassword) - 1);
-          mqttPassword[sizeof(mqttPassword) - 1] = '\0';
-        } else {
-          mqttPassword[0] = '\0';  // 清空
-        }
-      }
-
-      useCustomServer = true;  // 標記使用自訂伺服器
-      saveWiFiConfig();  // 儲存新的設定
-
-      if (mqttClient.connected()) {
-        mqttClient.disconnect();  // 斷開現有連接
-      }
-
-      String html = "<html><head>";
-      html += "<meta charset='UTF-8'>";
-      html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-      html += "<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'>";
-      html += "</head><body class='bg-light'>";
-      html += "<div class='container py-5'>";
-      html += "<div class='card mx-auto' style='max-width: 400px;'>";
-      html += "<div class='card-body text-center'>";
-      html += "<h2 class='card-title text-success mb-3'>MQTT 設定已更新</h2>";
-      html += "<p class='card-text'>伺服器：" + String(mqttServer) + ":" + String(mqttPort) + "</p>";
-      if (strlen(mqttUsername) > 0) {
-        html += "<p class='card-text'>認證：已啟用</p>";
-      }
-      html += "<p class='card-text'>系統將在 3 秒後重新連接...</p>";
-      html += "<a href='/' class='btn btn-primary'>返回首頁</a>";
-      html += "</div></div></div>";
-      html += "<script>setTimeout(function(){ window.location.href = '/'; }, 3000);</script>";
-      html += "</body></html>";
-
-      server.send(200, "text/html", html);
-
-      // 延遲後重新連接 MQTT
-      delay(1000);
-      connectToMQTT();
-    } else {
-      server.send(400, "text/plain", "MQTT 伺服器位址不能為空");
-    }
-  } else {
-    server.send(400, "text/plain", "缺少必要參數");
-  }
-}
