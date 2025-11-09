@@ -16,7 +16,7 @@
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
 const unsigned long LONG_BLINK = 800;   // 長閃持續時間 (毫秒)
 const unsigned long PATTERN_PAUSE = 2000; // 模式間暫停時間 (毫秒)
-const unsigned long QUICK_BLINK = 100;   // 快閃間隔時間 (毫秒)
+const unsigned long QUICK_BLINK = 300;   // 快閃間隔時間 (毫秒)
 
 // LED 閃爍狀態變數
 unsigned long lastBlinkTime = 0;
@@ -31,13 +31,12 @@ BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
 
-const char* firmwareVersion = "1.2.1"; // 當前韌體版本
+const char* firmwareVersion = "1.3.2"; // 當前韌體版本
 const char* deviceModel = "hoRelay2"; // 設備型號
 
 // ESP32-C3 GPIO 定義
 const int bootButton = 9;     // BOOT 按鈕在 GPIO 9
 const int resetButton = 1;        // 
-
 
 const int ledOnBoard = 3;    // 第二個按鈕在 GPIO 8
 const int ledOnFace = 0;        // 
@@ -47,15 +46,14 @@ const int relayButton = 4;      // 繼電器在 GPIO 4
 unsigned long buttonPressTime = 0;    // 記錄按下的時間
 unsigned long button2PressTime = 0;   // 第二個按鈕按下的時間
 unsigned long ledBlinkStart = 0;      // LED 開始閃爍的時間
-const int LONG_PRESS_TIME = 3000;     // 第一階段長按 3 秒
-const int BLINK_TIME = 3000;          // LED 閃爍 3 秒
-const int CONFIRM_TIME = 3000;        // 確認等待 3 秒
+const int LONG_PRESS_TIME = 3000;     // 長按 3 秒觸發重置
 bool isBlinking = false;              // LED 閃爍狀態
-bool waitingConfirm = false;          // 等待確認狀態
+bool lastBootButtonState = HIGH;      // BOOT 按鈕上次狀態
+bool lastResetButtonState = HIGH;     // RESET 按鈕上次狀態
 String deviceIdString;                // 儲存格式化後的設備 ID
 int failedAttempts = 0;               // MQTT 重試次數計數器
-bool isAPMode = false;                // AP 模式標誌
 bool relayState = false;              // 繼電器狀態
+bool bleConfigMode = false;           // BLE 配對模式標誌
 
 // WiFi 設定（預設值）
 char ssid[32] = "HBTech";
@@ -67,27 +65,12 @@ char mqttUsername[16] = "";
 char mqttPassword[16] = "";
 int mqttPort = 1883;
 
-// MQTT 伺服器配置結構
-struct MqttServerConfig {
-    const char* server;
-    int port;
-    const char* username;
-    const char* password;
-    const char* displayName;
-};
+// 預設 MQTT 伺服器配置
+const char* DEFAULT_MQTT_SERVER = "mqttgo.io";
+const int DEFAULT_MQTT_PORT = 1883;
+const char* DEFAULT_MQTT_USERNAME = NULL;
+const char* DEFAULT_MQTT_PASSWORD = NULL;
 
-// 5 個預設伺服器配置（所有資訊寫死在這裡）
-const MqttServerConfig DEFAULT_SERVERS[5] = {
-    // 伺服器地址, Port, 帳號, 密碼, 顯示名稱
-    {"mqttgo.io", 1883, NULL, NULL, "台灣 MQTT Go"},
-    {"broker.hoban.tw", 1883, NULL, NULL, "齁斑社企"},  // ← 請修改為實際帳密
-    {"mqtt.eclipseprojects.io", 1883, NULL, NULL, "Eclipse"},
-    {"broker.emqx.io", 1883, NULL, NULL, "EMQX 公共"},
-    {"broker.hivemq.com", 1883, NULL, NULL, "HiveMQ 公共"}
-};
-
-const int SERVER_COUNT = 5;
-int currentServerIndex = 0;         // 當前使用的伺服器索引
 bool useCustomServer = false;       // 是否使用自訂伺服器
 
 WiFiClient espClient; // MQTT 客戶端
@@ -138,6 +121,9 @@ void saveWiFiConfig() {
   // 儲存 MQTT Port (2 bytes)
   EEPROM.write(126, mqttPort & 0xFF);        // 低位元組
   EEPROM.write(127, (mqttPort >> 8) & 0xFF); // 高位元組
+  
+  // 儲存 useCustomServer 標誌
+  EEPROM.write(96, useCustomServer ? 1 : 0);
 
   EEPROM.commit();
 }
@@ -221,42 +207,21 @@ void clearWiFiConfig() {
 void blinkLED() {
   unsigned long currentTime = millis();
 
-  if (WiFi.status() != WL_CONNECTED && !isAPMode) {
+  if (bleConfigMode) {
+    // BLE 配對模式：慢速閃爍 (1000ms 間隔)
+    if (currentTime - lastBlinkTime >= 1000) {
+      ledState = !ledState;
+      digitalWrite(ledOnFace, ledState);
+      digitalWrite(ledOnBoard, ledState);
+      lastBlinkTime = currentTime;
+    }
+  } else if (WiFi.status() != WL_CONNECTED) {
     // WiFi 未連接模式：快速閃爍
     if (currentTime - lastBlinkTime >= QUICK_BLINK) {
       ledState = !ledState;
       digitalWrite(ledOnFace, ledState);
       digitalWrite(ledOnBoard, ledState);
       lastBlinkTime = currentTime;
-    }
-  } else if (isAPMode) {
-    // AP 模式：短短長模式
-    unsigned long patternTime = currentTime % (SHORT_BLINK * 2 + SHORT_BLINK * 2 + LONG_BLINK + PATTERN_PAUSE);
-
-    if (patternTime < SHORT_BLINK) {
-      // 第一個短閃
-      digitalWrite(ledOnFace, HIGH);
-      digitalWrite(ledOnBoard, HIGH);
-    } else if (patternTime < SHORT_BLINK * 2) {
-      // 第一個短閃暫停
-      digitalWrite(ledOnFace, LOW);
-      digitalWrite(ledOnBoard, LOW);
-    } else if (patternTime < SHORT_BLINK * 3) {
-      // 第二個短閃
-      digitalWrite(ledOnFace, HIGH);
-      digitalWrite(ledOnBoard, HIGH);
-    } else if (patternTime < SHORT_BLINK * 4) {
-      // 第二個短閃暫停
-      digitalWrite(ledOnFace, LOW);
-      digitalWrite(ledOnBoard, LOW);
-    } else if (patternTime < SHORT_BLINK * 4 + LONG_BLINK) {
-      // 長閃
-      digitalWrite(ledOnFace, HIGH);
-      digitalWrite(ledOnBoard, HIGH);
-    } else {
-      // 模式間暫停
-      digitalWrite(ledOnFace, LOW);
-      digitalWrite(ledOnBoard, LOW);
     }
   } else if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
     // WiFi 已連接但 MQTT 未連接：一長二短模式
@@ -559,93 +524,207 @@ void setup()
 
   const char* deviceId = getDeviceId();  // 獲取設備 ID
 
+  // 配置 WiFi 設定以提高穩定性
+  Serial.println("=== 初始化 WiFi 設定 ===");
+  WiFi.persistent(false);        // 不將 WiFi 配置寫入 Flash（減少寫入次數，延長壽命）
+  WiFi.setAutoReconnect(true);   // 啟用自動重連（ESP32 底層會嘗試重連）
+  WiFi.setSleep(false);          // 禁用 WiFi 睡眠模式（提高穩定性，避免斷線）
+
+  // 設定 WiFi 電源模式為最大性能（犧牲一點耗電換取穩定性）
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // 設定最大發射功率
+
+  Serial.printf("WiFi 模式: STA (Station)\n");
+  Serial.printf("自動重連: 啟用\n");
+  Serial.printf("睡眠模式: 禁用\n");
+  Serial.printf("發射功率: 19.5dBm (最大)\n");
+
   if (strlen(ssid) > 0) {
     Serial.println("SSID: " + String(ssid));
+    Serial.println("開始連接 WiFi...");
     connectToWiFi();
+    
+    // 只有在成功連接到 WiFi 時才使用智慧連接
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      smartConnect();  // 使用智慧連接取代 connectToMQTT()
+    }
   } else {
-    Serial.println("找不到 WiFi 設定。啟動 BLE 配對模式。");
-    isAPMode = true;
-    setupBLE();  // 先啟動 BLE
-
-    // 然後再啟動 AP 模式
-    WiFi.mode(WIFI_AP);
-    const char* deviceId = getDeviceId();
-    WiFi.softAP(deviceId);
-    Serial.print("AP 名稱: ");
-    Serial.println(deviceId);
-  }
-
-  // 只有在成功連接到 WiFi 且不是 AP 模式時才使用智慧連接
-  if (WiFi.status() == WL_CONNECTED && !isAPMode)
-  {
-    smartConnect();  // 使用智慧連接取代 connectToMQTT()
+    // 沒有 WiFi 設定，啟動 BLE 配對模式
+    Serial.println("找不到 WiFi 設定，啟動 BLE 配對模式...");
+    bleConfigMode = true;
+    setupBLE();
+    Serial.println("請使用 App 透過 BLE 配對設定 WiFi");
   }
 
 }
 
 void loop()
 {
-  // 在 AP 模式下處理 BLE
-  if (isAPMode && deviceConnected) {
-    delay(10);
+  // 讀取按鈕當前狀態
+  bool currentBootState = digitalRead(bootButton);
+  bool currentResetState = digitalRead(resetButton);
+
+  // 檢查按鈕是否被按下（從 HIGH 變成 LOW）
+  if ((currentBootState == LOW && lastBootButtonState == HIGH) || 
+      (currentResetState == LOW && lastResetButtonState == HIGH)) {
+    // 按鈕剛被按下，開始計時
+    if (buttonPressTime == 0) {
+      buttonPressTime = millis();
+      Serial.println("偵測到按鈕按下，開始計時...");
+    }
   }
 
-  // 檢查第一個按鈕狀態
-  if (digitalRead(bootButton) == LOW || digitalRead(resetButton) == LOW) {  // 按鈕被按下
-    if (buttonPressTime == 0) {  // 開始計時
-      buttonPressTime = millis();
-    } 
-    
+  // 如果按鈕正在被按下
+  if (currentBootState == LOW || currentResetState == LOW) {
     unsigned long pressDuration = millis() - buttonPressTime;
     
-    if (!isBlinking && pressDuration > LONG_PRESS_TIME) {
-      // 第一階段：開始閃爍
+    // 長按超過 3 秒，開始閃爍 LED
+    if (!isBlinking && pressDuration >= LONG_PRESS_TIME) {
       isBlinking = true;
       ledBlinkStart = millis();
-      Serial.println("開始 LED 閃爍...");
+      Serial.println("長按 3 秒達成，開始 LED 閃爍確認...");
     }
     
+    // 閃爍期間
     if (isBlinking) {
-      if (!waitingConfirm && (millis() - ledBlinkStart) < BLINK_TIME) {
-        // LED 閃爍階段
-        blinkLED();
-      } else if (!waitingConfirm) {
-        // 進入確認等待階段
-        waitingConfirm = true;
-        digitalWrite(ledOnFace, HIGH);  // LED 恆亮
-        digitalWrite(ledOnBoard, HIGH);  // LED 恆亮
-        Serial.println("請繼續按住按鈕以確認清除...");
-      }
+      unsigned long blinkDuration = millis() - ledBlinkStart;
       
-      if (waitingConfirm && (millis() - ledBlinkStart) > (BLINK_TIME + CONFIRM_TIME)) {
-        // 完成所有階段，執行清除
-        Serial.println("清除 WiFi 設定...");
-        digitalWrite(ledOnFace, LOW);  // 關閉 LED
-        digitalWrite(ledOnBoard, LOW);  // 關閉 LED
+      // 閃爍 3 秒
+      if (blinkDuration < LONG_PRESS_TIME) {
+        // 500ms 間隔閃爍
+        bool shouldLedBeOn = (blinkDuration % 500) < 250;
+        digitalWrite(ledOnFace, shouldLedBeOn ? HIGH : LOW);
+        digitalWrite(ledOnBoard, shouldLedBeOn ? HIGH : LOW);
+      } else {
+        // 閃爍 3 秒後，如果按鈕還在按著，執行重置
+        Serial.println("確認重置，清除 WiFi 設定...");
+        digitalWrite(ledOnFace, LOW);
+        digitalWrite(ledOnBoard, LOW);
         clearWiFiConfig();  // 清除設定並重啟
       }
     }
   } else {
-    // 按鈕放開，重置所有狀態
+    // 按鈕被放開，重置所有狀態
+    if (buttonPressTime != 0) {
+      Serial.println("按鈕放開，取消重置");
+    }
     buttonPressTime = 0;
     isBlinking = false;
-    waitingConfirm = false;
-    // 不要在這裡關閉 LED，讓 blinkLED() 處理
   }
 
+  // 更新按鈕上次狀態
+  lastBootButtonState = currentBootState;
+  lastResetButtonState = currentResetState;
+
   // 當不在按鈕長按流程時，根據連接狀態控制 LED 閃燈
-  if (!isBlinking && !waitingConfirm) {
+  if (!isBlinking) {
     blinkLED();
   }
 
 
-  // MQTT 相關程式碼
-  if (WiFi.status() == WL_CONNECTED && !isAPMode) {
-    static unsigned long lastReconnectAttempt = 0;
-    static unsigned long lastKeepAlive = 0;
-    static int reconnectFailCount = 0;
-    unsigned long now = millis();
+  // BLE 配對模式：只處理 BLE 連線
+  if (bleConfigMode) {
+    if (deviceConnected) {
+      delay(10);
+    }
+    return;  // BLE 配對模式下不執行其他邏輯
+  }
 
+  // WiFi 和 MQTT 管理
+  static unsigned long lastWiFiCheck = 0;
+  static unsigned long lastReconnectAttempt = 0;
+  static unsigned long lastKeepAlive = 0;
+  static int reconnectFailCount = 0;
+  static int wifiFailCount = 0;
+  static unsigned long wifiConnectedTime = 0;  // 記錄連接成功的時間
+  unsigned long now = millis();
+
+  // 檢查 WiFi 連線狀態（縮短檢查間隔到 5 秒）
+  if (now - lastWiFiCheck > 5000) {
+    lastWiFiCheck = now;
+
+    if (WiFi.status() != WL_CONNECTED && strlen(ssid) > 0) {
+      wifiFailCount++;
+
+      // 如果是第一次斷線，記錄診斷資訊
+      if (wifiFailCount == 1) {
+        Serial.println("═══ WiFi 連接中斷 ═══");
+        Serial.printf("斷線時間: %lu ms\n", now);
+        if (wifiConnectedTime > 0) {
+          Serial.printf("已連接時長: %lu 秒\n", (now - wifiConnectedTime) / 1000);
+        }
+      }
+
+      Serial.printf("WiFi 重連嘗試 #%d...\n", wifiFailCount);
+
+      // 根據失敗次數採用不同策略
+      if (wifiFailCount <= 3) {
+        // 前 3 次：快速重連
+        Serial.println("策略：快速重連");
+        connectToWiFi();
+      } else if (wifiFailCount <= 6) {
+        // 第 4-6 次：重置 WiFi 模組後重連
+        Serial.println("策略：重置 WiFi 模組後重連");
+        WiFi.disconnect(true);
+        delay(1000);
+        WiFi.mode(WIFI_OFF);
+        delay(1000);
+        WiFi.mode(WIFI_STA);
+        delay(1000);
+        connectToWiFi();
+      } else {
+        // 第 7 次以上：完整重啟 WiFi（但不重啟設備）
+        Serial.println("策略：完整重啟 WiFi 子系統");
+        WiFi.disconnect(true);
+        delay(2000);
+        WiFi.mode(WIFI_OFF);
+        delay(2000);
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(true);
+        WiFi.setSleep(false);
+        delay(1000);
+        connectToWiFi();
+
+        // 如果超過 10 次仍失敗，重置計數避免無限重試
+        if (wifiFailCount > 10) {
+          Serial.println("⚠ 重連失敗次數過多，暫停重試 30 秒");
+          wifiFailCount = 0;
+          lastWiFiCheck = now + 25000;  // 延遲到 30 秒後再檢查
+        }
+      }
+
+      // 如果連接成功，重置失敗計數並記錄時間
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("✓ WiFi 重新連接成功！(嘗試 %d 次)\n", wifiFailCount);
+        Serial.printf("訊號強度: %d dBm\n", WiFi.RSSI());
+        wifiFailCount = 0;
+        wifiConnectedTime = now;
+      }
+    } else if (WiFi.status() == WL_CONNECTED) {
+      // WiFi 已連接
+      if (wifiFailCount > 0) {
+        // 剛恢復連接
+        Serial.println("✓ WiFi 連接已恢復");
+        wifiFailCount = 0;
+      }
+
+      // 如果是第一次記錄，保存連接時間
+      if (wifiConnectedTime == 0) {
+        wifiConnectedTime = now;
+      }
+
+      // 定期印出 WiFi 狀態（每分鐘）
+      static unsigned long lastStatusPrint = 0;
+      if (now - lastStatusPrint > 60000) {
+        lastStatusPrint = now;
+        Serial.printf("ℹ WiFi 狀態: 已連接 %lu 秒，訊號 %d dBm\n",
+                     (now - wifiConnectedTime) / 1000, WiFi.RSSI());
+      }
+    }
+  }
+
+  // MQTT 連線管理
+  if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
       if (now - lastReconnectAttempt > 10000) {  // 每10秒重連一次
         lastReconnectAttempt = now;
@@ -653,9 +732,9 @@ void loop()
 
         reconnectFailCount++;
 
-        // 失敗3次後，切換伺服器
+        // 失敗3次後，重新智慧連接
         if (reconnectFailCount >= 3) {
-          Serial.println("多次重連失敗，切換伺服器...");
+          Serial.println("多次重連失敗，重新連接...");
           smartConnect();  // 重新智慧連接
           reconnectFailCount = 0;
         } else {
@@ -663,7 +742,7 @@ void loop()
           if (useCustomServer && strlen(mqttServer) > 0) {
             quickConnectCustom();
           } else {
-            quickConnect(DEFAULT_SERVERS[currentServerIndex]);
+            quickConnectDefault();
           }
         }
       }
@@ -674,7 +753,7 @@ void loop()
       // 每 3 秒發送一次保持連線的狀態更新（帶伺服器資訊）
       if (now - lastKeepAlive > 3000) {
         const char* server = useCustomServer && strlen(mqttServer) > 0 ?
-                             mqttServer : DEFAULT_SERVERS[currentServerIndex].server;
+                             mqttServer : DEFAULT_MQTT_SERVER;
         publishStatusWithServer(server);
         lastKeepAlive = now;
       }
@@ -683,37 +762,100 @@ void loop()
 }
 
 void connectToWiFi() {
+  // 檢查當前狀態
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi 已連接，跳過重連");
+    return;
+  }
+
+  // 溫和地斷開連接（不清除配置）
+  if (WiFi.status() != WL_DISCONNECTED) {
+    WiFi.disconnect(false);  // false = 不清除 WiFi 配置
+    delay(100);
+  }
+
+  // 設置為 STA 模式
+  WiFi.mode(WIFI_STA);
+
+  // 開始連接
+  Serial.printf("正在連接 WiFi: %s\n", ssid);
   WiFi.begin(ssid, password);
-  Serial.print("正在連接 WiFi");
 
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
+  const int maxAttempts = 60;  // 增加到 60 次（30 秒）
+
+  while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
+    blinkLED();  // 連接過程中持續閃爍 LED
+    delay(500);  // 增加到 500ms，給 WiFi 更多時間
+
+    // 每 2 秒印出一個點和當前狀態
+    if (attempts % 4 == 0) {
+      Serial.print(".");
+
+      // 印出詳細狀態碼（用於診斷）
+      if (attempts % 20 == 0 && attempts > 0) {
+        wl_status_t status = WiFi.status();
+        Serial.printf("\n狀態碼: %d ", status);
+        switch(status) {
+          case WL_IDLE_STATUS: Serial.print("(閒置)"); break;
+          case WL_NO_SSID_AVAIL: Serial.print("(找不到SSID)"); break;
+          case WL_SCAN_COMPLETED: Serial.print("(掃描完成)"); break;
+          case WL_CONNECT_FAILED: Serial.print("(連接失敗)"); break;
+          case WL_CONNECTION_LOST: Serial.print("(連接中斷)"); break;
+          case WL_DISCONNECTED: Serial.print("(已斷線)"); break;
+        }
+        Serial.println();
+      }
+    }
     attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi 連接成功！");
+    Serial.println("\n✓ WiFi 連接成功！");
     Serial.print("IP 位址: ");
     Serial.println(WiFi.localIP());
-    isAPMode = false;
-    
+    Serial.print("訊號強度: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    Serial.print("MAC 位址: ");
+    Serial.println(WiFi.macAddress());
+
     // WiFi 連接成功後發布狀態
     if (mqttClient.connected()) {
       publishStatus();
     }
   } else {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_AP);
-    const char* deviceId = getDeviceId();
-    Serial.println("\n無法連接到 WiFi，啟動 AP 模式。");
-    setupBLE();
-    WiFi.softAP(deviceId);
-    Serial.print("AP IP 位址: ");
-    Serial.println(WiFi.softAPIP());
-    isAPMode = true;
-    blinkLED(); // 使用現有的 blinkLED 函數
+    Serial.println("\n✗ 無法連接到 WiFi");
+    Serial.printf("最後狀態碼: %d\n", WiFi.status());
+
+    wl_status_t finalStatus = WiFi.status();
+    Serial.println("診斷資訊：");
+
+    switch(finalStatus) {
+      case WL_NO_SSID_AVAIL:
+        Serial.println("❌ 找不到指定的 SSID");
+        Serial.println("  → 請確認 SSID 名稱正確");
+        Serial.println("  → 確認路由器已開啟且在訊號範圍內");
+        break;
+      case WL_CONNECT_FAILED:
+        Serial.println("❌ 連接失敗（可能是密碼錯誤）");
+        Serial.println("  → 請檢查 WiFi 密碼");
+        Serial.println("  → 確認使用 2.4GHz 頻段（不支援 5GHz）");
+        break;
+      case WL_CONNECTION_LOST:
+        Serial.println("❌ 連接中斷");
+        Serial.println("  → 訊號可能太弱");
+        Serial.println("  → 路由器可能不穩定");
+        break;
+      default:
+        Serial.println("其他可能原因：");
+        Serial.println("1. SSID 或密碼錯誤");
+        Serial.println("2. 訊號太弱（嘗試靠近路由器）");
+        Serial.println("3. 路由器限制連接數（嘗試重啟路由器）");
+        Serial.println("4. WiFi 頻段不支援（僅支援 2.4GHz）");
+        Serial.println("5. MAC 過濾已啟用（請將設備加入白名單）");
+        break;
+    }
   }
 }
 
@@ -840,11 +982,11 @@ void publishServerChangeEvent(const char* switchType, const char* server) {
   Serial.printf("已發布伺服器切換事件: %s (%s)\n", server, switchType);
 }
 
-// 快速連接：嘗試連接單個伺服器，1秒內成功就返回 true（支援認證）
-bool quickConnect(const MqttServerConfig& config) {
-  Serial.printf("快速測試: %s:%d ... ", config.server, config.port);
+// 快速連接預設伺服器
+bool quickConnectDefault() {
+  Serial.printf("快速測試預設伺服器: %s:%d ... ", DEFAULT_MQTT_SERVER, DEFAULT_MQTT_PORT);
 
-  mqttClient.setServer(config.server, config.port);
+  mqttClient.setServer(DEFAULT_MQTT_SERVER, DEFAULT_MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setKeepAlive(30);
 
@@ -856,16 +998,16 @@ bool quickConnect(const MqttServerConfig& config) {
   StaticJsonDocument<128> offlineDoc;
   offlineDoc["device_id"] = deviceId;
   offlineDoc["status"] = "offline";
-  offlineDoc["server"] = config.server;
+  offlineDoc["server"] = DEFAULT_MQTT_SERVER;
   offlineDoc["timestamp"] = millis() / 1000;
 
   char offlineBuffer[128];
   serializeJson(offlineDoc, offlineBuffer);
 
-  // 嘗試連接（1秒超時），使用設定的帳密（可能為 NULL）
+  // 嘗試連接（1秒超時）
   if (mqttClient.connect(deviceId,
-                        config.username,   // 從 config 取得帳號（可為 NULL）
-                        config.password,   // 從 config 取得密碼（可為 NULL）
+                        DEFAULT_MQTT_USERNAME,
+                        DEFAULT_MQTT_PASSWORD,
                         statusTopic.c_str(), 1, true,
                         offlineBuffer, true)) {
     unsigned long connectTime = millis() - startTime;
@@ -879,7 +1021,7 @@ bool quickConnect(const MqttServerConfig& config) {
       mqttClient.subscribe(controlTopic.c_str());
 
       // 發布上線狀態（包含伺服器資訊）
-      publishStatusWithServer(config.server);
+      publishStatusWithServer(DEFAULT_MQTT_SERVER);
 
       return true;
     } else {
@@ -965,57 +1107,34 @@ void smartConnect() {
       failedAttempts = 0;
       return;
     }
-    Serial.println("自訂伺服器失敗，切換到預設列表");
+    Serial.println("自訂伺服器失敗，切換到預設伺服器");
   }
 
-  // 2. 嘗試上次成功的伺服器
-  EEPROM.begin(128);
-  int lastSuccessIndex = EEPROM.read(97);  // 讀取上次成功的索引
+  // 2. 嘗試預設伺服器（mqttgo.io）
+  Serial.println("嘗試連接預設伺服器...");
+  if (quickConnectDefault()) {
+    Serial.println("✓ 已連接到預設伺服器");
+    publishServerChangeEvent("default", DEFAULT_MQTT_SERVER);
+    failedAttempts = 0;
+    return;
+  }
 
-  if (lastSuccessIndex >= 0 && lastSuccessIndex < SERVER_COUNT) {
-    Serial.printf("嘗試上次成功的伺服器 [%d]: %s\n",
-                  lastSuccessIndex, DEFAULT_SERVERS[lastSuccessIndex].displayName);
-    if (quickConnect(DEFAULT_SERVERS[lastSuccessIndex])) {
-      currentServerIndex = lastSuccessIndex;
-      Serial.printf("✓ 已連接到伺服器: %s\n", DEFAULT_SERVERS[lastSuccessIndex].displayName);
+  Serial.println("✗ 預設伺服器連接失敗");
+  
+  // 如果預設伺服器失敗，重試幾次
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("重試第 %d 次...\n", attempt);
+    delay(2000);  // 等待 2 秒後重試
+    
+    if (quickConnectDefault()) {
+      Serial.println("✓ 重試成功，已連接到預設伺服器");
+      publishServerChangeEvent("default", DEFAULT_MQTT_SERVER);
       failedAttempts = 0;
       return;
     }
   }
 
-  // 3. 循環嘗試所有預設伺服器
-  Serial.println("循環測試所有預設伺服器...");
-  for (int attempt = 0; attempt < SERVER_COUNT * 2; attempt++) {
-    int index = attempt % SERVER_COUNT;
-
-    // 跳過剛才失敗的伺服器
-    if (index == lastSuccessIndex && attempt < SERVER_COUNT) continue;
-
-    Serial.printf("嘗試伺服器 [%d/%d]: %s\n",
-                  attempt + 1, SERVER_COUNT * 2,
-                  DEFAULT_SERVERS[index].displayName);
-
-    if (quickConnect(DEFAULT_SERVERS[index])) {
-      currentServerIndex = index;
-
-      // 儲存成功的伺服器索引
-      EEPROM.begin(128);
-      EEPROM.write(97, index);
-      EEPROM.commit();
-
-      Serial.printf("✓ 已連接並儲存伺服器 [%d]: %s\n",
-                   index, DEFAULT_SERVERS[index].displayName);
-
-      // 發布伺服器切換事件
-      publishServerChangeEvent("auto", DEFAULT_SERVERS[index].server);
-      failedAttempts = 0;
-      return;
-    }
-
-    delay(500);  // 短暫延遲避免過快請求
-  }
-
-  Serial.println("✗ 所有伺服器連接失敗");
+  Serial.println("✗ 所有連接嘗試失敗");
   failedAttempts = 5;  // 設置為最大值，避免持續重試
 }
 
@@ -1039,6 +1158,7 @@ void startFirmwareUpdate(const char* downloadUrl) {
   isUpdating = true;
   updateProgress = 0;
   digitalWrite(ledOnFace, HIGH);
+  digitalWrite(ledOnBoard, HIGH);
   
   // 發送更新開始狀態到 MQTT
   if (mqttClient.connected()) {
@@ -1190,6 +1310,7 @@ void startFirmwareUpdate(const char* downloadUrl) {
   // 更新失敗處理
   isUpdating = false;
   digitalWrite(ledOnFace, LOW);
+  digitalWrite(ledOnBoard, LOW);
   
   if (mqttClient.connected()) {
     String deviceId = getDeviceId();
