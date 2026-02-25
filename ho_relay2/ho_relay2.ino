@@ -31,7 +31,7 @@ BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
 
-const char* firmwareVersion = "1.3.9"; // 當前韌體版本
+const char* firmwareVersion = "1.3.11"; // 當前韌體版本
 const char* deviceModel = "hoRelay2"; // 設備型號
 
 // ESP32-C3 GPIO 定義

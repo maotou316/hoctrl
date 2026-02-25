@@ -1,68 +1,61 @@
-## MQTT 技術規格
+## 韌體發布工具 (publish.py)
 
-### 1. 連線配置
-| 參數 | 值 |
-|------|-----|
-| 代理伺服器 | 支援 5 個預設伺服器 + 自訂伺服器 |
-| 連接埠 | 1883（可自訂） |
-| 認證方式 | 支援帳號密碼認證（選用） |
-| 重連機制 | 智慧伺服器切換，失敗 3 次自動切換伺服器 |
-| QoS 等級 | 0 |
-| 連線策略 | 每次啟動選擇最快伺服器（1秒內連線即採用） |
+hoRelay 韌體發布自動化腳本，支援 hoRelay1～3。自動完成版本遞增、編譯、上傳至 GitHub Releases / Firebase Storage，並更新 Firestore 記錄。
 
-### 2. 預設伺服器列表
-| 序號 | 伺服器名稱 | 伺服器位址 | 埠號 | 需要認證 |
-|------|------------|------------|------|----------|
-| 1 | 台灣 MQTT Go | mqttgo.io | 1883 | ✗ |
-| 2 | 齁斑社企 | broker.hoban.tw | 1883 | ✓ |
-| 3 | Eclipse | mqtt.eclipseprojects.io | 1883 | ✗ |
-| 4 | EMQX 公共 | broker.emqx.io | 1883 | ✗ |
-| 5 | HiveMQ 公共 | broker.hivemq.com | 1883 | ✗ |
+### 必要工具
 
-### 2.1 智慧連線機制
-設備啟動時按以下優先順序連線：
-1. **自訂伺服器**（如果有設定）
-2. **上次成功的伺服器**
-3. **循環測試所有預設伺服器**（1秒快速測試）
+| 工具 | 用途 | 安裝方式 |
+|------|------|----------|
+| arduino-cli | 編譯韌體 | https://arduino.github.io/arduino-cli/ |
+| firebase | Firestore 更新 | `npm install -g firebase-tools` |
+| gh | GitHub Releases 上傳（優先） | https://cli.github.com/ |
+| gsutil | Firebase Storage 上傳（備選） | https://cloud.google.com/storage/docs/gsutil_install |
 
-連線中如果失敗 3 次，會自動切換到下一個可用伺服器。
+### 用法
 
-### 2.2 認證配置
-- **預設伺服器認證**：寫死在韌體中，無需手動配置
-- **自訂伺服器認證**：
-  - 透過 BLE 配置：發送 JSON 包含 `mqtt_username` 和 `mqtt_password` 欄位
-  - 透過 Web 介面：在 MQTT 設定表單中填寫帳號密碼（選用）
-  - 儲存位置：EEPROM（帳號 16 bytes + 密碼 16 bytes）
-  - 如果不需要認證，將欄位留空即可
+```bash
+# 互動式選擇型號
+python publish.py
 
-### 3. 主題架構
-```
-狀態發布主題：hoban/{device_id}/status
-控制訂閱主題：hoban/{device_id}/control
+# 指定型號發布
+python publish.py 1                       # hoRelay1 (ESP32 WROOM)
+python publish.py 2                       # hoRelay2 (ESP32-C3)
+python publish.py 3                       # hoRelay3 (ESP32-C3)
+
+# 附帶更新說明
+python publish.py 2 -c "修正 WiFi 連接問題"
+
+# 跳過確認直接發布
+python publish.py 1 -y
+
+# 指定最低版本要求
+python publish.py 2 -m 1.2.0
+
+# 組合使用
+python publish.py 3 -c "新增藍牙配對功能" -m 1.0.0 -y
 ```
 
-### 4. 控制指令集
-| 指令 | 功能描述 |
-|------|----------|
-| status | 請求設備狀態回報 |
-| ON | 觸發繼電器動作 |
-| reset | 重置設備配置 |
-| update | 觸發韌體更新程序 |
+### 參數說明
 
-### 5. 狀態回報機制
-- **回報頻率**：15秒/次
-- **回報內容**：
-  - 設備識別碼 (device_id)
-  - 韌體版本號
-  - WiFi 連線狀態
-  - 系統記憶體使用量
-- **離線檢測**：
-  - 實作 Last Will and Testament (LWT)
-  - 支援即時離線通知
+| 參數 | 說明 | 預設值 |
+|------|------|--------|
+| `relay` | 型號編號 (1/2/3)，不帶則進入互動選單 | 無 |
+| `-c`, `--changelog` | 更新說明 | `修正錯誤，優化效能` |
+| `-m`, `--min-version` | 最低版本要求 | `1.0.0` |
+| `-y`, `--yes` | 跳過確認直接發布 | 否 |
 
-### 6. LED 狀態指示
-| 狀態 | LED 行為模式 |
-|------|-------------|
-| 韌體更新中 | 快速閃爍 (200ms 間隔) |
-| AP 模式 | 慢速閃爍 (1000ms 間隔) |
-| 正常運作 | 恆亮 |
+### 發布流程
+
+1. **檢查工具** — 確認 arduino-cli、firebase 等已安裝
+2. **讀取韌體資訊** — 從 `.ino` 讀取目前版本號與設備型號
+3. **版本遞增** — 自動將末位版本號 +1（例如 1.3.9 → 1.3.10）
+4. **編譯韌體** — 使用 arduino-cli 編譯，產出 `.bin` 檔案
+5. **上傳韌體** — 依序嘗試 GitHub Releases → Firebase Storage → gsutil → 手動上傳
+6. **更新 Firestore** — 寫入 `firmware_updates/{model}` 文件，設備下次連線時收到更新通知
+
+### 上傳優先順序
+
+1. **GitHub Releases**（需安裝 gh CLI）— 上傳至 `maotou316/hoctrl-firmware`
+2. **Python Firebase Storage**（需安裝 `google-cloud-storage`）
+3. **gsutil**（需安裝 Google Cloud SDK）
+4. **手動上傳** — 提示開啟 Firebase Console 手動操作
