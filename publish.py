@@ -501,23 +501,46 @@ db.collection('firmware_updates')
 
 # ── 主程式 ──────────────────────────────────────────────────────────
 
+def select_relay():
+    """互動式選擇型號"""
+    print_color("\n╔════════════════════════════════════════╗", Colors.CYAN)
+    print_color("║   hoRelay 韌體發布自動化腳本          ║", Colors.CYAN)
+    print_color("╚════════════════════════════════════════╝\n", Colors.CYAN)
+    print_color("請選擇要發布的型號:\n", Colors.WHITE)
+    for num, cfg in MODEL_CONFIGS.items():
+        print_color(f"  {num}) {cfg['label']}", Colors.WHITE)
+    print_color("", Colors.NC)
+    while True:
+        try:
+            choice = input("請輸入型號編號 (1-3): ").strip()
+            num = int(choice)
+            if num in MODEL_CONFIGS:
+                return num
+            print_color("⚠ 請輸入 1、2 或 3", Colors.YELLOW)
+        except ValueError:
+            print_color("⚠ 請輸入數字", Colors.YELLOW)
+        except EOFError:
+            sys.exit(0)
+
 def main():
     parser = argparse.ArgumentParser(
         description='hoRelay 韌體發布自動化腳本（支援 hoRelay1～3）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='範例:\n'
+               '  python publish.py\n'
                '  python publish.py 2\n'
                '  python publish.py 3 -c "修正 WiFi 連接問題"\n'
                '  python publish.py 1 -y -m 1.0.0\n'
     )
-    parser.add_argument('relay', type=int, choices=[1, 2, 3],
+    parser.add_argument('relay', type=int, choices=[1, 2, 3], nargs='?', default=None,
                         help='繼電器型號 (1=hoRelay1, 2=hoRelay2, 3=hoRelay3)')
     parser.add_argument('-c', '--changelog', help='更新說明')
     parser.add_argument('-m', '--min-version', default='1.0.0', help='最低版本要求')
     parser.add_argument('-y', '--yes', action='store_true', help='跳過確認直接發布')
     args = parser.parse_args()
 
-    cfg = MODEL_CONFIGS[args.relay]
+    relay = args.relay if args.relay is not None else select_relay()
+    cfg = MODEL_CONFIGS[relay]
 
     # 以腳本所在目錄為基準計算 project_dir
     script_dir = os.path.dirname(os.path.abspath(__file__))
