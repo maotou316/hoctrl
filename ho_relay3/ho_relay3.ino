@@ -31,7 +31,7 @@ BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
 
-const char* firmwareVersion = "1.3.9"; // 當前韌體版本
+const char* firmwareVersion = "1.3.5"; // 當前韌體版本
 const char* deviceModel = "hoRelay2"; // 設備型號
 
 // ESP32-C3 GPIO 定義
@@ -555,6 +555,7 @@ void setupBLE() {
 
 void setup()
 {
+  delay(3000); // 等待 USB CDC 穩定，避免 boot loop
   Serial.begin(115200);
   delay(1000); // 等待序列埠穩定
 

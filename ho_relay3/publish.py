@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hoRelay2 韌體發布自動化腳本
+hoRelay3 韌體發布自動化腳本
 此腳本會編譯韌體、上傳到 Firebase Storage 並更新 Firestore 記錄
 """
 
@@ -113,7 +113,7 @@ def increment_version(version):
 
 def update_firmware_version(new_version):
     """更新 .ino 檔案中的版本號"""
-    ino_file = "ho_relay2.ino"
+    ino_file = "ho_relay3.ino"
 
     try:
         with open(ino_file, 'r', encoding='utf-8') as f:
@@ -139,7 +139,7 @@ def get_firmware_info():
     """從 .ino 檔案讀取韌體資訊"""
     print_header("讀取韌體資訊")
 
-    ino_file = "ho_relay2.ino"
+    ino_file = "ho_relay3.ino"
     if not os.path.exists(ino_file):
         print_color(f"❌ 找不到 {ino_file}", Colors.RED)
         return None
@@ -570,14 +570,14 @@ db.collection('firmware_updates')
 
 def main():
     """主函數"""
-    parser = argparse.ArgumentParser(description='hoRelay2 韌體發布自動化腳本')
+    parser = argparse.ArgumentParser(description='hoRelay3 韌體發布自動化腳本')
     parser.add_argument('-c', '--changelog', help='更新說明')
     parser.add_argument('-m', '--min-version', default='1.0.0', help='最低版本要求')
     parser.add_argument('-y', '--yes', action='store_true', help='跳過確認直接發布')
     args = parser.parse_args()
     
     print_color("\n╔════════════════════════════════════════╗", Colors.CYAN)
-    print_color("║   hoRelay2 韌體發布自動化腳本        ║", Colors.CYAN)
+    print_color("║   hoRelay3 韌體發布自動化腳本        ║", Colors.CYAN)
     print_color("╚════════════════════════════════════════╝\n", Colors.CYAN)
     
     # 檢查必要工具
