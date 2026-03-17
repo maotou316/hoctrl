@@ -33,13 +33,18 @@ MODEL_CONFIGS = {
         'dir': 'ho_relay2',
         'ino': 'ho_relay2.ino',
         'fqbn': 'esp32:esp32:esp32c3:CDCOnBoot=cdc,CPUFreq=160,DebugLevel=error,EraseFlash=all,FlashFreq=80,FlashMode=dio,FlashSize=4M,JTAGAdapter=default,PartitionScheme=custom,UploadSpeed=921600,ZigbeeMode=default',
-        'label': 'hoRelay2 (ESP32-C3)',
+        'label': 'hoRelay2/hoRelay2-1 (ESP32-C3 MOSFET)',
+        # 同一份 .ino 編譯出多個硬體變體（不同出廠年份 GPIO 不同）
+        'variants': [
+            {'model': 'hoRelay2',   'relay_pin': 4},  # 舊版
+            {'model': 'hoRelay2-1', 'relay_pin': 7},  # 新版
+        ],
     },
     3: {
         'dir': 'ho_relay3',
         'ino': 'ho_relay3.ino',
         'fqbn': 'esp32:esp32:esp32c3:CDCOnBoot=cdc,CPUFreq=160,DebugLevel=error,EraseFlash=all,FlashFreq=80,FlashMode=dio,FlashSize=4M,JTAGAdapter=default,PartitionScheme=custom,UploadSpeed=921600,ZigbeeMode=default',
-        'label': 'hoRelay3 (ESP32-C3)',
+        'label': 'hoRelay v3.0 齁斑自製電路板',
     },
 }
 
@@ -143,7 +148,7 @@ def update_firmware_version(project_dir, ino_file, new_version):
         print_color(f"❌ 更新版本號失敗: {e}", Colors.RED)
         return False
 
-def get_firmware_info(project_dir, ino_file):
+def get_firmware_info(project_dir, ino_file, cfg=None):
     print_header("讀取韌體資訊")
     ino_path = os.path.join(project_dir, ino_file)
     if not os.path.exists(ino_path):
@@ -157,13 +162,24 @@ def get_firmware_info(project_dir, ino_file):
             print_color("❌ 無法從 .ino 檔案讀取版本號", Colors.RED)
             return None
         version = version_match.group(1)
-        model_match = re.search(r'const char\* deviceModel = "([^"]+)"', content)
-        if not model_match:
-            print_color("❌ 無法從 .ino 檔案讀取設備型號", Colors.RED)
-            return None
-        model = model_match.group(1)
-        print_color(f"設備型號: {model}", Colors.WHITE)
-        print_color(f"韌體版本: {version}", Colors.WHITE)
+
+        # 如果有多變體設定，model 由變體定義；否則從 .ino 讀取
+        variants = cfg.get('variants') if cfg else None
+        if variants:
+            model = variants[0]['model']  # 主要型號
+            print_color(f"韌體版本: {version}", Colors.WHITE)
+            print_color(f"硬體變體: {len(variants)} 個", Colors.WHITE)
+            for v in variants:
+                print_color(f"  - {v['model']} (GPIO {v['relay_pin']})", Colors.GRAY)
+        else:
+            model_match = re.search(r'const char\* deviceModel = "([^"]+)"', content)
+            if not model_match:
+                print_color("❌ 無法從 .ino 檔案讀取設備型號", Colors.RED)
+                return None
+            model = model_match.group(1)
+            print_color(f"設備型號: {model}", Colors.WHITE)
+            print_color(f"韌體版本: {version}", Colors.WHITE)
+
         return {'version': version, 'model': model}
     except Exception as e:
         print_color(f"❌ 讀取檔案失敗: {e}", Colors.RED)
@@ -171,9 +187,9 @@ def get_firmware_info(project_dir, ino_file):
 
 # ── 編譯韌體 ────────────────────────────────────────────────────────
 
-def build_firmware(project_dir, fqbn, model):
-    print_header("開始編譯韌體")
-    build_path = os.path.join(project_dir, 'build')
+def build_firmware(project_dir, fqbn, model, variant=None):
+    print_header(f"編譯韌體: {model}")
+    build_path = os.path.join(project_dir, 'build', model) if variant else os.path.join(project_dir, 'build')
 
     # 清空並重建 build 目錄，避免殘留舊的 .bin 檔案
     if os.path.exists(build_path):
@@ -181,31 +197,41 @@ def build_firmware(project_dir, fqbn, model):
     os.makedirs(build_path)
 
     print_color(f"FQBN: {fqbn}", Colors.GRAY)
+
+    # 組合編譯指令
+    cli = get_arduino_cli_path()
+    cmd = [cli, 'compile', '--fqbn', fqbn, '--output-dir', build_path]
+
+    # 如果有變體定義，透過編譯旗標指定 GPIO（型號由 .ino 根據 RELAY_PIN 自動決定）
+    if variant:
+        extra_flag = f'-DRELAY_PIN={variant["relay_pin"]}'
+        cmd += [
+            '--build-property', f'compiler.cpp.extra_flags={extra_flag}',
+            '--build-property', f'compiler.c.extra_flags={extra_flag}',
+        ]
+        print_color(f"編譯旗標: {extra_flag}", Colors.GRAY)
+
+    cmd.append(project_dir)
     print_color("正在編譯...", Colors.YELLOW)
 
     try:
-        cli = get_arduino_cli_path()
-        res = subprocess.run(
-            [cli, 'compile', '--fqbn', fqbn, '--output-dir', build_path, project_dir],
-            encoding='utf-8',
-            errors='ignore'
-        )
+        res = subprocess.run(cmd, encoding='utf-8', errors='ignore')
         if res.returncode != 0:
-            print_color("❌ 編譯失敗", Colors.RED)
+            print_color(f"❌ {model} 編譯失敗", Colors.RED)
             return None
 
         bin_files = list(Path(build_path).glob('*.bin'))
         if not bin_files:
-            print_color("❌ 找不到編譯後的 .bin 檔案", Colors.RED)
+            print_color(f"❌ 找不到 {model} 編譯後的 .bin 檔案", Colors.RED)
             return None
 
         bin_file = bin_files[0]
         file_size = bin_file.stat().st_size / 1024
-        print_color(f"✓ 編譯成功: {bin_file.name}", Colors.GREEN)
+        print_color(f"✓ {model} 編譯成功: {bin_file.name}", Colors.GREEN)
         print_color(f"檔案大小: {file_size:.2f} KB", Colors.WHITE)
         return str(bin_file)
     except Exception as e:
-        print_color(f"❌ 編譯過程出錯: {e}", Colors.RED)
+        print_color(f"❌ {model} 編譯過程出錯: {e}", Colors.RED)
         return None
 
 # ── 上傳韌體 ────────────────────────────────────────────────────────
@@ -504,7 +530,7 @@ db.collection('firmware_updates')
 def select_relay():
     """互動式選擇型號"""
     print_color("\n╔════════════════════════════════════════╗", Colors.CYAN)
-    print_color("║   hoRelay 韌體發布自動化腳本          ║", Colors.CYAN)
+    print_color("║   hoRelay 韌體發布自動化腳本           ║", Colors.CYAN)
     print_color("╚════════════════════════════════════════╝\n", Colors.CYAN)
     print_color("請選擇要發布的型號:\n", Colors.WHITE)
     for num, cfg in MODEL_CONFIGS.items():
@@ -535,7 +561,7 @@ def main():
     parser.add_argument('relay', type=int, choices=[1, 2, 3], nargs='?', default=None,
                         help='繼電器型號 (1=hoRelay1, 2=hoRelay2, 3=hoRelay3)')
     parser.add_argument('-c', '--changelog', help='更新說明')
-    parser.add_argument('-m', '--min-version', default='1.0.0', help='最低版本要求')
+    parser.add_argument('-m', '--min-version', default='1.3.5', help='最低版本要求')
     parser.add_argument('-y', '--yes', action='store_true', help='跳過確認直接發布')
     args = parser.parse_args()
 
@@ -561,7 +587,7 @@ def main():
         sys.exit(1)
 
     # 讀取韌體資訊
-    firmware_info = get_firmware_info(project_dir, cfg['ino'])
+    firmware_info = get_firmware_info(project_dir, cfg['ino'], cfg)
     if not firmware_info:
         print_color("\n❌ 無法讀取韌體資訊", Colors.RED)
         sys.exit(1)
@@ -582,7 +608,6 @@ def main():
 
     # 確認更新資訊
     print_header("確認更新資訊")
-    print_color(f"設備型號: {model}", Colors.WHITE)
     print_color(f"韌體版本: {version}", Colors.WHITE)
     print_color(f"最低版本: {args.min_version}", Colors.WHITE)
 
@@ -593,36 +618,82 @@ def main():
 
     print_color(f"\n更新說明:\n{changelog}", Colors.WHITE)
 
-    # 編譯韌體
-    bin_path = build_firmware(project_dir, cfg['fqbn'], model)
-    if not bin_path:
-        print_color("\n❌ 編譯失敗，無法繼續", Colors.RED)
-        sys.exit(1)
+    # 判斷是否有多變體
+    variants = cfg.get('variants')
 
-    # 上傳到 Firebase 或 GitHub
-    download_url = upload_to_firebase(bin_path, project_dir, model, version, changelog)
-    if not download_url:
-        print_color("\n❌ 上傳失敗，無法繼續", Colors.RED)
-        sys.exit(1)
+    if variants:
+        # 多變體：逐一編譯、上傳、更新
+        results = []
+        for variant in variants:
+            vmodel = variant['model']
+            print_color(f"\n{'─'*50}", Colors.CYAN)
+            print_color(f"  處理變體: {vmodel} (GPIO {variant['relay_pin']})", Colors.CYAN)
+            print_color(f"{'─'*50}", Colors.CYAN)
 
-    # 更新 Firestore
-    firestore_ok = update_firestore(project_dir, model, version, download_url, changelog, args.min_version)
+            bin_path = build_firmware(project_dir, cfg['fqbn'], vmodel, variant)
+            if not bin_path:
+                print_color(f"\n❌ {vmodel} 編譯失敗，中止發布", Colors.RED)
+                sys.exit(1)
 
-    # 完成
-    if firestore_ok:
-        print_color("\n╔════════════════════════════════════════╗", Colors.GREEN)
-        print_color("║        ✓ 韌體發布完成！              ║", Colors.GREEN)
-        print_color("╚════════════════════════════════════════╝", Colors.GREEN)
+            download_url = upload_to_firebase(bin_path, project_dir, vmodel, version, changelog)
+            if not download_url:
+                print_color(f"\n❌ {vmodel} 上傳失敗，中止發布", Colors.RED)
+                sys.exit(1)
+                continue
+
+            update_firestore(project_dir, vmodel, version, download_url, changelog, args.min_version)
+            results.append({'model': vmodel, 'success': True, 'url': download_url})
+
+        # 摘要
+        success_count = sum(1 for r in results if r['success'])
+        total_count = len(results)
+
+        if success_count == total_count:
+            print_color(f"\n╔════════════════════════════════════════╗", Colors.GREEN)
+            print_color(f"║   ✓ 所有韌體發布完成！({success_count}/{total_count})       ║", Colors.GREEN)
+            print_color(f"╚════════════════════════════════════════╝", Colors.GREEN)
+        else:
+            print_color(f"\n╔════════════════════════════════════════╗", Colors.YELLOW)
+            print_color(f"║   ⚠ 部分韌體發布完成 ({success_count}/{total_count})         ║", Colors.YELLOW)
+            print_color(f"╚════════════════════════════════════════╝", Colors.YELLOW)
+
         print_color(f"\n版本: {version}", Colors.WHITE)
-        print_color(f"下載 URL: {download_url}", Colors.WHITE)
+        for r in results:
+            status = "✓" if r['success'] else "❌"
+            url_info = f" - {r['url']}" if r.get('url') else ""
+            print_color(f"  {status} {r['model']}{url_info}", Colors.GREEN if r['success'] else Colors.RED)
         print_color("\n設備將在下次連線時收到更新通知\n", Colors.YELLOW)
+
     else:
-        print_color("\n╔════════════════════════════════════════╗", Colors.YELLOW)
-        print_color("║    ⚠ 韌體已上傳，但 Firestore 未更新 ║", Colors.YELLOW)
-        print_color("╚════════════════════════════════════════╝", Colors.YELLOW)
-        print_color(f"\n版本: {version}", Colors.WHITE)
-        print_color(f"下載 URL: {download_url}", Colors.WHITE)
-        print_color("\n請手動更新 Firestore 後，設備才會收到更新通知\n", Colors.YELLOW)
+        # 單一型號：原有流程
+        print_color(f"設備型號: {model}", Colors.WHITE)
+
+        bin_path = build_firmware(project_dir, cfg['fqbn'], model)
+        if not bin_path:
+            print_color("\n❌ 編譯失敗，無法繼續", Colors.RED)
+            sys.exit(1)
+
+        download_url = upload_to_firebase(bin_path, project_dir, model, version, changelog)
+        if not download_url:
+            print_color("\n❌ 上傳失敗，無法繼續", Colors.RED)
+            sys.exit(1)
+
+        firestore_ok = update_firestore(project_dir, model, version, download_url, changelog, args.min_version)
+
+        if firestore_ok:
+            print_color("\n╔════════════════════════════════════════╗", Colors.GREEN)
+            print_color("║        ✓ 韌體發布完成！              ║", Colors.GREEN)
+            print_color("╚════════════════════════════════════════╝", Colors.GREEN)
+            print_color(f"\n版本: {version}", Colors.WHITE)
+            print_color(f"下載 URL: {download_url}", Colors.WHITE)
+            print_color("\n設備將在下次連線時收到更新通知\n", Colors.YELLOW)
+        else:
+            print_color("\n╔════════════════════════════════════════╗", Colors.YELLOW)
+            print_color("║    ⚠ 韌體已上傳，但 Firestore 未更新 ║", Colors.YELLOW)
+            print_color("╚════════════════════════════════════════╝", Colors.YELLOW)
+            print_color(f"\n版本: {version}", Colors.WHITE)
+            print_color(f"下載 URL: {download_url}", Colors.WHITE)
+            print_color("\n請手動更新 Firestore 後，設備才會收到更新通知\n", Colors.YELLOW)
 
 if __name__ == '__main__':
     try:

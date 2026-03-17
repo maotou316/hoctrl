@@ -10,9 +10,7 @@
 #include <Update.h>       // 引入 Update 庫
 #include <HTTPClient.h>   // 添加 HTTPClient 庫
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
-#include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.4.6"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -33,15 +31,28 @@ BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
 
-const char* deviceModel = "hoRelay2"; // 設備型號
+const char* firmwareVersion = "2.0.4"; // 當前韌體版本
+
+// 透過編譯旗標切換硬體版本（預設為舊版 GPIO 4）
+#ifndef RELAY_PIN
+#define RELAY_PIN 7
+#endif
+
+// 根據 RELAY_PIN 自動決定設備型號
+#if RELAY_PIN == 7
+const char* deviceModel = "hoRelay2-1"; // 新版 (GPIO 7)
+#else
+const char* deviceModel = "hoRelay2";   // 舊版 (GPIO 4)
+#endif
 
 // ESP32-C3 GPIO 定義
 const int bootButton = 9;     // BOOT 按鈕在 GPIO 9
-const int resetButton = 1;        // 
+const int resetButton = 1;        //
+
 
 const int ledOnBoard = 3;    // 第二個按鈕在 GPIO 8
-const int ledOnFace = 0;        // 
-const int relayButton = 4;      // 繼電器在 GPIO 4
+const int ledOnFace = 0;        //
+const int relayButton = RELAY_PIN;      // MOSFET 控制腳位
 
 // 其他全域變數
 unsigned long buttonPressTime = 0;    // 記錄按下的時間
@@ -55,24 +66,6 @@ String deviceIdString;                // 儲存格式化後的設備 ID
 int failedAttempts = 0;               // MQTT 重試次數計數器
 bool relayState = false;              // 繼電器狀態
 bool bleConfigMode = false;           // BLE 配對模式標誌
-unsigned long wifiDisconnectStart = 0; // WiFi 斷線起始時間（用於 30 秒後熄燈）
-const unsigned long LED_TIMEOUT = 30000; // 30 秒後停止閃爍
-
-// WiFi 斷線原因碼（用於診斷）
-volatile uint8_t lastWifiDisconnectReason = 0;
-
-// WiFi 事件回調：取得底層斷線原因碼
-void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
-  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-    lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
-    Serial.printf("WiFi 斷線原因碼: %d\n", lastWifiDisconnectReason);
-    // 常見原因碼：
-    // 2=AUTH_EXPIRE, 6=NOT_ASSOCED, 7=NOT_AUTHED
-    // 14=MIC_FAILURE, 15=4WAY_HANDSHAKE_TIMEOUT
-    // 200=BEACON_TIMEOUT, 201=NO_AP_FOUND, 202=AUTH_FAIL
-    // 203=ASSOC_FAIL, 204=HANDSHAKE_TIMEOUT
-  }
-}
 
 // WiFi 設定（預設值）
 char ssid[32] = "HBTech";
@@ -223,33 +216,6 @@ void clearWiFiConfig() {
   ESP.restart();
 }
 
-// 可中斷的延遲：在等待期間持續檢查重置按鈕，長按 3 秒則清除 WiFi 並重啟
-void interruptibleDelay(unsigned long ms) {
-  unsigned long start = millis();
-  unsigned long btnPressStart = 0;
-  bool btnPressed = false;
-  while (millis() - start < ms) {
-    if (digitalRead(bootButton) == LOW || digitalRead(resetButton) == LOW) {
-      if (!btnPressed) {
-        btnPressed = true;
-        btnPressStart = millis();
-        Serial.println("偵測到按鈕按下（delay 期間）...");
-      }
-      if (millis() - btnPressStart >= LONG_PRESS_TIME) {
-        Serial.println("長按確認，清除 WiFi 設定...");
-        clearWiFiConfig();
-        return;
-      }
-    } else {
-      if (btnPressed) {
-        Serial.println("短按放開，繼續等待...");
-        btnPressed = false;
-      }
-    }
-    delay(50);
-  }
-}
-
 void blinkLED() {
   unsigned long currentTime = millis();
 
@@ -262,25 +228,14 @@ void blinkLED() {
       lastBlinkTime = currentTime;
     }
   } else if (WiFi.status() != WL_CONNECTED) {
-    // WiFi 未連接模式：記錄斷線時間，30 秒內快速閃爍，之後熄燈
-    if (wifiDisconnectStart == 0) {
-      wifiDisconnectStart = currentTime;
-    }
-    if (currentTime - wifiDisconnectStart < LED_TIMEOUT) {
-      // 30 秒內：快速閃爍
-      if (currentTime - lastBlinkTime >= QUICK_BLINK) {
-        ledState = !ledState;
-        digitalWrite(ledOnFace, ledState);
-        digitalWrite(ledOnBoard, ledState);
-        lastBlinkTime = currentTime;
-      }
-    } else {
-      // 超過 30 秒：熄燈省電
-      digitalWrite(ledOnFace, LOW);
-      digitalWrite(ledOnBoard, LOW);
+    // WiFi 未連接模式：快速閃爍
+    if (currentTime - lastBlinkTime >= QUICK_BLINK) {
+      ledState = !ledState;
+      digitalWrite(ledOnFace, ledState);
+      digitalWrite(ledOnBoard, ledState);
+      lastBlinkTime = currentTime;
     }
   } else if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
-    wifiDisconnectStart = 0;  // WiFi 已連上，重置斷線計時
     // WiFi 已連接但 MQTT 未連接：一長二短模式
     unsigned long patternTime = currentTime % (LONG_BLINK + SHORT_BLINK * 2 + SHORT_BLINK * 2 + SHORT_BLINK * 2 + PATTERN_PAUSE);
 
@@ -311,7 +266,6 @@ void blinkLED() {
     }
   } else {
     // WiFi 和 MQTT 都已連接：LED 關閉
-    wifiDisconnectStart = 0;  // 重置斷線計時
     digitalWrite(ledOnFace, LOW);
     digitalWrite(ledOnBoard, LOW);
   }
@@ -455,54 +409,17 @@ const char* getDeviceId() {
   return deviceIdString.c_str();
 }
 
-// 打開繼電器和燈（不自動關閉）
-void relayOn() {
-  Serial.println("═══ 繼電器 ON ═══");
-  Serial.printf("繼電器腳位: GPIO %d\n", relayButton);
-
-  digitalWrite(relayButton, HIGH);
-  digitalWrite(ledOnFace, HIGH);
-  digitalWrite(ledOnBoard, HIGH);
-
-  Serial.println("✓ 繼電器已開啟（長亮狀態）");
-
-  // 使用 JSON 格式發布狀態
-  publishStatus();
-}
-
-// 關閉繼電器和燈
-void relayOff() {
-  Serial.println("═══ 繼電器 OFF ═══");
-
-  digitalWrite(relayButton, LOW);
-  digitalWrite(ledOnFace, LOW);
-  digitalWrite(ledOnBoard, LOW);
-
-  Serial.println("✓ 繼電器已關閉");
-
-  // 使用 JSON 格式發布狀態
-  publishStatus();
-}
-
-// 保留舊的 pulseRelay 函數以向後相容（如果有其他地方使用）
 void pulseRelay() {
-  Serial.println("═══ 觸發繼電器 ═══");
-  Serial.printf("繼電器腳位: GPIO %d\n", relayButton);
-
-  Serial.println("→ 繼電器 ON（長亮）");
+  Serial.println("關門點動--------------");
   digitalWrite(relayButton, HIGH);
   digitalWrite(ledOnFace, HIGH);
   digitalWrite(ledOnBoard, HIGH);
-
-  delay(2000);  // 改為 2 秒長亮
-
-  Serial.println("→ 繼電器 OFF");
+  delay(3000);
+  Serial.println("結束--------------");
   digitalWrite(relayButton, LOW);
   digitalWrite(ledOnFace, LOW);
   digitalWrite(ledOnBoard, LOW);
-
-  Serial.println("✓ 繼電器觸發完成");
-
+  
   // 使用 JSON 格式發布狀態
   publishStatus();
 }
@@ -513,31 +430,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   for (int i = 0; i < length; i++) {
     message += (char)payload[i];
   }
-
-  Serial.println("═══ MQTT 訊息 ═══");
-  Serial.print("主題: ");
-  Serial.println(topic);
-  Serial.print("內容: ");
+  
+  Serial.print("收到訊息 [");
+  Serial.print(topic);
+  Serial.print("] ");
   Serial.println(message);
-  Serial.print("長度: ");
-  Serial.println(length);
 
-  String expectedTopic = String("hoban/") + deviceId + "/control";
-  Serial.print("預期主題: ");
-  Serial.println(expectedTopic);
-
-  if (String(topic) == expectedTopic) {
-    Serial.println("✓ 主題匹配，處理指令...");
-
+  if (String(topic) == String("hoban/" + deviceId + "/control")) {
     if (message == "status") {
-      Serial.println("→ 執行：發布狀態");
       publishStatus();  // 使用 JSON 格式發布狀態
     } else if (message == "ON") {
-      Serial.println("→ 執行：打開繼電器（長亮）");
-      relayOn();
-    } else if (message == "OFF") {
-      Serial.println("→ 執行：關閉繼電器");
-      relayOff();
+      pulseRelay();
     } else if (message == "reset") {
       Serial.println("收到重置命令，執行重置...");
       clearWiFiConfig();  // 清除 WiFi 設定並重啟
@@ -567,14 +470,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
           startFirmwareUpdate(downloadUrl);
         }
       }
-    } else {
-      Serial.print("→ 未知指令: ");
-      Serial.println(message);
     }
-  } else {
-    Serial.println("✗ 主題不匹配，忽略訊息");
   }
-  Serial.println("═══════════════");
 }
 
 
@@ -623,7 +520,7 @@ void setup()
   digitalWrite(relayButton, LOW);
   
   // 設定並關閉內建 LED
-  pinMode(ledOnBoard, INPUT);  // 初始化第二個按鈕
+  pinMode(ledOnBoard, OUTPUT);  // 初始化LED腳位
   digitalWrite(ledOnBoard, LOW);  // 關閉 LED
   
   pinMode(ledOnFace, OUTPUT);
@@ -642,24 +539,12 @@ void setup()
   const char* deviceId = getDeviceId();  // 獲取設備 ID
 
   // 配置 WiFi 設定以提高穩定性
-  Serial.println("=== 初始化 WiFi 設定 ===");
-  WiFi.onEvent(onWiFiEvent);     // 註冊 WiFi 事件回調（取得斷線原因碼）
-  WiFi.mode(WIFI_STA);           // 先設定模式（ESP32-C3 必須先設定模式再做其他配置）
-  WiFi.persistent(false);        // 不將 WiFi 配置寫入 Flash（減少寫入次數，延長壽命）
-  WiFi.setAutoReconnect(true);   // 啟用自動重連（ESP32 底層會嘗試重連）
-  WiFi.setSleep(false);          // 禁用 WiFi 睡眠模式（提高穩定性，避免斷線）
-
-  // 設定 WiFi 電源模式為最大性能（犧牲一點耗電換取穩定性）
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // 設定最大發射功率
-
-  Serial.printf("WiFi 模式: STA (Station)\n");
-  Serial.printf("自動重連: 啟用\n");
-  Serial.printf("睡眠模式: 禁用\n");
-  Serial.printf("發射功率: 19.5dBm (最大)\n");
+  WiFi.persistent(false);  // 不將 WiFi 配置寫入 Flash（減少寫入次數）
+  WiFi.setAutoReconnect(true);  // 啟用自動重連
+  WiFi.setSleep(false);  // 禁用 WiFi 睡眠模式（提高穩定性）
 
   if (strlen(ssid) > 0) {
     Serial.println("SSID: " + String(ssid));
-    Serial.println("開始連接 WiFi...");
     connectToWiFi();
     
     // 只有在成功連接到 WiFi 時才使用智慧連接
@@ -755,90 +640,25 @@ void loop()
   static unsigned long lastKeepAlive = 0;
   static int reconnectFailCount = 0;
   static int wifiFailCount = 0;
-  static unsigned long wifiConnectedTime = 0;  // 記錄連接成功的時間
   unsigned long now = millis();
 
-  // 檢查 WiFi 連線狀態（縮短檢查間隔到 5 秒）
-  if (now - lastWiFiCheck > 5000) {
+  // 檢查 WiFi 連線狀態（每 10 秒檢查一次，降低檢查頻率）
+  if (now - lastWiFiCheck > 10000) {
     lastWiFiCheck = now;
-
+    
     if (WiFi.status() != WL_CONNECTED && strlen(ssid) > 0) {
       wifiFailCount++;
-
-      // 如果是第一次斷線，記錄診斷資訊
-      if (wifiFailCount == 1) {
-        Serial.println("═══ WiFi 連接中斷 ═══");
-        Serial.printf("斷線時間: %lu ms\n", now);
-        if (wifiConnectedTime > 0) {
-          Serial.printf("已連接時長: %lu 秒\n", (now - wifiConnectedTime) / 1000);
-        }
-      }
-
-      Serial.printf("WiFi 重連嘗試 #%d...\n", wifiFailCount);
-
-      // 根據失敗次數採用不同策略
-      if (wifiFailCount <= 3) {
-        // 前 3 次：快速重連
-        Serial.println("策略：快速重連");
-        connectToWiFi();
-      } else if (wifiFailCount <= 6) {
-        // 第 4-6 次：重置 WiFi 模組後重連
-        Serial.println("策略：重置 WiFi 模組後重連");
-        WiFi.disconnect(true);
-        interruptibleDelay(1000);
-        WiFi.mode(WIFI_OFF);
-        interruptibleDelay(1000);
-        WiFi.mode(WIFI_STA);
-        interruptibleDelay(1000);
-        connectToWiFi();
-      } else {
-        // 第 7 次以上：完整重啟 WiFi（但不重啟設備）
-        Serial.println("策略：完整重啟 WiFi 子系統");
-        WiFi.disconnect(true);
-        interruptibleDelay(2000);
-        WiFi.mode(WIFI_OFF);
-        interruptibleDelay(2000);
-        WiFi.mode(WIFI_STA);
-        WiFi.setAutoReconnect(true);
-        WiFi.setSleep(false);
-        interruptibleDelay(1000);
-        connectToWiFi();
-
-        // 如果超過 10 次仍失敗，重置計數避免無限重試
-        if (wifiFailCount > 10) {
-          Serial.println("⚠ 重連失敗次數過多，暫停重試 30 秒");
-          wifiFailCount = 0;
-          lastWiFiCheck = now + 25000;  // 延遲到 30 秒後再檢查
-        }
-      }
-
-      // 如果連接成功，重置失敗計數並記錄時間
+      Serial.printf("WiFi 連接中斷（第 %d 次），嘗試重新連接...\n", wifiFailCount);
+      connectToWiFi();
+      
+      // 如果連接成功，重置失敗計數
       if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("✓ WiFi 重新連接成功！(嘗試 %d 次)\n", wifiFailCount);
-        Serial.printf("訊號強度: %d dBm\n", WiFi.RSSI());
         wifiFailCount = 0;
-        wifiConnectedTime = now;
+        Serial.println("WiFi 重新連接成功！");
       }
-    } else if (WiFi.status() == WL_CONNECTED) {
-      // WiFi 已連接
-      if (wifiFailCount > 0) {
-        // 剛恢復連接
-        Serial.println("✓ WiFi 連接已恢復");
-        wifiFailCount = 0;
-      }
-
-      // 如果是第一次記錄，保存連接時間
-      if (wifiConnectedTime == 0) {
-        wifiConnectedTime = now;
-      }
-
-      // 定期印出 WiFi 狀態（每分鐘）
-      static unsigned long lastStatusPrint = 0;
-      if (now - lastStatusPrint > 60000) {
-        lastStatusPrint = now;
-        Serial.printf("ℹ WiFi 狀態: 已連接 %lu 秒，訊號 %d dBm\n",
-                     (now - wifiConnectedTime) / 1000, WiFi.RSSI());
-      }
+    } else if (WiFi.status() == WL_CONNECTED && wifiFailCount > 0) {
+      // 連接恢復，重置計數
+      wifiFailCount = 0;
     }
   }
 
@@ -881,205 +701,50 @@ void loop()
 }
 
 void connectToWiFi() {
-  // 檢查當前狀態
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi 已連接，跳過重連");
-    return;
-  }
-
-  // 徹底重置 WiFi 狀態（ESP32-C3 需要完整重置才能可靠連線）
-  WiFi.disconnect(true);  // true = 清除之前的 AP 配置
-  delay(200);
-  WiFi.mode(WIFI_OFF);
-  delay(200);
-  WiFi.mode(WIFI_STA);
-  delay(200);
-
-  // 先掃描確認目標 SSID 是否存在，並取得加密類型
-  Serial.println("掃描附近 WiFi 網路...");
-  int n = WiFi.scanNetworks();
-  bool ssidFound = false;
-  wifi_auth_mode_t authMode = WIFI_AUTH_WPA2_PSK;
-  int8_t targetRSSI = -100;
-  for (int i = 0; i < n; i++) {
-    Serial.printf("  [%d] %s (%d dBm) 加密: %d ch: %d\n", i,
-                  WiFi.SSID(i).c_str(), WiFi.RSSI(i),
-                  WiFi.encryptionType(i), WiFi.channel(i));
-    if (WiFi.SSID(i) == String(ssid)) {
-      ssidFound = true;
-      authMode = WiFi.encryptionType(i);
-      targetRSSI = WiFi.RSSI(i);
-    }
-  }
-  if (!ssidFound) {
-    Serial.printf("⚠ 掃描結果中找不到 SSID: %s\n", ssid);
-    Serial.println("  → 請確認路由器已開啟且在 2.4GHz 頻段");
-  } else {
-    Serial.printf("✓ 找到目標 SSID: %s (RSSI: %d dBm, 加密類型: %d)\n", ssid, targetRSSI, authMode);
-    // 顯示加密類型名稱
-    switch(authMode) {
-      case WIFI_AUTH_OPEN: Serial.println("  加密: 開放(無加密)"); break;
-      case WIFI_AUTH_WEP: Serial.println("  加密: WEP"); break;
-      case WIFI_AUTH_WPA_PSK: Serial.println("  加密: WPA-PSK"); break;
-      case WIFI_AUTH_WPA2_PSK: Serial.println("  加密: WPA2-PSK"); break;
-      case WIFI_AUTH_WPA_WPA2_PSK: Serial.println("  加密: WPA/WPA2-PSK"); break;
-      case WIFI_AUTH_WPA3_PSK: Serial.println("  加密: WPA3-PSK"); break;
-      case WIFI_AUTH_WPA2_WPA3_PSK: Serial.println("  加密: WPA2/WPA3-PSK"); break;
-      default: Serial.printf("  加密: 未知(%d)\n", authMode); break;
-    }
-  }
-  WiFi.scanDelete();
-
-  // 掃描後重新設定 STA 模式
-  WiFi.mode(WIFI_STA);
+  // 先斷開現有連接
+  WiFi.disconnect(true);
   delay(100);
-
+  
+  // 設置為 STA 模式
+  WiFi.mode(WIFI_STA);
+  
   // 開始連接
-  Serial.printf("正在連接 WiFi: %s (密碼長度: %d)\n", ssid, strlen(password));
+  Serial.printf("正在連接 WiFi: %s", ssid);
+  WiFi.begin(ssid, password);
 
-  // 自動嘗試多種安全模式連線（處理各種路由器設定）
-  struct WiFiAuthConfig {
-    wifi_auth_mode_t authmode;
-    bool pmf_capable;
-    bool pmf_required;
-    const char* desc;
-  };
-
-  // 依序嘗試不同安全設定
-  WiFiAuthConfig authConfigs[] = {
-    { WIFI_AUTH_WPA_WPA2_PSK, true, false, "WPA/WPA2 + PMF capable" },
-    { WIFI_AUTH_WPA2_PSK, true, false, "WPA2 + PMF capable" },
-    { WIFI_AUTH_WPA2_WPA3_PSK, true, false, "WPA2/WPA3 + PMF capable" },
-    { WIFI_AUTH_WPA_WPA2_PSK, false, false, "WPA/WPA2 無 PMF" },
-    { WIFI_AUTH_OPEN, false, false, "開放模式（最低門檻）" },
-  };
-  const int numConfigs = sizeof(authConfigs) / sizeof(authConfigs[0]);
-
-  bool connected = false;
-
-  for (int cfgIdx = 0; cfgIdx < numConfigs && !connected; cfgIdx++) {
-    WiFiAuthConfig& cfg = authConfigs[cfgIdx];
-    Serial.printf("\n嘗試第 %d/%d 種安全模式: %s\n", cfgIdx + 1, numConfigs, cfg.desc);
-
-    // 重置連線狀態
-    lastWifiDisconnectReason = 0;
-    WiFi.disconnect(true);
-    delay(200);
-    WiFi.mode(WIFI_STA);
-    delay(100);
-
-    wifi_config_t wifi_cfg = {};
-    memcpy(wifi_cfg.sta.ssid, ssid, min(strlen(ssid), sizeof(wifi_cfg.sta.ssid)));
-    memcpy(wifi_cfg.sta.password, password, min(strlen(password), sizeof(wifi_cfg.sta.password)));
-    wifi_cfg.sta.threshold.authmode = cfg.authmode;
-    wifi_cfg.sta.pmf_cfg.capable = cfg.pmf_capable;
-    wifi_cfg.sta.pmf_cfg.required = cfg.pmf_required;
-    wifi_cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
-
-    esp_err_t err;
-    err = esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-    if (err != ESP_OK) {
-      Serial.printf("esp_wifi_set_config 失敗: %d\n", err);
-      continue;
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {  // 增加到 30 次（15 秒）
+    blinkLED();  // 連接過程中持續閃爍 LED
+    delay(50);   // 短延遲讓 LED 有時間更新
+    
+    // 每 500ms 印出一個點
+    if (attempts % 10 == 0) {
+      Serial.print(".");
     }
-    err = esp_wifi_connect();
-    if (err != ESP_OK) {
-      Serial.printf("esp_wifi_connect 失敗: %d\n", err);
-      continue;
-    }
-
-    int attempts = 0;
-    const int maxAttempts = 20;  // 每種模式等待 10 秒
-
-    while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
-      blinkLED();
-      delay(500);
-
-      // 在等待 WiFi 連線期間檢查重置按鈕
-      if (digitalRead(bootButton) == LOW || digitalRead(resetButton) == LOW) {
-        unsigned long pressStart = millis();
-        Serial.println("偵測到按鈕按下（WiFi 連線等待中）...");
-        while ((digitalRead(bootButton) == LOW || digitalRead(resetButton) == LOW) &&
-               (millis() - pressStart < LONG_PRESS_TIME)) {
-          delay(50);
-        }
-        if (millis() - pressStart >= LONG_PRESS_TIME) {
-          Serial.println("長按確認，清除 WiFi 設定...");
-          clearWiFiConfig();
-          return;
-        } else {
-          Serial.println("短按放開，繼續等待連線...");
-        }
-      }
-
-      if (attempts % 4 == 0) {
-        Serial.print(".");
-      }
-
-      // 如果已經收到 AUTH_FAIL，提早跳到下一種模式
-      if (lastWifiDisconnectReason == 202 || lastWifiDisconnectReason == 15) {
-        Serial.printf("\n認證失敗 (原因碼: %d)，切換下一種模式...\n", lastWifiDisconnectReason);
-        break;
-      }
-
-      attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-      connected = true;
-      Serial.printf("\n成功！使用模式: %s\n", cfg.desc);
-    } else {
-      Serial.printf("\n模式 [%s] 失敗，斷線原因碼: %d\n", cfg.desc, lastWifiDisconnectReason);
-    }
+    attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n✓ WiFi 連接成功！");
+    Serial.println("\nWiFi 連接成功！");
     Serial.print("IP 位址: ");
     Serial.println(WiFi.localIP());
     Serial.print("訊號強度: ");
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
-    Serial.print("MAC 位址: ");
-    Serial.println(WiFi.macAddress());
-
+    
     // WiFi 連接成功後發布狀態
     if (mqttClient.connected()) {
       publishStatus();
     }
   } else {
-    Serial.println("\n✗ 無法連接到 WiFi");
+    Serial.println("\n無法連接到 WiFi");
     Serial.printf("最後狀態碼: %d\n", WiFi.status());
-    Serial.printf("底層斷線原因碼: %d\n", lastWifiDisconnectReason);
-
-    wl_status_t finalStatus = WiFi.status();
-    Serial.println("診斷資訊：");
-
-    switch(finalStatus) {
-      case WL_NO_SSID_AVAIL:
-        Serial.println("❌ 找不到指定的 SSID");
-        Serial.println("  → 請確認 SSID 名稱正確");
-        Serial.println("  → 確認路由器已開啟且在訊號範圍內");
-        break;
-      case WL_CONNECT_FAILED:
-        Serial.println("❌ 連接失敗（可能是密碼錯誤）");
-        Serial.println("  → 請檢查 WiFi 密碼");
-        Serial.println("  → 確認使用 2.4GHz 頻段（不支援 5GHz）");
-        break;
-      case WL_CONNECTION_LOST:
-        Serial.println("❌ 連接中斷");
-        Serial.println("  → 訊號可能太弱");
-        Serial.println("  → 路由器可能不穩定");
-        break;
-      default:
-        Serial.println("其他可能原因：");
-        Serial.println("1. SSID 或密碼錯誤");
-        Serial.println("2. 訊號太弱（嘗試靠近路由器）");
-        Serial.println("3. 路由器限制連接數（嘗試重啟路由器）");
-        Serial.println("4. WiFi 頻段不支援（僅支援 2.4GHz）");
-        Serial.println("5. MAC 過濾已啟用（請將設備加入白名單）");
-        break;
-    }
+    Serial.println("可能原因：");
+    Serial.println("1. SSID 或密碼錯誤");
+    Serial.println("2. 訊號太弱");
+    Serial.println("3. 路由器限制連接數");
+    Serial.println("4. WiFi 頻段不支援（僅支援 2.4GHz）");
+    Serial.println("將於 5 秒後重試...");
   }
 }
 
@@ -1242,10 +907,7 @@ bool quickConnectDefault() {
 
       // 訂閱控制主題
       String controlTopic = String("hoban/") + deviceId + "/control";
-      bool subscribeSuccess = mqttClient.subscribe(controlTopic.c_str());
-      Serial.printf("訂閱控制主題: %s - %s\n",
-                    controlTopic.c_str(),
-                    subscribeSuccess ? "成功" : "失敗");
+      mqttClient.subscribe(controlTopic.c_str());
 
       // 發布上線狀態（包含伺服器資訊）
       publishStatusWithServer(DEFAULT_MQTT_SERVER);
@@ -1303,10 +965,7 @@ bool quickConnectCustom() {
 
       // 訂閱控制主題
       String controlTopic = String("hoban/") + deviceId + "/control";
-      bool subscribeSuccess = mqttClient.subscribe(controlTopic.c_str());
-      Serial.printf("訂閱控制主題: %s - %s\n",
-                    controlTopic.c_str(),
-                    subscribeSuccess ? "成功" : "失敗");
+      mqttClient.subscribe(controlTopic.c_str());
 
       // 發布上線狀態（包含伺服器資訊）
       publishStatusWithServer(mqttServer);
@@ -1384,12 +1043,11 @@ void startFirmwareUpdate(const char* downloadUrl) {
   Serial.printf("下載網址：%s\n", downloadUrl);
   Serial.printf("可用空間：%u bytes\n", ESP.getFreeSketchSpace());
   Serial.printf("當前韌體版本：%s\n", firmwareVersion);
-
+  
   isUpdating = true;
   updateProgress = 0;
-  // LED 開始快閃（更新模式）
-  digitalWrite(ledOnFace, LOW);
-  digitalWrite(ledOnBoard, LOW);
+  digitalWrite(ledOnFace, HIGH);
+  digitalWrite(ledOnBoard, HIGH);
   
   // 發送更新開始狀態到 MQTT
   if (mqttClient.connected()) {
@@ -1456,14 +1114,12 @@ void startFirmwareUpdate(const char* downloadUrl) {
         WiFiClient* stream = http.getStreamPtr();
         size_t written = 0;
         uint8_t buff[1024] = { 0 };
-
+        
         // 下載超時設定
         const unsigned long downloadTimeout = 300000; // 5 分鐘
         unsigned long startTime = millis();
         unsigned long lastProgressTime = startTime;
-        unsigned long lastBlinkTime = startTime;
-        bool ledBlinkState = false;
-
+        
         while (http.connected() && (written < contentLength)) {
           size_t available = stream->available();
           if (available) {
@@ -1472,28 +1128,20 @@ void startFirmwareUpdate(const char* downloadUrl) {
             if (bytesWritten > 0) {
               written += bytesWritten;
               updateProgress = (written * 100) / contentLength;
-
+              
               if (millis() - lastProgressTime >= 1000) {
                 Serial.printf("下載進度：%d%%（%u/%d bytes）\n", updateProgress, written, contentLength);
                 lastProgressTime = millis();
               }
             }
           }
-
-          // LED 快閃 (每 QUICK_BLINK 毫秒切換一次)
-          if (millis() - lastBlinkTime >= QUICK_BLINK) {
-            ledBlinkState = !ledBlinkState;
-            digitalWrite(ledOnFace, ledBlinkState ? HIGH : LOW);
-            digitalWrite(ledOnBoard, ledBlinkState ? HIGH : LOW);
-            lastBlinkTime = millis();
-          }
-
+          
           // 檢查超時
           if (millis() - startTime > downloadTimeout) {
             Serial.println("錯誤：下載超時");
             break;
           }
-
+          
           delay(1); // 避免看門狗重置
         }
         

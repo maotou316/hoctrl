@@ -1,18 +1,16 @@
-### hoRelay2
-- **開發板**: ESP32-C3 Dev Module
-- **特色**: 無聲繼電器
-- **韌體版本**: 1.2.1
-- **GPIO 定義**:
-  - BOOT 按鈕: GPIO 9
-  - RESET 按鈕: GPIO 1
-  - 板載 LED: GPIO 3
-  - 面板 LED: GPIO 0
-  - 繼電器按鈕: GPIO 4
-- **開發板設定**:
-  - USB CDC On Boot: Enabled
-  - CPU Frequency: 160MHz (WiFi)
-  - Flash Size: 4MB (32Mb)
-  - Partition Scheme: Custom (使用 partitions.csv)
-  - Upload Speed: 921600
-  - Flash Mode: DIO
-  - Erase All Flash Before Sketch Upload：Enabled
+# HoCtrl Firmware Releases
+
+Firmware releases for HoCtrl devices.
+
+
+其中 #define BUTTON_PIN 9 定义了板载按钮，也就是BOOT键的IO口
+#define RELAY_PIN 4  定义了板载继电器或MOS管的IO口
+模块上还有一个状态指示灯为IO3
+另外模块上还额外引出了2个IO，分别为IO0和IO1
+*/
+
+#define BUTTON_PIN 9  //boot键IO
+#define RELAY_PIN 4  //继电器IO口
+#define DEBOUNCE_DELAY 50  // 去抖动延时，单位：毫秒  
+
+
