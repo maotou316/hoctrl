@@ -14,3 +14,5 @@ Firmware releases for HoCtrl devices.
 #define DEBOUNCE_DELAY 50  // 去抖动延时，单位：毫秒  
 
 
+GPIO 0 是LED
+GPIO 1 鈕

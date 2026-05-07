@@ -31,7 +31,7 @@ BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
 
-const char* firmwareVersion = "2.0.4"; // 當前韌體版本
+const char* firmwareVersion = "2.0.5"; // 當前韌體版本
 
 // 透過編譯旗標切換硬體版本（預設為舊版 GPIO 4）
 #ifndef RELAY_PIN
@@ -62,6 +62,11 @@ const int LONG_PRESS_TIME = 3000;     // 長按 3 秒觸發重置
 bool isBlinking = false;              // LED 閃爍狀態
 bool lastBootButtonState = HIGH;      // BOOT 按鈕上次狀態
 bool lastResetButtonState = HIGH;     // RESET 按鈕上次狀態
+unsigned long resetBtnPressTime = 0;  // GPIO 1 按下時間
+unsigned long resetBtnReleaseTime = 0; // GPIO 1 放開偵測時間（debounce）
+unsigned long wifiDisabledUntil = 0;  // WiFi 停用到此時間點
+const unsigned long WIFI_DISABLE_COOLDOWN = 10000; // 斷網後 10 秒才能重連
+const unsigned long RELEASE_DEBOUNCE = 100; // 放開 debounce 100ms
 String deviceIdString;                // 儲存格式化後的設備 ID
 int failedAttempts = 0;               // MQTT 重試次數計數器
 bool relayState = false;              // 繼電器狀態
@@ -218,12 +223,14 @@ void clearWiFiConfig() {
 
 void blinkLED() {
   unsigned long currentTime = millis();
+  // 面板按鈕按住期間，不操作 GPIO 0 (ledOnFace) 避免干擾相鄰 GPIO 1
+  bool skipFaceLed = (resetBtnPressTime != 0);
 
   if (bleConfigMode) {
     // BLE 配對模式：慢速閃爍 (1000ms 間隔)
     if (currentTime - lastBlinkTime >= 1000) {
       ledState = !ledState;
-      digitalWrite(ledOnFace, ledState);
+      if (!skipFaceLed) digitalWrite(ledOnFace, ledState);
       digitalWrite(ledOnBoard, ledState);
       lastBlinkTime = currentTime;
     }
@@ -231,7 +238,7 @@ void blinkLED() {
     // WiFi 未連接模式：快速閃爍
     if (currentTime - lastBlinkTime >= QUICK_BLINK) {
       ledState = !ledState;
-      digitalWrite(ledOnFace, ledState);
+      if (!skipFaceLed) digitalWrite(ledOnFace, ledState);
       digitalWrite(ledOnBoard, ledState);
       lastBlinkTime = currentTime;
     }
@@ -240,33 +247,27 @@ void blinkLED() {
     unsigned long patternTime = currentTime % (LONG_BLINK + SHORT_BLINK * 2 + SHORT_BLINK * 2 + SHORT_BLINK * 2 + PATTERN_PAUSE);
 
     if (patternTime < LONG_BLINK) {
-      // 長閃
-      digitalWrite(ledOnFace, HIGH);
+      if (!skipFaceLed) digitalWrite(ledOnFace, HIGH);
       digitalWrite(ledOnBoard, HIGH);
     } else if (patternTime < LONG_BLINK + SHORT_BLINK) {
-      // 長閃後暫停
-      digitalWrite(ledOnFace, LOW);
+      if (!skipFaceLed) digitalWrite(ledOnFace, LOW);
       digitalWrite(ledOnBoard, LOW);
     } else if (patternTime < LONG_BLINK + SHORT_BLINK * 2) {
-      // 第一個短閃
-      digitalWrite(ledOnFace, HIGH);
+      if (!skipFaceLed) digitalWrite(ledOnFace, HIGH);
       digitalWrite(ledOnBoard, HIGH);
     } else if (patternTime < LONG_BLINK + SHORT_BLINK * 3) {
-      // 第一個短閃暫停
-      digitalWrite(ledOnFace, LOW);
+      if (!skipFaceLed) digitalWrite(ledOnFace, LOW);
       digitalWrite(ledOnBoard, LOW);
     } else if (patternTime < LONG_BLINK + SHORT_BLINK * 4) {
-      // 第二個短閃
-      digitalWrite(ledOnFace, HIGH);
+      if (!skipFaceLed) digitalWrite(ledOnFace, HIGH);
       digitalWrite(ledOnBoard, HIGH);
     } else {
-      // 模式間暫停
-      digitalWrite(ledOnFace, LOW);
+      if (!skipFaceLed) digitalWrite(ledOnFace, LOW);
       digitalWrite(ledOnBoard, LOW);
     }
   } else {
     // WiFi 和 MQTT 都已連接：LED 關閉
-    digitalWrite(ledOnFace, LOW);
+    if (!skipFaceLed) digitalWrite(ledOnFace, LOW);
     digitalWrite(ledOnBoard, LOW);
   }
 }
@@ -564,60 +565,69 @@ void setup()
 
 void loop()
 {
-  // 讀取按鈕當前狀態
-  bool currentBootState = digitalRead(bootButton);
+  // === 面板按鈕 (GPIO 1) ===
+  // 按 1 秒：斷開 WiFi（10 秒後才重連）
+  // 長按 3 秒：LED 閃爍確認 → 繼續按住則清除設定重啟
   bool currentResetState = digitalRead(resetButton);
 
-  // 檢查按鈕是否被按下（從 HIGH 變成 LOW）
-  if ((currentBootState == LOW && lastBootButtonState == HIGH) || 
-      (currentResetState == LOW && lastResetButtonState == HIGH)) {
-    // 按鈕剛被按下，開始計時
-    if (buttonPressTime == 0) {
-      buttonPressTime = millis();
-      Serial.println("偵測到按鈕按下，開始計時...");
-    }
+  // 按鈕剛被按下（排除 debounce 期間的假觸發）
+  if (currentResetState == LOW && lastResetButtonState == HIGH && resetBtnPressTime == 0) {
+    resetBtnPressTime = millis();
+    Serial.println("面板按鈕按下，開始計時...");
   }
 
-  // 如果按鈕正在被按下
-  if (currentBootState == LOW || currentResetState == LOW) {
-    unsigned long pressDuration = millis() - buttonPressTime;
-    
-    // 長按超過 3 秒，開始閃爍 LED
+  if (currentResetState == LOW && resetBtnPressTime != 0) {
+    unsigned long pressDuration = millis() - resetBtnPressTime;
+
+    // 長按超過 3 秒，開始閃爍 LED（進入重置確認）
     if (!isBlinking && pressDuration >= LONG_PRESS_TIME) {
       isBlinking = true;
       ledBlinkStart = millis();
       Serial.println("長按 3 秒達成，開始 LED 閃爍確認...");
     }
-    
-    // 閃爍期間
+
+    // 閃爍期間：繼續按住 3 秒則清除設定
     if (isBlinking) {
       unsigned long blinkDuration = millis() - ledBlinkStart;
-      
-      // 閃爍 3 秒
+
       if (blinkDuration < LONG_PRESS_TIME) {
-        // 500ms 間隔閃爍
+        // 只用板載 LED 閃爍，不動 GPIO 0 (ledOnFace) 避免干擾相鄰 GPIO 1
         bool shouldLedBeOn = (blinkDuration % 500) < 250;
-        digitalWrite(ledOnFace, shouldLedBeOn ? HIGH : LOW);
         digitalWrite(ledOnBoard, shouldLedBeOn ? HIGH : LOW);
       } else {
-        // 閃爍 3 秒後，如果按鈕還在按著，執行重置
         Serial.println("確認重置，清除 WiFi 設定...");
         digitalWrite(ledOnFace, LOW);
         digitalWrite(ledOnBoard, LOW);
-        clearWiFiConfig();  // 清除設定並重啟
+        clearWiFiConfig();
       }
     }
-  } else {
-    // 按鈕被放開，重置所有狀態
-    if (buttonPressTime != 0) {
-      Serial.println("按鈕放開，取消重置");
+  } else if (currentResetState == HIGH && resetBtnPressTime != 0) {
+    // GPIO 1 讀到 HIGH，開始 debounce 計時
+    if (resetBtnReleaseTime == 0) {
+      resetBtnReleaseTime = millis();
+    } else if (millis() - resetBtnReleaseTime >= RELEASE_DEBOUNCE) {
+      // 持續 HIGH 超過 1 秒，確認為真正放開
+      unsigned long pressDuration = millis() - resetBtnPressTime;
+
+      if (isBlinking) {
+        Serial.println("按鈕放開，取消重置");
+        isBlinking = false;
+      } else if (pressDuration >= 1000) {
+        Serial.println("斷開 WiFi，10 秒後才能重連");
+        WiFi.disconnect(true);
+        wifiDisabledUntil = millis() + WIFI_DISABLE_COOLDOWN;
+      }
+
+      resetBtnPressTime = 0;
+      resetBtnReleaseTime = 0;
     }
-    buttonPressTime = 0;
-    isBlinking = false;
   }
 
-  // 更新按鈕上次狀態
-  lastBootButtonState = currentBootState;
+  // 按鈕讀回 LOW 時重置 release debounce
+  if (currentResetState == LOW) {
+    resetBtnReleaseTime = 0;
+  }
+
   lastResetButtonState = currentResetState;
 
   // 當不在按鈕長按流程時，根據連接狀態控制 LED 閃燈
@@ -642,10 +652,21 @@ void loop()
   static int wifiFailCount = 0;
   unsigned long now = millis();
 
+  // WiFi 停用冷卻期檢查
+  if (wifiDisabledUntil != 0) {
+    if (now >= wifiDisabledUntil) {
+      Serial.println("WiFi 冷卻期結束，允許重新連線");
+      wifiDisabledUntil = 0;
+    } else {
+      // 冷卻期間跳過所有 WiFi/MQTT 邏輯
+      return;
+    }
+  }
+
   // 檢查 WiFi 連線狀態（每 10 秒檢查一次，降低檢查頻率）
   if (now - lastWiFiCheck > 10000) {
     lastWiFiCheck = now;
-    
+
     if (WiFi.status() != WL_CONNECTED && strlen(ssid) > 0) {
       wifiFailCount++;
       Serial.printf("WiFi 連接中斷（第 %d 次），嘗試重新連接...\n", wifiFailCount);
