@@ -198,6 +198,22 @@ bool hasWifiConfig() {
   return strlen(ssid) > 0;
 }
 
+// ── WiFi 狀態 ──
+volatile uint8_t lastWifiDisconnectReason = 0;
+unsigned long wifiConnectedTime = 0;
+uint8_t lastKnownChannel = 0;     // 用於偵測 channel 變化
+
+// WiFi 事件回調：取得底層斷線原因碼，並在取得 IP 時通知 slave 新 channel
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
+    Serial.printf("[WiFi] 斷線原因碼: %d\n", lastWifiDisconnectReason);
+    // 常見：2=AUTH_EXPIRE 15=4WAY_HANDSHAKE_TIMEOUT 201=NO_AP_FOUND 202=AUTH_FAIL
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    Serial.printf("[WiFi] 取得 IP: %s\n", WiFi.localIP().toString().c_str());
+  }
+}
+
 // ── 設備 ID ──
 const char* getDeviceId() {
   if (deviceIdString.length() == 0) {
@@ -743,6 +759,64 @@ void sendHeartbeatBurst() {
   }
 }
 
+// 偵測 WiFi channel 是否改變，改變就立刻連發心跳通知 slave
+// slave 靠心跳得知 master 的 channel，若不通知會等到 30 秒失聯門檻才開始輪掃
+void onWifiChannelMayHaveChanged() {
+  uint8_t primary = 0;
+  wifi_second_chan_t second;
+  esp_wifi_get_channel(&primary, &second);
+
+  if (primary != lastKnownChannel) {
+    Serial.printf("[channel] 由 %u 變為 %u，連發心跳通知 slave\n",
+                  lastKnownChannel, primary);
+    lastKnownChannel = primary;
+    currentChannel = primary;
+    sendHeartbeatBurst();
+  }
+}
+
+// ESP-NOW 友善的 WiFi 連線
+// 與 ho_relay2 的差異：不掃描頻道、不關閉 WiFi 驅動、等待迴圈走 maintainEspNow()。
+// 最壞阻塞約 30 秒，期間心跳照常發出。
+void connectToWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (!hasWifiConfig()) return;
+
+  Serial.printf("[WiFi] 連線到 %s …\n", ssid);
+  lastWifiDisconnectReason = 0;
+
+  // 只斷開連線，不關閉 WiFi 驅動（ESP-NOW 要靠它活著）
+  WiFi.disconnect(false);
+  espNowDelay(100);
+
+  WiFi.begin(ssid, password);
+
+  // 等待最多 30 秒，期間持續發心跳
+  const int maxWaitMs = 30000;
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < maxWaitMs) {
+    maintainEspNow();
+    if (anyResetButtonPressed()) return;   // 讓長按重置仍可用
+    delay(100);
+
+    // 認證失敗類的原因碼不必等滿，直接放棄本次
+    if (lastWifiDisconnectReason == 202 || lastWifiDisconnectReason == 15) {
+      Serial.println("[WiFi] 認證失敗，放棄本次嘗試");
+      break;
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnectedTime = millis();
+    Serial.printf("[WiFi] 已連線 IP=%s RSSI=%d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    onWifiChannelMayHaveChanged();
+  } else {
+    Serial.printf("[WiFi] 連線失敗，狀態=%d 原因碼=%d\n",
+                  WiFi.status(), lastWifiDisconnectReason);
+  }
+}
+
 // ── ESP-NOW 初始化 ──
 void setupEspNow() {
   WiFi.mode(WIFI_STA);
@@ -797,6 +871,16 @@ void setup() {
   setupEspNow();
   registerAllPeers();  // 必須在 esp_now_init() 之後，否則名冊上的 slave 全部送不出指令
 
+  // WiFi 連線必須排在 ESP-NOW 初始化與 peer 註冊之後：
+  // 反過來會讓 esp_now_init() 在 STA 已連線的狀態下執行，peer 的 channel 跟隨行為可能不如預期。
+  WiFi.onEvent(onWiFiEvent);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);      // 禁用睡眠，避免 ESP-NOW 收包延遲
+
+  if (hasWifiConfig()) {
+    connectToWiFi();
+  }
+
   Serial.printf("設備 ID: %s\n", getDeviceId());
   printHelp();
   Serial.println("就緒");
@@ -837,6 +921,46 @@ void loop() {
   // 心跳固定 1 秒一次（HEARTBEAT_INTERVAL），計時併入 maintainEspNow()，
   // 避免與 Phase 2a 阻塞流程內的維持機制形成兩套計時器、重複發送
   maintainEspNow();
+
+  // ── WiFi 連線管理（每 5 秒檢查）──
+  static unsigned long lastWiFiCheck = 0;
+  static int wifiFailCount = 0;
+  static unsigned long wifiPauseUntil = 0;   // 取代 ho_relay2 會 unsigned 下溢的寫法
+
+  if (hasWifiConfig() && now - lastWiFiCheck > 5000) {
+    lastWiFiCheck = now;
+
+    if (WiFi.status() != WL_CONNECTED) {
+      if (wifiPauseUntil != 0 && now < wifiPauseUntil) {
+        // 連續失敗過多，暫停重試中
+      } else {
+        wifiPauseUntil = 0;
+        wifiFailCount++;
+        Serial.printf("[WiFi] 重連嘗試 #%d\n", wifiFailCount);
+
+        if (wifiFailCount <= 3) {
+          connectToWiFi();
+        } else {
+          // 重設連線狀態但不關閉 WiFi 驅動（ESP-NOW 要靠它）
+          Serial.println("[WiFi] 重設連線狀態後重試");
+          esp_wifi_disconnect();
+          espNowDelay(500);
+          connectToWiFi();
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+          wifiFailCount = 0;
+        } else if (wifiFailCount > 10) {
+          wifiFailCount = 0;
+          wifiPauseUntil = now + 60000;   // 暫停 60 秒再試
+          Serial.println("[WiFi] 連續失敗過多，暫停 60 秒");
+        }
+      }
+    } else {
+      wifiFailCount = 0;
+      onWifiChannelMayHaveChanged();   // AP 可能不斷線就換頻
+    }
+  }
 
   // ── 分散式輪詢 slave 狀態，每次 loop() 最多問一台（見 pollNextSlave()）──
   pollNextSlave();
