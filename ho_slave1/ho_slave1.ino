@@ -49,11 +49,27 @@ unsigned long resetPressTime = 0;
 unsigned long resetBlinkStart = 0;
 bool resetBlinking = false;
 
+// ── 開機按鈕自檢（移植自 ho_relay2.ino）──
+// 防止「開機即自動清除配對 → 重啟 → 再清除」的無限迴圈。
+// 成因：按鈕接法是 GPIO ──[按鈕]── GND，靠 INPUT_PULLUP 拉高；某支腳一旦短路
+// 或走線接地就恆為 LOW，而 lastAnyPressed 初值為 false（代表未按下），
+// 開機時就已是 LOW 的腳會被誤判成「使用者剛按下」，長按時間一到就清除配對並重啟。
+// 2026-08 在 hoRelay2（完全相同的硬體與 GPIO）實際發生過：RESET 按鈕內部短路。
+// slave 沒有 WiFi／MQTT 可自救，未配對的 slave 更是永遠沒機會被配對，故必須防呆。
+// 對策：開機時短暫取樣兩支腳，整段都是 LOW 就判定卡住，本次開機停用該腳的按鈕功能。
+const unsigned long BTN_SELFTEST_DURATION = 500;  // 自檢取樣總長度 (毫秒)
+const unsigned long BTN_SELFTEST_INTERVAL = 50;   // 取樣間隔 (毫秒)
+bool bootButtonUsable = true;                     // BOOT 按鈕是否可用
+bool resetButtonUsable = true;                    // RESET 按鈕是否可用
+
 // 掃描狀態
 bool scanning = false;
 uint8_t scanChannel = 1;
 unsigned long scanChannelStart = 0;
-const unsigned long SCAN_DWELL_MS = 600;      // 每個 channel 停留時間
+// 每個 channel 停留時間。必須「明顯大於 master 的心跳間隔（1 秒）」，
+// 才能保證只要 master 就在這個 channel，這一輪 dwell 內必定收得到一次心跳。
+// 舊值 600ms 小於心跳間隔，命中與否變成兩個週期的機率問題，期望要十幾輪心跳才鎖得回來。
+const unsigned long SCAN_DWELL_MS = 1200;
 const unsigned long HEARTBEAT_TIMEOUT = 30000; // 超過這麼久沒心跳就重掃
 
 const uint8_t BROADCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -152,12 +168,64 @@ void savePairing() {
 }
 
 void clearPairing() {
+  // 先通知 master 解除配對，再清 EEPROM。
+  // 協定的 HO_PKT_UNPAIR 是雙向的，master 端已實作接收處理（移除名冊 + esp_now_del_peer）；
+  // 若不送，master 名冊那一格與 peer 表項會永久佔用，list 永遠顯示該台離線且無法自動移除，
+  // 20 台名額會被慢慢吃光，只能靠人工 unpair <n> 收拾。
+  if (masterKnown) {
+    uint8_t buf[250];
+    size_t total = hoPackPacket(buf, sizeof(buf), HO_PKT_UNPAIR, txSeq++, nullptr, 0);
+    esp_now_send(masterMac, buf, total);
+    delay(100);   // 給封包送出的時間，之後才會清設定並重啟
+    Serial.println("[配對] 已通知 master 解除配對");
+  }
+
   EEPROM.begin(EEPROM_SIZE);
   for (int i = 0; i < EEPROM_SIZE; i++) EEPROM.write(i, 0);
   EEPROM.commit();
   Serial.println("配對記錄已清除，重新啟動中…");
   delay(1000);
   ESP.restart();
+}
+
+// 開機按鈕自檢：短暫取樣兩支按鈕腳，整段都是 LOW 即判定卡住並停用其按鈕功能
+// 必須在 pinMode(..., INPUT_PULLUP) 之後、進入任何重置流程之前呼叫，
+// 但絕不能早於 initRelayPins()（繼電器安全鐵則）
+// 注意：這也會擋掉「按住按鈕再上電」的操作，但那本來就不是合法流程
+//（正常重置是設備運作中才長按），放開後重新上電即恢復
+void checkStuckButtons() {
+  const int totalSamples = BTN_SELFTEST_DURATION / BTN_SELFTEST_INTERVAL;
+  int bootLowCount = 0;
+  int resetLowCount = 0;
+
+  for (int i = 0; i < totalSamples; i++) {
+    if (digitalRead(bootButton) == LOW) bootLowCount++;
+    if (digitalRead(resetButton) == LOW) resetLowCount++;
+    delay(BTN_SELFTEST_INTERVAL);
+  }
+
+  bootButtonUsable = (bootLowCount < totalSamples);
+  resetButtonUsable = (resetLowCount < totalSamples);
+
+  if (bootButtonUsable && resetButtonUsable) {
+    Serial.println("按鈕自檢: 正常");
+    return;
+  }
+
+  if (!bootButtonUsable) {
+    Serial.printf("⚠ 按鈕自檢: BOOT(GPIO %d) 恆為 LOW，本次開機停用其按鈕功能\n", bootButton);
+  }
+  if (!resetButtonUsable) {
+    Serial.printf("⚠ 按鈕自檢: RESET(GPIO %d) 恆為 LOW，本次開機停用其按鈕功能\n", resetButton);
+  }
+  Serial.println("  若非按住按鈕開機，代表該腳短路或未接，請檢查硬體");
+}
+
+// 是否有「可用的」按鈕正被按下；自檢判定卡住的腳一律視為未按下
+bool anyResetButtonPressed() {
+  if (bootButtonUsable && digitalRead(bootButton) == LOW) return true;
+  if (resetButtonUsable && digitalRead(resetButton) == LOW) return true;
+  return false;
 }
 
 // ── Channel 控制 ──
@@ -211,16 +279,70 @@ void onMasterFound(const uint8_t mac[6], uint8_t channel) {
   }
 }
 
-// LED 快閃指定次數（阻塞，只在配對結果時用）
-void blinkLed(int times, int intervalMs) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(ledOnFace, HIGH);
-    digitalWrite(ledOnBoard, HIGH);
-    delay(intervalMs);
-    digitalWrite(ledOnFace, LOW);
-    digitalWrite(ledOnBoard, LOW);
-    delay(intervalMs);
+// ── 非阻塞 LED 閃爍（配對結果指示）──
+// ESP-IDF 明文要求 ESP-NOW 的 recv callback 在 WiFi task 執行、不可做冗長操作。
+// 舊版在 callback 內直接跑阻塞式 blinkLed()，配對失敗那次是 3×400×2 = 2400ms，
+// 配對瞬間會丟封包，最壞觸發 task watchdog reset。
+// 現在 callback 只呼叫 requestBlink() 登記需求（純變數寫入），
+// 實際閃爍由 loop() 的 updateBlink() 用 millis 推進狀態，完全不 delay()。
+volatile uint8_t blinkRequestTimes = 0;      // 待執行的閃爍次數（由 callback 登記）
+volatile uint16_t blinkRequestInterval = 0;  // 亮／滅各自的毫秒數
+
+bool blinkActive = false;        // loop() 是否正在執行閃爍
+uint8_t blinkRemaining = 0;      // 還剩幾次
+uint16_t blinkInterval = 0;
+bool blinkPhaseOn = false;       // 目前是「亮」的半週期
+unsigned long blinkPhaseStart = 0;
+
+// 供 ESP-NOW callback 呼叫：只寫旗標，立即返回
+void requestBlink(uint8_t times, uint16_t intervalMs) {
+  blinkRequestInterval = intervalMs;
+  blinkRequestTimes = times;   // 次數最後寫，確保 loop() 讀到時間隔已就緒
+}
+
+// 取消閃爍：長按重置流程要接手同兩顆 LED 時呼叫，避免兩邊互相打架
+void cancelBlink() {
+  blinkRequestTimes = 0;
+  blinkActive = false;
+  blinkRemaining = 0;
+}
+
+void setBlinkLeds(bool on) {
+  digitalWrite(ledOnFace, on ? HIGH : LOW);
+  digitalWrite(ledOnBoard, on ? HIGH : LOW);
+}
+
+void updateBlink(unsigned long now) {
+  // 有新的登記且目前沒在閃 → 啟動
+  if (!blinkActive && blinkRequestTimes > 0) {
+    blinkRemaining = blinkRequestTimes;
+    blinkInterval = blinkRequestInterval;
+    blinkRequestTimes = 0;
+    blinkActive = true;
+    blinkPhaseOn = true;
+    blinkPhaseStart = now;
+    setBlinkLeds(true);
+    return;
   }
+  if (!blinkActive) return;
+  if (now - blinkPhaseStart < blinkInterval) return;   // 無號數減法，不怕 millis() 溢位
+
+  blinkPhaseStart = now;
+  if (blinkPhaseOn) {
+    blinkPhaseOn = false;   // 亮的半週期結束 → 轉滅
+    setBlinkLeds(false);
+    return;
+  }
+
+  // 滅的半週期結束 → 完成一次閃爍
+  blinkRemaining--;
+  if (blinkRemaining == 0) {
+    blinkActive = false;
+    setBlinkLeds(relayState);   // 還原成繼電器對應的 LED 狀態
+    return;
+  }
+  blinkPhaseOn = true;
+  setBlinkLeds(true);
 }
 
 void requestPairing() {
@@ -272,6 +394,14 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
   }
 
   if (header.type == HO_PKT_PAIR_ACK && payloadLen >= sizeof(HoPairAckPayload)) {
+    // 沒有主動送出配對請求就收到 PAIR_ACK 一律忽略。
+    // 否則任何持有共享密鑰的設備只要主動送一個 PAIR_ACK，就能無條件覆寫 masterMac
+    // 並寫進 EEPROM，把一台已配對的 slave 劫持到自己名下。
+    if (!waitingPairAck) {
+      Serial.println("[配對] 收到非預期的 PAIR_ACK，忽略");
+      return;
+    }
+
     HoPairAckPayload ack;
     memcpy(&ack, payload, sizeof(ack));
     waitingPairAck = false;
@@ -285,13 +415,13 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
       char id[20];
       hoFormatDeviceId(masterMac, id);
       Serial.printf("[配對] 成功，master=%s channel=%u\n", id, ack.channel);
-      blinkLed(3, 100);   // 快閃 3 下表示成功
+      requestBlink(3, 100);   // 快閃 3 下表示成功（實際閃爍在 loop() 執行）
     } else {
       const char* why = (ack.reason == HO_PAIR_FULL) ? "master 已達 20 台上限"
                       : (ack.reason == HO_PAIR_NOT_PAIRING) ? "master 不在配對模式"
                       : "未知原因";
       Serial.printf("[配對] 被拒絕：%s\n", why);
-      blinkLed(3, 400);   // 慢閃 3 下表示失敗
+      requestBlink(3, 400);   // 慢閃 3 下表示失敗（實際閃爍在 loop() 執行）
     }
     return;
   }
@@ -388,6 +518,9 @@ void setup() {
   digitalWrite(ledOnFace, LOW);
   pinMode(bootButton, INPUT_PULLUP);
   pinMode(resetButton, INPUT_PULLUP);
+  delay(50);  // 等內部提升電阻把腳位拉穩再取樣
+
+  checkStuckButtons();  // 必須早於任何重置流程，卡住的腳會在此被排除
 
   loadPairing();
   setupEspNow();
@@ -408,10 +541,10 @@ void loop() {
   unsigned long now = millis();
 
   // ── 按鈕：短按配對，長按重置 ──
-  // 兩顆按鈕任一顆都可以，與 ho_relay2 一致
-  bool bootState = digitalRead(bootButton);
-  bool resetState = digitalRead(resetButton);
-  bool anyPressed = (bootState == LOW || resetState == LOW);
+  // 兩顆按鈕任一顆都可以，與 ho_relay2 一致；
+  // 開機自檢判定卡在 LOW 的腳會被 anyResetButtonPressed() 排除，
+  // 避免壞按鈕造成「開機即清除配對 → 重啟 → 再清除」的無限迴圈
+  bool anyPressed = anyResetButtonPressed();
 
   static bool lastAnyPressed = false;
 
@@ -425,6 +558,7 @@ void loop() {
     if (!resetBlinking && pressDuration >= LONG_PRESS_TIME) {
       resetBlinking = true;
       resetBlinkStart = now;
+      cancelBlink();   // 重置閃爍要接手 LED，先取消配對結果的閃爍
       Serial.println("長按 3 秒達成，繼續按住 2 秒清除配對…");
     }
 
@@ -461,6 +595,12 @@ void loop() {
   }
 
   lastAnyPressed = anyPressed;
+
+  // ── 配對結果的 LED 閃爍（非阻塞，由 ESP-NOW callback 登記）──
+  // 長按重置流程正在用同兩顆 LED 時讓給它，避免兩邊互搶
+  if (!resetBlinking) {
+    updateBlink(now);
+  }
 
   // ── 配對請求逾時 ──
   if (waitingPairAck && now - pairReqTime >= PAIR_ACK_TIMEOUT) {

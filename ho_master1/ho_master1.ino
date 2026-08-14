@@ -46,7 +46,26 @@ const unsigned long PAIRING_TIMEOUT = 60000;  // 60 秒
 const unsigned long SLAVE_OFFLINE_TIMEOUT = 30000;
 
 const uint8_t BROADCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-const unsigned long HEARTBEAT_INTERVAL = 5000;
+// 心跳間隔。必須「明顯小於 slave 每個 channel 的停留時間（SCAN_DWELL_MS = 1200ms）」，
+// slave 輪掃時才能保證每停留一個 channel 至少涵蓋一次心跳、一輪內必定命中。
+// 舊值 5000ms 大於 dwell，命中變成兩個週期的機率問題（約 7.7%），
+// 期望要十幾次心跳、約一分鐘才鎖得回來。廣播封包只有 11 bytes，加快到 1 秒的流量代價可忽略。
+const unsigned long HEARTBEAT_INTERVAL = 1000;
+
+// channel 改變時立刻連發數次心跳，讓正在輪掃的 slave 更快命中
+const int HEARTBEAT_BURST_COUNT = 4;
+const int HEARTBEAT_BURST_GAP = 200;
+
+// ── 開機按鈕自檢（移植自 ho_relay2.ino）──
+// 按鈕接法是 GPIO ──[按鈕]── GND，靠 INPUT_PULLUP 拉高；某支腳一旦短路或走線接地
+// 就恆為 LOW，會被按鈕狀態機誤判成「使用者一直按著」。
+// master 目前只有短按進配對（風險低），但重置功能的位置已預留在 loop()，
+// Phase 2 一補上就會繼承 hoRelay2 那個「開機即清設定 → 重啟 → 再清除」的無限迴圈缺陷，
+// 所以現在先把防呆一併備妥。
+const unsigned long BTN_SELFTEST_DURATION = 500;  // 自檢取樣總長度 (毫秒)
+const unsigned long BTN_SELFTEST_INTERVAL = 50;   // 取樣間隔 (毫秒)
+bool bootButtonUsable = true;                     // BOOT 按鈕是否可用
+bool secondButtonUsable = true;                   // 第二按鈕是否可用
 
 // ── 繼電器 ──
 // 與 ho_relay2 相同的鐵則：initRelayPins() 必須是 setup() 第一行
@@ -88,6 +107,46 @@ const char* getDeviceId() {
     deviceIdString = String(buf);
   }
   return deviceIdString.c_str();
+}
+
+// ── 開機按鈕自檢 ──
+// 短暫取樣兩支按鈕腳，整段都是 LOW 即判定卡住並停用其按鈕功能。
+// 必須在 pinMode(..., INPUT_PULLUP) 之後呼叫，但絕不能早於 initRelayPins()（繼電器安全鐵則）。
+// 注意：這也會擋掉「按住按鈕再上電」的操作，放開後重新上電即恢復。
+void checkStuckButtons() {
+  const int totalSamples = BTN_SELFTEST_DURATION / BTN_SELFTEST_INTERVAL;
+  int bootLowCount = 0;
+  int secondLowCount = 0;
+
+  for (int i = 0; i < totalSamples; i++) {
+    if (digitalRead(bootButton) == LOW) bootLowCount++;
+    if (digitalRead(secondButton) == LOW) secondLowCount++;
+    delay(BTN_SELFTEST_INTERVAL);
+  }
+
+  bootButtonUsable = (bootLowCount < totalSamples);
+  secondButtonUsable = (secondLowCount < totalSamples);
+
+  if (bootButtonUsable && secondButtonUsable) {
+    Serial.println("按鈕自檢: 正常");
+    return;
+  }
+
+  if (!bootButtonUsable) {
+    Serial.printf("⚠ 按鈕自檢: BOOT(GPIO %d) 恆為 LOW，本次開機停用其按鈕功能\n", bootButton);
+  }
+  if (!secondButtonUsable) {
+    Serial.printf("⚠ 按鈕自檢: 第二按鈕(GPIO %d) 恆為 LOW，本次開機停用其按鈕功能\n", secondButton);
+  }
+  Serial.println("  若非按住按鈕開機，代表該腳短路或未接，請檢查硬體");
+}
+
+// 是否有「可用的」按鈕正被按下；自檢判定卡住的腳一律視為未按下。
+// 目前只有 BOOT 用於短按配對，這支保留給 Phase 2 的長按重置流程，屆時一律走這裡判斷。
+bool anyResetButtonPressed() {
+  if (bootButtonUsable && digitalRead(bootButton) == LOW) return true;
+  if (secondButtonUsable && digitalRead(secondButton) == LOW) return true;
+  return false;
 }
 
 // ── 名冊管理 ──
@@ -155,6 +214,23 @@ bool registerPeer(const uint8_t mac[6]) {
     return false;
   }
   return true;
+}
+
+// 把 NVS 名冊裡的每一台都重新註冊成 ESP-NOW peer。
+// 這步不能省，也必須在 esp_now_init() 之後才叫得動：
+// peer 表只存在 RAM，重開機後全空，而 loadSlaves() 只從 NVS 還原 MAC 而已。
+// 少了它，master 拔電重插這種例行操作就會讓 esp_now_send() 回 ESP_ERR_ESPNOW_NOT_FOUND，
+// 所有輪詢與控制指令全部失敗、list 顯示全部離線，而且不會自我修復
+//（slave 不會主動送封包來觸發重新註冊），只能一台一台重新配對。
+// 更嚴重的是：slave 仍持續收到廣播心跳，lastHeartbeatTime 一直更新，
+// slave 端「30 秒失聯就強制關閉繼電器」的安全保護永遠不會觸發 ——
+// master 重開機前若某台繼電器是 ON，它會無限期保持通電，等於籠子無限期停在錯誤狀態。
+void registerAllPeers() {
+  int okCount = 0;
+  for (int i = 0; i < slaveCount; i++) {
+    if (registerPeer(slaves[i].mac)) okCount++;
+  }
+  Serial.printf("[名冊] 已重新註冊 %d／%d 台為 ESP-NOW peer\n", okCount, slaveCount);
 }
 
 bool addSlave(const uint8_t mac[6]) {
@@ -376,7 +452,7 @@ void handleSerialCommand(const String& line) {
       esp_wifi_set_channel((uint8_t)arg, WIFI_SECOND_CHAN_NONE);
       currentChannel = (uint8_t)arg;
       Serial.printf("[channel] master 切換到 %d\n", arg);
-      sendHeartbeat();
+      sendHeartbeatBurst();   // 立刻連發數次，讓正在輪掃的 slave 早點命中
     } else {
       Serial.println("channel 需在 1~13 之間");
     }
@@ -508,6 +584,16 @@ void sendHeartbeat() {
                 hb.channel, hb.pairingMode ? "是" : "否", hb.slaveCount);
 }
 
+// channel 改變的當下連發數次心跳（設計規格要求）。
+// 換 channel 後 slave 還停在舊 channel，得等 30 秒失聯門檻才開始輪掃；
+// 連發能讓「剛好已在輪掃、正巧停在新 channel」的 slave 立刻命中，不必再等下一輪。
+void sendHeartbeatBurst() {
+  for (int i = 0; i < HEARTBEAT_BURST_COUNT; i++) {
+    sendHeartbeat();
+    if (i < HEARTBEAT_BURST_COUNT - 1) delay(HEARTBEAT_BURST_GAP);
+  }
+}
+
 // ── ESP-NOW 初始化 ──
 void setupEspNow() {
   WiFi.mode(WIFI_STA);
@@ -554,9 +640,13 @@ void setup() {
   digitalWrite(ledOnBoard, LOW);
   pinMode(bootButton, INPUT_PULLUP);
   pinMode(secondButton, INPUT_PULLUP);
+  delay(50);  // 等內部提升電阻把腳位拉穩再取樣
 
-  loadSlaves();
+  checkStuckButtons();  // 必須早於任何按鈕流程，卡住的腳會在此被排除
+
+  loadSlaves();     // 只讀 NVS，可以在 ESP-NOW 初始化之前
   setupEspNow();
+  registerAllPeers();  // 必須在 esp_now_init() 之後，否則名冊上的 slave 全部送不出指令
 
   Serial.printf("設備 ID: %s\n", getDeviceId());
   printHelp();
@@ -568,10 +658,11 @@ void loop() {
   unsigned long now = millis();
 
   // ── 短按 BOOT 進入配對模式 ──
-  // 長按 3 秒以上不觸發，保留給之後的重置功能
+  // 長按 3 秒以上不觸發，保留給之後的重置功能（屆時請一律走 anyResetButtonPressed()）
+  // 自檢判定卡在 LOW 的腳一律視為未按下，避免壞按鈕不斷觸發按鈕流程
   static bool lastButtonState = HIGH;
   static unsigned long buttonDownTime = 0;
-  bool buttonState = digitalRead(bootButton);
+  bool buttonState = (bootButtonUsable && digitalRead(bootButton) == LOW) ? LOW : HIGH;
 
   if (lastButtonState == HIGH && buttonState == LOW) {
     buttonDownTime = now;
@@ -595,13 +686,7 @@ void loop() {
     digitalWrite(ledOnBoard, ((now / 500) % 2) ? HIGH : LOW);
   }
 
-  // ── 配對模式時心跳加快到 1 秒，讓 slave 更快找到 ──
-  static unsigned long lastPairingHeartbeat = 0;
-  if (pairingMode && now - lastPairingHeartbeat >= 1000) {
-    lastPairingHeartbeat = now;
-    sendHeartbeat();
-  }
-
+  // 心跳固定 1 秒一次（HEARTBEAT_INTERVAL），配對模式不再另開一組等值計時器
   if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
     lastHeartbeat = now;
     sendHeartbeat();
