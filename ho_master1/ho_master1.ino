@@ -8,6 +8,10 @@
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 const char* firmwareVersion = "1.0.0";
 const char* deviceModel = "hoMaster1";
@@ -220,6 +224,155 @@ void clearNetConfig() {
 
 bool hasWifiConfig() {
   return strlen(ssid) > 0;
+}
+
+// ── BLE 配網 ──
+// UUID 必須與 ho_relay2 完全一致，否則現有 Flutter App 找不到設備
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+bool bleConfigMode = false;   // 是否處於 BLE 配網模式（開機時沒有 WiFi 設定才會開啟）
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* srv) override {
+    deviceConnected = true;
+    Serial.println("[BLE] App 已連線");
+  }
+  void onDisconnect(BLEServer* srv) override {
+    deviceConnected = false;
+    Serial.println("[BLE] App 已斷線，重新開始廣播");
+    // ho_relay2 的 MyServerCallbacks::onDisconnect 沒有這行，導致 App 斷線後
+    // 第二次連不上，必須重開機才能再次配對，master 補上這個缺口。
+    BLEDevice::startAdvertising();
+  }
+};
+
+// BLE 收到設定資料時的回調。
+// JSON 欄位路徑必須與 ho_relay2 MyCallbacks::onWrite 的實際程式碼一致
+//（server/port/帳密全部在 wifi 物件底下，非頂層 mqtt 物件），否則現有 App 送的設定會被忽略。
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* chr) override {
+    uint8_t* data = chr->getData();
+    size_t len = chr->getLength();
+    if (len == 0) return;
+
+    char* buffer = (char*)malloc(len + 1);
+    if (!buffer) return;
+    memcpy(buffer, data, len);
+    buffer[len] = '\0';
+    Serial.printf("[BLE] 收到設定：%s\n", buffer);
+
+    // 記憶體釋放只能有一條路徑：ho_relay2 的 onWrite 在成功分支呼叫 free(buffer) 後
+    // 又在函式結尾再呼叫一次，靠 ESP.restart() 沒真的執行到才沒炸。這裡改成
+    // 所有分支共用同一個結尾，只在函式唯一的出口 free 一次。
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, buffer);
+
+    if (err || !doc.containsKey("wifi")) {
+      StaticJsonDocument<200> res;
+      res["status"] = "error";
+      res["message"] = "無效的JSON格式";
+      char resBuf[200];
+      serializeJson(res, resBuf);
+      chr->setValue((uint8_t*)resBuf, strlen(resBuf));
+      chr->notify();
+      free(buffer);
+      return;
+    }
+
+    const char* newSsid = doc["wifi"]["ssid"];
+    const char* newPassword = doc["wifi"]["password"];
+    const char* newMqttServer = doc["wifi"]["server"];
+    const char* newMqttUsername = doc["wifi"]["mqtt_username"];  // 選用
+    const char* newMqttPassword = doc["wifi"]["mqtt_password"];  // 選用
+    int newMqttPort = doc["wifi"]["mqtt_port"] | 1883;            // 選用，預設 1883
+
+    if (!newSsid || !newPassword || !newMqttServer) {
+      StaticJsonDocument<200> res;
+      res["status"] = "error";
+      res["message"] = "SSID、密碼或伺服器格式錯誤";
+      char resBuf[200];
+      serializeJson(res, resBuf);
+      chr->setValue((uint8_t*)resBuf, strlen(resBuf));
+      chr->notify();
+      free(buffer);
+      return;
+    }
+
+    strncpy(ssid, newSsid, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+    strncpy(password, newPassword, sizeof(password) - 1);
+    password[sizeof(password) - 1] = '\0';
+    strncpy(mqttServer, newMqttServer, sizeof(mqttServer) - 1);
+    mqttServer[sizeof(mqttServer) - 1] = '\0';
+
+    if (newMqttUsername) {
+      strncpy(mqttUsername, newMqttUsername, sizeof(mqttUsername) - 1);
+      mqttUsername[sizeof(mqttUsername) - 1] = '\0';
+    } else {
+      mqttUsername[0] = '\0';
+    }
+    if (newMqttPassword) {
+      strncpy(mqttPassword, newMqttPassword, sizeof(mqttPassword) - 1);
+      mqttPassword[sizeof(mqttPassword) - 1] = '\0';
+    } else {
+      mqttPassword[0] = '\0';
+    }
+    mqttPort = newMqttPort;
+    useCustomServer = true;
+
+    saveNetConfig();
+
+    StaticJsonDocument<350> res;
+    res["status"] = "success";
+    res["message"] = "WiFi 和 MQTT 設定已儲存";
+    res["data"]["device_id"] = getDeviceId();
+    res["data"]["ssid"] = ssid;
+    res["data"]["mqttServer"] = mqttServer;
+    res["data"]["mqttPort"] = mqttPort;
+    res["data"]["hasAuth"] = (strlen(mqttUsername) > 0);
+    char resBuf[350];
+    serializeJson(res, resBuf);
+    chr->setValue((uint8_t*)resBuf, strlen(resBuf));
+    chr->notify();
+
+    free(buffer);
+
+    Serial.println("[BLE] 設定已儲存，2 秒後重新啟動");
+    espNowDelay(2000);   // 維持心跳，避免已配對的 slave 在重啟前失聯
+    ESP.restart();
+  }
+};
+
+void setupBLE() {
+  const char* deviceId = getDeviceId();
+  BLEDevice::init(deviceId);
+
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ |
+                      BLECharacteristic::PROPERTY_WRITE |
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  pCharacteristic->addDescriptor(new BLE2902());
+
+  pService->start();
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  Serial.printf("[BLE] 已啟動，名稱: %s\n", deviceId);
 }
 
 // ── WiFi 狀態 ──
@@ -1134,8 +1287,15 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);      // 禁用睡眠，避免 ESP-NOW 收包延遲
 
+  // BLE 只在「沒有 WiFi 設定」時啟動，與 ho_relay2 一致。
+  // 原因：BLE stack 約佔 50~70KB heap，且與 WiFi 共用 2.4G 射頻。
+  // 配網是一次性動作，完成後 ESP.restart()，之後不再開 BLE。
   if (hasWifiConfig()) {
     connectToWiFi();
+  } else {
+    bleConfigMode = true;
+    setupBLE();
+    Serial.println("[BLE] 等待 App 配網");
   }
 
   Serial.printf("設備 ID: %s\n", getDeviceId());
@@ -1184,7 +1344,10 @@ void loop() {
   static int wifiFailCount = 0;
   static unsigned long wifiPauseUntil = 0;   // 取代 ho_relay2 會 unsigned 下溢的寫法
 
-  if (hasWifiConfig() && now - lastWiFiCheck > 5000) {
+  // BLE 配網模式下沒有 WiFi 設定也連不上，跳過整段管理；
+  // 與 ho_relay2 在 BLE 模式直接 return 不同，master 只跳過這一區塊，
+  // 按鈕處理、maintainEspNow()、LED 仍照跑，避免已配對的 slave 在配網期間失聯關籠。
+  if (!bleConfigMode && hasWifiConfig() && now - lastWiFiCheck > 5000) {
     if (WiFi.status() != WL_CONNECTED) {
       // wrap-safe 寫法：(long)(now - wifiPauseUntil) < 0 等同「now 還沒到 wifiPauseUntil」，
       // 且在 millis() 溢位時仍成立（與檔案內點動計時用的無號數減法比較同一套邏輯）。
@@ -1228,10 +1391,12 @@ void loop() {
   }
 
   // ── MQTT 連線管理 ──
+  // BLE 配網模式下同樣跳過：沒有 WiFi 連線，WiFi.status() 本就不會是 WL_CONNECTED，
+  // 這裡明講 !bleConfigMode 是為了讓「配網期間不碰 MQTT」的意圖在程式碼上明確可見。
   static unsigned long lastReconnect = 0;
   static unsigned long lastStatusPub = 0;
 
-  if (WiFi.status() == WL_CONNECTED) {
+  if (!bleConfigMode && WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
       if (now - lastReconnect > 10000) {
         lastReconnect = now;
