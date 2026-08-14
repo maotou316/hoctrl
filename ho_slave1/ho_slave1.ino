@@ -35,6 +35,11 @@ uint8_t lockedChannel = 0;        // 已鎖定的 channel，0 = 未鎖定
 unsigned long lastHeartbeatTime = 0;
 uint16_t txSeq = 0;
 
+bool waitingPairAck = false;
+unsigned long pairReqTime = 0;
+const unsigned long PAIR_ACK_TIMEOUT = 5000;
+bool masterInPairingMode = false;   // 從心跳得知 master 是否在配對模式
+
 // 掃描狀態
 bool scanning = false;
 uint8_t scanChannel = 1;
@@ -138,6 +143,38 @@ void onMasterFound(const uint8_t mac[6], uint8_t channel) {
   }
 }
 
+// LED 快閃指定次數（阻塞，只在配對結果時用）
+void blinkLed(int times, int intervalMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(ledOnFace, HIGH);
+    digitalWrite(ledOnBoard, HIGH);
+    delay(intervalMs);
+    digitalWrite(ledOnFace, LOW);
+    digitalWrite(ledOnBoard, LOW);
+    delay(intervalMs);
+  }
+}
+
+void requestPairing() {
+  if (lockedChannel == 0) {
+    Serial.println("[配對] 還沒找到 master，先開始掃描");
+    startChannelScan();
+    return;
+  }
+  if (!masterInPairingMode) {
+    Serial.println("[配對] master 不在配對模式，請先短按 master 的按鈕");
+    return;
+  }
+
+  uint8_t buf[250];
+  size_t total = hoPackPacket(buf, sizeof(buf), HO_PKT_PAIR_REQ, txSeq++, nullptr, 0);
+  esp_now_send(masterMac, buf, total);
+
+  waitingPairAck = true;
+  pairReqTime = millis();
+  Serial.println("[配對] 已送出配對請求，等待回覆");
+}
+
 // ── ESP-NOW ──
 void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   HoPacketHeader header;
@@ -161,10 +198,35 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     Serial.printf("[心跳] 來自 %s channel=%u 配對模式=%s rssi=%d\n",
                   id, hb.channel, hb.pairingMode ? "是" : "否", info->rx_ctrl->rssi);
 
+    masterInPairingMode = (hb.pairingMode == 1);
     onMasterFound(info->src_addr, hb.channel);
     return;
   }
-  // 其餘型別在 Task 4、Task 5 補上
+
+  if (header.type == HO_PKT_PAIR_ACK && payloadLen >= sizeof(HoPairAckPayload)) {
+    HoPairAckPayload ack;
+    memcpy(&ack, payload, sizeof(ack));
+    waitingPairAck = false;
+
+    if (ack.accepted) {
+      memcpy(masterMac, info->src_addr, 6);
+      lockedChannel = ack.channel;
+      masterKnown = true;
+      savePairing();
+
+      char id[20];
+      hoFormatDeviceId(masterMac, id);
+      Serial.printf("[配對] 成功，master=%s channel=%u\n", id, ack.channel);
+      blinkLed(3, 100);   // 快閃 3 下表示成功
+    } else {
+      const char* why = (ack.reason == HO_PAIR_FULL) ? "master 已達 20 台上限"
+                      : (ack.reason == HO_PAIR_NOT_PAIRING) ? "master 不在配對模式"
+                      : "未知原因";
+      Serial.printf("[配對] 被拒絕：%s\n", why);
+      blinkLed(3, 400);   // 慢閃 3 下表示失敗
+    }
+    return;
+  }
 }
 
 void onEspNowSent(const wifi_tx_info_t* txInfo, esp_now_send_status_t status) {
@@ -230,6 +292,28 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  // ── 短按 BOOT 送出配對請求 ──
+  static bool lastButtonState = HIGH;
+  static unsigned long buttonDownTime = 0;
+  bool buttonState = digitalRead(bootButton);
+
+  if (lastButtonState == HIGH && buttonState == LOW) {
+    buttonDownTime = now;
+  }
+  if (lastButtonState == LOW && buttonState == HIGH) {
+    unsigned long pressDuration = now - buttonDownTime;
+    if (pressDuration >= 50 && pressDuration < 1000) {
+      requestPairing();
+    }
+  }
+  lastButtonState = buttonState;
+
+  // ── 配對請求逾時 ──
+  if (waitingPairAck && now - pairReqTime >= PAIR_ACK_TIMEOUT) {
+    waitingPairAck = false;
+    Serial.println("[配對] 等待回覆逾時");
+  }
 
   // 掃描中：每個 channel 停留 SCAN_DWELL_MS 後換下一個
   if (scanning) {
