@@ -1,0 +1,5 @@
+# arduino-cli 編譯輸出
+*/build/
+
+# SDD 執行工作區
+.superpowers/
