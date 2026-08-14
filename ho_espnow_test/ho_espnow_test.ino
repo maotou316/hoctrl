@@ -88,6 +88,12 @@ void testRejectBadPackets() {
 
   uint8_t huge[300];
   check(hoPackPacket(buf, sizeof(buf), HO_PKT_CMD, 1, huge, 300) == 0, "payload 超長時回 0");
+
+  // 正向邊界：payload 長度剛好等於上限時應該打包成功，不能被上面的超長檢查誤傷
+  uint8_t maxPayload[HO_ESPNOW_MAX_PAYLOAD];
+  memset(maxPayload, 0xAB, sizeof(maxPayload));
+  size_t maxLen = hoPackPacket(buf, sizeof(buf), HO_PKT_CMD, 1, maxPayload, HO_ESPNOW_MAX_PAYLOAD);
+  check(maxLen == sizeof(HoPacketHeader) + HO_ESPNOW_MAX_PAYLOAD, "payload 剛好等於上限時打包成功");
 }
 
 void testDeviceId() {
@@ -104,6 +110,11 @@ void testDeviceId() {
   check(!hoParseMacFromDeviceId("hoban-xyz", back), "長度不符時拒絕");
   check(!hoParseMacFromDeviceId("relay-a0b1c2d3e4f5", back), "前綴不符時拒絕");
   check(!hoParseMacFromDeviceId("hoban-a0b1c2d3e4gg", back), "非十六進位字元時拒絕");
+
+  // 迴歸測試：strtol 會吃掉前導空白與正負號，仍回報「完整消耗兩字元」，
+  // 換成 isxdigit() 逐字元驗證後，這兩種畸形輸入必須被拒絕。
+  check(!hoParseMacFromDeviceId("hoban- 0b1c2d3e4f5", back), "前導空白時拒絕");
+  check(!hoParseMacFromDeviceId("hoban--0b1c2d3e4f5", back), "正負號時拒絕");
 }
 
 void setup() {

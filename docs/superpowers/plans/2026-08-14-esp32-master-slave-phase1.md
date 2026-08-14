@@ -216,6 +216,7 @@ bool hoParseMacFromDeviceId(const char* deviceId, uint8_t out[6]);
 
 ```cpp
 #include "HoEspNowProtocol.h"
+#include <ctype.h>
 
 uint8_t hoCrc8(const uint8_t* data, size_t len) {
   uint8_t crc = 0x00;
@@ -287,18 +288,28 @@ void hoFormatDeviceId(const uint8_t mac[6], char out[20]) {
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+// 單一十六進位字元 → 數值。呼叫前必須先用 isxdigit() 確認合法，
+// 否則遇到非十六進位字元會回傳未定義的結果。
+static uint8_t hoHexNibble(char c) {
+  if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+  if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+  return (uint8_t)(c - 'A' + 10);  // 呼叫端已保證是十六進位字元
+}
+
 bool hoParseMacFromDeviceId(const char* deviceId, uint8_t out[6]) {
   if (deviceId == nullptr) return false;
   if (strncmp(deviceId, "hoban-", 6) != 0) return false;
   const char* hex = deviceId + 6;
   if (strlen(hex) != 12) return false;
 
+  // 不用 strtol：它會吃掉前導空白與正負號，"  1"、"-1" 這種畸形輸入
+  // 也會被判定為「完整消耗兩字元」而誤判成功。改成逐字元用 isxdigit()
+  // 驗證後再手動轉換，才擋得住外部輸入（如 MQTT topic）夾帶的怪字元。
   for (int i = 0; i < 6; i++) {
-    char buf[3] = { hex[i * 2], hex[i * 2 + 1], '\0' };
-    char* end = nullptr;
-    long v = strtol(buf, &end, 16);
-    if (end != buf + 2) return false;   // 有非十六進位字元
-    out[i] = (uint8_t)v;
+    char hi = hex[i * 2];
+    char lo = hex[i * 2 + 1];
+    if (!isxdigit((unsigned char)hi) || !isxdigit((unsigned char)lo)) return false;
+    out[i] = (uint8_t)((hoHexNibble(hi) << 4) | hoHexNibble(lo));
   }
   return true;
 }
@@ -399,6 +410,12 @@ void testRejectBadPackets() {
 
   uint8_t huge[300];
   check(hoPackPacket(buf, sizeof(buf), HO_PKT_CMD, 1, huge, 300) == 0, "payload 超長時回 0");
+
+  // 正向邊界：payload 長度剛好等於上限時應該打包成功，不能被上面的超長檢查誤傷
+  uint8_t maxPayload[HO_ESPNOW_MAX_PAYLOAD];
+  memset(maxPayload, 0xAB, sizeof(maxPayload));
+  size_t maxLen = hoPackPacket(buf, sizeof(buf), HO_PKT_CMD, 1, maxPayload, HO_ESPNOW_MAX_PAYLOAD);
+  check(maxLen == sizeof(HoPacketHeader) + HO_ESPNOW_MAX_PAYLOAD, "payload 剛好等於上限時打包成功");
 }
 
 void testDeviceId() {
@@ -415,6 +432,11 @@ void testDeviceId() {
   check(!hoParseMacFromDeviceId("hoban-xyz", back), "長度不符時拒絕");
   check(!hoParseMacFromDeviceId("relay-a0b1c2d3e4f5", back), "前綴不符時拒絕");
   check(!hoParseMacFromDeviceId("hoban-a0b1c2d3e4gg", back), "非十六進位字元時拒絕");
+
+  // 迴歸測試：strtol 會吃掉前導空白與正負號，仍回報「完整消耗兩字元」，
+  // 換成 isxdigit() 逐字元驗證後，這兩種畸形輸入必須被拒絕。
+  check(!hoParseMacFromDeviceId("hoban- 0b1c2d3e4f5", back), "前導空白時拒絕");
+  check(!hoParseMacFromDeviceId("hoban--0b1c2d3e4f5", back), "正負號時拒絕");
 }
 
 void setup() {
@@ -585,10 +607,10 @@ Run：
 
 Expected：序列埠輸出每項都是 `[PASS]`，最後兩行為
 ```
-執行 29 項，失敗 0 項
+執行 32 項，失敗 0 項
 ALL TESTS PASSED
 ```
-（29 = struct 大小 5 + CRC 4 + 打包解包 8 + 拒收異常 6 + 設備 ID 6）
+（32 = struct 大小 5 + CRC 4 + 打包解包 8 + 拒收異常 7 + 設備 ID 8）
 腳本 exit code 0。
 
 **若 struct 大小測試失敗**：表示 `__attribute__((packed))` 沒生效或編譯器有額外對齊，
@@ -602,7 +624,7 @@ git add libraries/ ho_espnow_test/ tools/serial_expect.ps1 flash.ps1
 git commit -m "新增 ESP-NOW 共用協定 library 與 on-target 測試
 
 - HoEspNow library：封包格式、CRC8（含共享密鑰）、打包解包、設備 ID 轉換
-- ho_espnow_test：在真實 ESP32-C3 上驗證 struct 對齊與協定行為，29 項全過
+- ho_espnow_test：在真實 ESP32-C3 上驗證 struct 對齊與協定行為，32 項全過
 - tools/serial_expect.ps1：用 arduino-cli monitor 抓序列埠輸出並比對
 - flash.ps1：新增 master/slave/test 三個型號，編譯加 --libraries
 
