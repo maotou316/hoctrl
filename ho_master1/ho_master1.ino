@@ -222,14 +222,30 @@ void requestSlaveState(int idx) {
   espNowSendTo(slaves[idx].mac, HO_PKT_STATE_REQ, nullptr, 0);
 }
 
-// 每輪只問一台，20 台輪完一圈約 5 分鐘太慢，
-// 所以每次輪詢就把全部問一遍，用 20ms 錯開避免碰撞。
-void pollSlaveStates() {
+// 分散式輪詢：每次 loop() 呼叫最多只問一台，用「15000ms ÷ 台數」的間隔
+// 平均分攤，一輪剛好 15 秒問完全部，且完全不阻塞 loop()。
+// （舊版用 for 迴圈搭配 delay(20) 一次問完全部，20 台會阻塞 loop() 達
+// 400ms，若與 master 自身點動的關閉時機重疊，會讓點動時間被拖長超過設定
+// 值，故改為此設計，見 Task 6 review 修正 2）
+void pollNextSlave() {
   if (slaveCount == 0) return;
-  for (int i = 0; i < slaveCount; i++) {
-    requestSlaveState(i);
-    delay(20);
-  }
+
+  static unsigned long lastPollAt = 0;
+  static int pollIdx = 0;
+
+  // 下限 20ms：台數很多時避免間隔過短、無線封包擠在一起碰撞
+  unsigned long interval = 15000UL / (unsigned long)slaveCount;
+  if (interval < 20) interval = 20;
+
+  unsigned long now = millis();
+  if (now - lastPollAt < interval) return;
+  lastPollAt = now;
+
+  // slaveCount 可能因配對／解除配對中途變動，索引越界就重頭開始，
+  // 不特別處理「跳過某台」，反正下一輪就會輪到
+  if (pollIdx >= slaveCount) pollIdx = 0;
+  requestSlaveState(pollIdx);
+  pollIdx = (pollIdx + 1) % slaveCount;
 }
 
 void updateSlaveOnlineStatus() {
@@ -591,11 +607,13 @@ void loop() {
     sendHeartbeat();
   }
 
-  // ── 每 15 秒輪詢一次 slave 狀態 ──
-  static unsigned long lastPoll = 0;
-  if (now - lastPoll >= 15000) {
-    lastPoll = now;
-    pollSlaveStates();
+  // ── 分散式輪詢 slave 狀態，每次 loop() 最多問一台（見 pollNextSlave()）──
+  pollNextSlave();
+
+  // ── 每 15 秒檢查一次 slave 是否離線 ──
+  static unsigned long lastOnlineCheck = 0;
+  if (now - lastOnlineCheck >= 15000) {
+    lastOnlineCheck = now;
     updateSlaveOnlineStatus();
   }
 

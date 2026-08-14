@@ -2144,24 +2144,43 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 5 的 `requestSlaveState()`、`slaves[].lastSeen`
-- Produces: Master 定期輪詢機制；`void pollSlaveStates()`
+- Produces: Master 定期輪詢機制；`void pollNextSlave()`
 
 - [ ] **Step 1: Master 定期輪詢 slave 狀態**
 
 只靠 slave 主動回報無法得知離線。Master 每 15 秒輪詢一次，
 超過 30 秒沒回應就標記離線（Phase 2 會用這個狀態代發 MQTT 的 offline）。
 
+> **Review 修正（原稿曾用 for 迴圈搭配 `delay(20)` 一次問完全部 slave，
+> 20 台時會阻塞 `loop()` 達 400ms，若與 master 自身點動的關閉時機重疊，
+> 會讓點動時間被拖長超過設定值。已改為分散式輪詢：每次 `loop()` 最多問
+> 一台，用「15000ms ÷ 台數」的間隔平均分攤，一輪仍是 15 秒問完全部，
+> 但完全不阻塞。）**
+
 在 `ho_master1.ino` 的 `requestSlaveState()` 之後加入：
 
 ```cpp
-// 每輪只問一台，20 台輪完一圈約 5 分鐘太慢，
-// 所以每次輪詢就把全部問一遍，用 20ms 錯開避免碰撞。
-void pollSlaveStates() {
+// 分散式輪詢：每次 loop() 呼叫最多只問一台，用「15000ms ÷ 台數」的間隔
+// 平均分攤，一輪剛好 15 秒問完全部，且完全不阻塞 loop()。
+void pollNextSlave() {
   if (slaveCount == 0) return;
-  for (int i = 0; i < slaveCount; i++) {
-    requestSlaveState(i);
-    delay(20);
-  }
+
+  static unsigned long lastPollAt = 0;
+  static int pollIdx = 0;
+
+  // 下限 20ms：台數很多時避免間隔過短、無線封包擠在一起碰撞
+  unsigned long interval = 15000UL / (unsigned long)slaveCount;
+  if (interval < 20) interval = 20;
+
+  unsigned long now = millis();
+  if (now - lastPollAt < interval) return;
+  lastPollAt = now;
+
+  // slaveCount 可能因配對／解除配對中途變動，索引越界就重頭開始，
+  // 不特別處理「跳過某台」，反正下一輪就會輪到
+  if (pollIdx >= slaveCount) pollIdx = 0;
+  requestSlaveState(pollIdx);
+  pollIdx = (pollIdx + 1) % slaveCount;
 }
 
 void updateSlaveOnlineStatus() {
@@ -2184,11 +2203,13 @@ void updateSlaveOnlineStatus() {
 在 `loop()` 的心跳區塊之後加入：
 
 ```cpp
-  // ── 每 15 秒輪詢一次 slave 狀態 ──
-  static unsigned long lastPoll = 0;
-  if (now - lastPoll >= 15000) {
-    lastPoll = now;
-    pollSlaveStates();
+  // ── 分散式輪詢 slave 狀態，每次 loop() 最多問一台（見 pollNextSlave()）──
+  pollNextSlave();
+
+  // ── 每 15 秒檢查一次 slave 是否離線 ──
+  static unsigned long lastOnlineCheck = 0;
+  if (now - lastOnlineCheck >= 15000) {
+    lastOnlineCheck = now;
     updateSlaveOnlineStatus();
   }
 ```
@@ -2304,7 +2325,7 @@ git commit -m "實作失聯偵測與自動恢復
 - Master：每 15 秒輪詢所有 slave 狀態，超過 30 秒無回應標記離線
 - Slave：失去 master 時強制關閉繼電器（安全預設），再開始輪掃
 - Master 新增測試指令 ch <n>，可手動切 channel 驗證 slave 的重掃恢復
-- 三種失聯情境（slave 斷電、master 斷電、channel 改變）皆實測恢復
+- 三種失聯情境的程式碼已補齊，實機驗證待有板子後執行
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
