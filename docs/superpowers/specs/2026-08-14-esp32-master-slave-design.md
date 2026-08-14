@@ -65,14 +65,22 @@ ESP-NOW 收發雙方必須在**同一個 WiFi channel**。Master 連上路由器
 
 解法（三層）：
 
-1. **Master 廣播心跳** — 每 5 秒對 `FF:FF:FF:FF:FF:FF` 發一次 `PKT_HEARTBEAT`，
+1. **Master 廣播心跳** — 每 1 秒對 `FF:FF:FF:FF:FF:FF` 發一次 `PKT_HEARTBEAT`，
    內含自己的 MAC、目前 channel、是否在配對模式
 2. **Slave 記住 channel** — 配對時把 master MAC + channel 寫入 EEPROM，
    開機直接 `esp_wifi_set_channel()` 切過去
 3. **失聯自動輪掃** — Slave 超過 30 秒沒收到心跳，開始輪掃 channel 1~13
-   （每個 channel 停 600ms），收到心跳就鎖定並更新 EEPROM
+   （每個 channel 停 1200ms），收到心跳就鎖定並更新 EEPROM
 
-Master 也要在 `WiFi.channel()` 改變時立刻多發幾次心跳，縮短 slave 的失聯窗口。
+**心跳週期與掃描停留時間的比例是有意設計的**：dwell（1200ms）必須大於心跳週期（1000ms），
+才能保證 slave 掃過正確 channel 時**必定**涵蓋到至少一次心跳。若兩者比例失衡
+（例如心跳 5 秒、dwell 600ms），命中就變成機率事件——停留時間佔比僅 600/7800 ≈ 7.7%，
+期望要約 13 次心跳才鎖得回來，恢復時間會從十幾秒惡化到 60 秒以上且無上界。
+**調整任一個常數時務必一併檢查這個關係。**
+
+恢復時間：最壞 30 秒失聯門檻 + 一輪掃描 13 × 1200ms = **45.6 秒**；典型約 38 秒。
+
+Master 也要在 `WiFi.channel()` 改變時立刻連發數次心跳，縮短 slave 的失聯窗口。
 
 ### 難點 2：Long Range 模式可切換
 
