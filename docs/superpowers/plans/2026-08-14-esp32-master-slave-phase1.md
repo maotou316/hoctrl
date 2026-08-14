@@ -1720,11 +1720,17 @@ Master 用序列埠指令控制 slave 的繼電器，slave 回報狀態。
 ```cpp
 // 點動：開啟 ms 毫秒後自動關閉。
 // 用非阻塞方式，避免點動期間收不到 ESP-NOW 封包。
-unsigned long pulseEndTime = 0;
+// 用「起始時間＋持續時間」搭配無號數減法比較，而非「結束時間」搭配絕對值比較，
+// 避免 millis() 約 49.7 天溢位時，迴繞後的極小值被誤判為「時間已到」而提前關閉繼電器
+unsigned long pulseStartTime = 0;
+uint16_t pulseDuration = 0;
+bool pulseActive = false;
 
 void pulseRelay(uint16_t ms) {
   setRelayPins(true);
-  pulseEndTime = millis() + ms;
+  pulseStartTime = millis();
+  pulseDuration = ms;
+  pulseActive = true;
   Serial.printf("[繼電器] 點動 %u ms\n", ms);
 }
 
@@ -1760,12 +1766,12 @@ void sendState() {
     switch (cmd.cmd) {
       case HO_CMD_ON:
         setRelayPins(true);
-        pulseEndTime = 0;
+        pulseActive = false;
         Serial.println("[繼電器] 開啟");
         break;
       case HO_CMD_OFF:
         setRelayPins(false);
-        pulseEndTime = 0;
+        pulseActive = false;
         Serial.println("[繼電器] 關閉");
         break;
       case HO_CMD_PULSE:
@@ -1799,8 +1805,8 @@ void sendState() {
 
 ```cpp
   // 點動時間到，自動關閉
-  if (pulseEndTime != 0 && now >= pulseEndTime) {
-    pulseEndTime = 0;
+  if (pulseActive && (now - pulseStartTime) >= pulseDuration) {
+    pulseActive = false;
     setRelayPins(false);
     Serial.println("[繼電器] 點動結束，已關閉");
     sendState();
@@ -1909,19 +1915,25 @@ void setRelayPins(bool on) {
   relayState = on;
 }
 
-unsigned long pulseEndTime = 0;
+// 用「起始時間＋持續時間」搭配無號數減法比較，而非「結束時間」搭配絕對值比較，
+// 避免 millis() 約 49.7 天溢位時，迴繞後的極小值被誤判為「時間已到」而提前關閉繼電器
+unsigned long pulseStartTime = 0;
+uint16_t pulseDuration = 0;
+bool pulseActive = false;
 
 void pulseRelay(uint16_t ms) {
   setRelayPins(true);
-  pulseEndTime = millis() + ms;
+  pulseStartTime = millis();
+  pulseDuration = ms;
+  pulseActive = true;
 }
 ```
 
 在 `loop()` 尾端加入點動結束處理：
 
 ```cpp
-  if (pulseEndTime != 0 && now >= pulseEndTime) {
-    pulseEndTime = 0;
+  if (pulseActive && (now - pulseStartTime) >= pulseDuration) {
+    pulseActive = false;
     setRelayPins(false);
   }
 ```
@@ -1972,6 +1984,19 @@ void printHelp() {
   Serial.println("  help          顯示這份說明");
 }
 
+// 驗證序列埠指令的編號參數是否為合法非負整數。
+// String::toInt() 對非數字輸入會靜默回傳 0，若不驗證，打錯字（如 on a）
+// 會被誤當成「編號 0」直接執行，動物管制設備誤觸發繼電器等於誤關籠子，故視為安全性驗證。
+bool parseIndexArg(const String& argStr, int& outIdx) {
+  if (argStr.length() == 0) return false;
+  for (unsigned int i = 0; i < argStr.length(); i++) {
+    char c = argStr.charAt(i);
+    if (c < '0' || c > '9') return false;  // 只接受純數字，不支援負號
+  }
+  outIdx = argStr.toInt();
+  return true;
+}
+
 void handleSerialCommand(const String& line) {
   String cmd = line;
   cmd.trim();
@@ -1979,7 +2004,17 @@ void handleSerialCommand(const String& line) {
 
   int spacePos = cmd.indexOf(' ');
   String verb = (spacePos < 0) ? cmd : cmd.substring(0, spacePos);
-  int arg = (spacePos < 0) ? -1 : cmd.substring(spacePos + 1).toInt();
+  String argStr = (spacePos < 0) ? "" : cmd.substring(spacePos + 1);
+  argStr.trim();
+
+  // 這些指令需要編號參數，其餘指令（list/pair/allon/alloff/allpulse/help）不受影響
+  bool needsArg = (verb == "on" || verb == "off" || verb == "pulse" ||
+                   verb == "state" || verb == "unpair");
+  int arg = -1;
+  if (needsArg && !parseIndexArg(argStr, arg)) {
+    Serial.println("[指令] 編號必須是數字，例如：on 0（輸入 help 看說明）");
+    return;
+  }
 
   if (verb == "list") {
     printSlaveList();
@@ -2169,7 +2204,7 @@ slave 超過心跳逾時仍找不到 master，強制關閉繼電器。
   // 安全預設：失去 master 時關閉繼電器，避免一直通電
   if (relayState) {
     setRelayPins(false);
-    pulseEndTime = 0;
+    pulseActive = false;
     Serial.println("[安全] 失去 master，繼電器已關閉");
   }
 ```

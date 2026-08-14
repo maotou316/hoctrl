@@ -69,11 +69,17 @@ void setRelayPins(bool on) {
 
 // 點動：開啟 ms 毫秒後自動關閉。
 // 用非阻塞方式，避免點動期間收不到 ESP-NOW 封包。
-unsigned long pulseEndTime = 0;
+// 用「起始時間＋持續時間」搭配無號數減法比較，而非「結束時間」搭配絕對值比較，
+// 避免 millis() 約 49.7 天溢位時，迴繞後的極小值被誤判為「時間已到」而提前關閉繼電器
+unsigned long pulseStartTime = 0;
+uint16_t pulseDuration = 0;
+bool pulseActive = false;
 
 void pulseRelay(uint16_t ms) {
   setRelayPins(true);
-  pulseEndTime = millis() + ms;
+  pulseStartTime = millis();
+  pulseDuration = ms;
+  pulseActive = true;
   Serial.printf("[繼電器] 點動 %u ms\n", ms);
 }
 
@@ -276,12 +282,12 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     switch (cmd.cmd) {
       case HO_CMD_ON:
         setRelayPins(true);
-        pulseEndTime = 0;
+        pulseActive = false;
         Serial.println("[繼電器] 開啟");
         break;
       case HO_CMD_OFF:
         setRelayPins(false);
-        pulseEndTime = 0;
+        pulseActive = false;
         Serial.println("[繼電器] 關閉");
         break;
       case HO_CMD_PULSE:
@@ -408,8 +414,8 @@ void loop() {
   }
 
   // 點動時間到，自動關閉
-  if (pulseEndTime != 0 && now >= pulseEndTime) {
-    pulseEndTime = 0;
+  if (pulseActive && (now - pulseStartTime) >= pulseDuration) {
+    pulseActive = false;
     setRelayPins(false);
     Serial.println("[繼電器] 點動結束，已關閉");
     sendState();
