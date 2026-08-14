@@ -1431,8 +1431,17 @@ void exitPairingMode() {
     }
 
     // 回覆前必須先註冊 peer，否則單播送不出去
+    // 注意：一定要在 registerPeer() 之前記錄 wasPeer，且只在「原本就不是 peer」
+    // 又被拒絕時才刪除。若沒有這個判斷，已配對成功的 slave 若因故重送
+    // PAIR_REQ（例如剛好 master 不在配對模式），會被誤刪 peer 而收不到後續指令。
+    bool wasPeer = esp_now_is_peer_exist(info->src_addr);
     registerPeer(info->src_addr);
     espNowSendTo(info->src_addr, HO_PKT_PAIR_ACK, &ack, sizeof(ack));
+    if (!ack.accepted && !wasPeer) {
+      // 被拒絕又不是原本就存在的 peer：這只是為了送出 ACK 而暫時註冊，
+      // 用完就刪，避免陌生設備灌爆 20 台的 peer 表上限。
+      esp_now_del_peer(info->src_addr);
+    }
     return;
   }
 
