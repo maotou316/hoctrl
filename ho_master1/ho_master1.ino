@@ -222,6 +222,32 @@ void requestSlaveState(int idx) {
   espNowSendTo(slaves[idx].mac, HO_PKT_STATE_REQ, nullptr, 0);
 }
 
+// 每輪只問一台，20 台輪完一圈約 5 分鐘太慢，
+// 所以每次輪詢就把全部問一遍，用 20ms 錯開避免碰撞。
+void pollSlaveStates() {
+  if (slaveCount == 0) return;
+  for (int i = 0; i < slaveCount; i++) {
+    requestSlaveState(i);
+    delay(20);
+  }
+}
+
+void updateSlaveOnlineStatus() {
+  unsigned long now = millis();
+  for (int i = 0; i < slaveCount; i++) {
+    bool wasOnline = slaves[i].online;
+    bool isOnline = slaves[i].lastSeen > 0 &&
+                    (now - slaves[i].lastSeen) < SLAVE_OFFLINE_TIMEOUT;
+    if (wasOnline && !isOnline) {
+      char id[20];
+      hoFormatDeviceId(slaves[i].mac, id);
+      Serial.printf("[離線] %s 超過 %lu 秒沒回應\n",
+                    id, SLAVE_OFFLINE_TIMEOUT / 1000);
+    }
+    slaves[i].online = isOnline;
+  }
+}
+
 void unpairSlave(int idx) {
   if (idx < 0 || idx >= slaveCount) {
     Serial.println("[配對] 編號超出範圍");
@@ -270,6 +296,7 @@ void printHelp() {
   Serial.println("  allpulse      全部點動 2 秒");
   Serial.println("  state <n>     要求第 n 台回報狀態");
   Serial.println("  unpair <n>    解除第 n 台配對");
+  Serial.println("  ch <n>        測試用：切換 master 的 channel（1~13）");
   Serial.println("  help          顯示這份說明");
 }
 
@@ -296,12 +323,14 @@ void handleSerialCommand(const String& line) {
   String argStr = (spacePos < 0) ? "" : cmd.substring(spacePos + 1);
   argStr.trim();
 
-  // 這些指令需要編號參數，其餘指令（list/pair/allon/alloff/allpulse/help）不受影響
+  // 這些指令需要數字參數，其餘指令（list/pair/allon/alloff/allpulse/help）不受影響
+  // ch 雖然不是編號而是 channel，但同樣要求純數字，沿用同一套驗證避免 String::toInt()
+  // 對非數字輸入靜默回傳 0（例如 ch abc 誤觸發切到 channel 0）
   bool needsArg = (verb == "on" || verb == "off" || verb == "pulse" ||
-                   verb == "state" || verb == "unpair");
+                   verb == "state" || verb == "unpair" || verb == "ch");
   int arg = -1;
   if (needsArg && !parseIndexArg(argStr, arg)) {
-    Serial.println("[指令] 編號必須是數字，例如：on 0（輸入 help 看說明）");
+    Serial.println("[指令] 參數必須是數字，例如：on 0（輸入 help 看說明）");
     return;
   }
 
@@ -325,6 +354,16 @@ void handleSerialCommand(const String& line) {
     requestSlaveState(arg);
   } else if (verb == "unpair") {
     unpairSlave(arg);
+  } else if (verb == "ch") {
+    // 測試用：手動切換 channel，模擬 Phase 2 連上不同路由器的情況
+    if (arg >= 1 && arg <= 13) {
+      esp_wifi_set_channel((uint8_t)arg, WIFI_SECOND_CHAN_NONE);
+      currentChannel = (uint8_t)arg;
+      Serial.printf("[channel] master 切換到 %d\n", arg);
+      sendHeartbeat();
+    } else {
+      Serial.println("channel 需在 1~13 之間");
+    }
   } else if (verb == "help") {
     printHelp();
   } else {
@@ -550,6 +589,14 @@ void loop() {
   if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
     lastHeartbeat = now;
     sendHeartbeat();
+  }
+
+  // ── 每 15 秒輪詢一次 slave 狀態 ──
+  static unsigned long lastPoll = 0;
+  if (now - lastPoll >= 15000) {
+    lastPoll = now;
+    pollSlaveStates();
+    updateSlaveOnlineStatus();
   }
 
   if (pulseActive && (now - pulseStartTime) >= pulseDuration) {

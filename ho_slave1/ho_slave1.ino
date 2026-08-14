@@ -151,6 +151,14 @@ void setChannel(uint8_t ch) {
 
 void startChannelScan() {
   if (scanning) return;
+
+  // 安全預設：失去 master 時關閉繼電器，避免一直通電
+  if (relayState) {
+    setRelayPins(false);
+    pulseActive = false;
+    Serial.println("[安全] 失去 master，繼電器已關閉");
+  }
+
   scanning = true;
   scanChannel = 1;
   scanChannelStart = millis();
