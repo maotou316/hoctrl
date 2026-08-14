@@ -990,16 +990,88 @@ void smartConnect() {
   Serial.println("[MQTT] 所有伺服器都連不上");
 }
 
-// Task 5 會擴充成完整的狀態 JSON
+// 發布完整狀態（Phase 2a 先不含 slaves 陣列，那是 Phase 2b 才加）
 void publishStatus() {
   if (!mqttClient.connected()) return;
-  String topic = String("hoban/") + getDeviceId() + "/status";
-  mqttClient.publish(topic.c_str(), "{\"status\":\"online\"}", true);
+
+  const char* deviceId = getDeviceId();
+  String topic = String("hoban/") + deviceId + "/status";
+
+  StaticJsonDocument<512> doc;
+  doc["device_id"] = deviceId;
+  doc["status"] = "online";
+  doc["version"] = firmwareVersion;
+  doc["model"] = deviceModel;
+  doc["timestamp"] = millis() / 1000;
+
+  JsonObject wifi = doc.createNestedObject("wifi");
+  wifi["connected"] = WiFi.isConnected();
+  wifi["ssid"] = ssid;
+  wifi["rssi"] = WiFi.RSSI();
+  wifi["ip"] = WiFi.localIP().toString();
+
+  JsonObject dev = doc.createNestedObject("device");
+  dev["relay"] = relayState ? 1 : 0;
+  dev["has_relay"] = hasRelay;
+  dev["pairing"] = pairingMode;
+  dev["slave_count"] = (int)slaveCount;
+  dev["channel"] = currentChannel;
+  dev["long_range"] = longRangeEnabled;
+
+  char buf[512];
+  size_t n = serializeJson(doc, buf);
+  bool ok = mqttClient.publish(topic.c_str(), buf, true);
+  if (!ok) {
+    // Phase 2b 會在這個 JSON 裡加最多 20 台 slave 的陣列，一旦超過 buffer
+    // 會像這樣靜默失敗（publish() 只回傳 false，不會拋例外），先把長度印出來
+    // 讓「快超過了」在序列埠上就看得見，不必等到真的超過才發現。
+    Serial.printf("[MQTT] 狀態發布失敗（長度 %u，buffer %u）\n",
+                  (unsigned)n, (unsigned)mqttClient.getBufferSize());
+  }
 }
 
-// Task 5 會擴充成完整的指令分派
+// 指令分派。Phase 2a 只處理 master 自己的指令；ALL:*、PAIR:*、UNPAIR:* 等
+// slave 相關指令留給 Phase 2b。
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.printf("[MQTT] 收到訊息，長度 %u（指令處理待 Task 5 實作）\n", length);
+  String message;
+  message.reserve(length + 1);
+  for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
+
+  String expected = String("hoban/") + getDeviceId() + "/control";
+  if (String(topic) != expected) return;
+
+  Serial.printf("[MQTT] 收到指令: %s\n", message.c_str());
+
+  if (message == "status") {
+    publishStatus();
+  } else if (message == "ON") {
+    pulseRelay(2000);
+    publishStatus();
+  } else if (message == "OFF") {
+    setRelayPins(false);
+    publishStatus();
+  } else if (message == "reset") {
+    // 這裡刻意「清除後立刻重開機」，不可改成「清除後繼續往下執行」：
+    // Preferences::getString() 在 key 不存在時完全不寫入緩衝區（core 3.3.7 的
+    // Preferences.cpp 遇到 key 不存在直接 return 0），所以 clearNetConfig() 之後
+    // 若不重開機就再呼叫 loadNetConfig()，RAM 裡的 ssid 等變數會殘留清除前的
+    // 舊字串，hasWifiConfig() 會誤判成「仍有設定」。用 restart 讓開機流程重新
+    // 從乾淨的 RAM 狀態呼叫 loadNetConfig()，才能保證讀到的是清除後的結果。
+    clearNetConfig();
+    espNowDelay(1000);
+    ESP.restart();
+  } else if (message == "FIND_BEST_SERVER") {
+    mqttClient.disconnect();
+    espNowDelay(500);
+    smartConnect();
+  } else if (message == "HASRELAY:ON" || message == "HASRELAY:OFF") {
+    hasRelay = (message == "HASRELAY:ON");
+    saveNetConfig();
+    Serial.printf("[設定] 繼電器宣告為 %s\n", hasRelay ? "有接" : "未接");
+    publishStatus();
+  } else {
+    Serial.printf("[MQTT] 未知指令: %s\n", message.c_str());
+  }
 }
 
 // ── ESP-NOW 初始化 ──
