@@ -56,6 +56,10 @@ const unsigned long HEARTBEAT_INTERVAL = 1000;
 const int HEARTBEAT_BURST_COUNT = 4;
 const int HEARTBEAT_BURST_GAP = 200;
 
+// 心跳「印出序列埠」的降頻倍數（發送頻率不受影響，仍是每 1 秒一次）。
+// 每 10 次印一行 ≈ 每 10 秒一行，狀態有變化時仍會立即印，詳見 sendHeartbeat()
+const int HEARTBEAT_LOG_EVERY = 10;
+
 // ── 開機按鈕自檢（移植自 ho_relay2.ino）──
 // 按鈕接法是 GPIO ──[按鈕]── GND，靠 INPUT_PULLUP 拉高；某支腳一旦短路或走線接地
 // 就恆為 LOW，會被按鈕狀態機誤判成「使用者一直按著」。
@@ -580,14 +584,40 @@ void sendHeartbeat() {
   hb.slaveCount = (uint8_t)slaveCount;
 
   espNowSendTo(BROADCAST_MAC, HO_PKT_HEARTBEAT, &hb, sizeof(hb));
-  Serial.printf("[心跳] channel=%u 配對模式=%s slave=%u\n",
-                hb.channel, hb.pairingMode ? "是" : "否", hb.slaveCount);
+
+  // ── 心跳 log 降頻 ──
+  // 發送頻率必須維持 1 秒（保證 slave 掃描一輪必定命中），但若每次都印，
+  // 序列埠會被每秒一行的心跳洗版，人工照回歸清單逐項比對時根本看不到其他訊息。
+  // 因此只降低「印出」頻率：平常每 HEARTBEAT_LOG_EVERY 次印一行；
+  // 但 channel／配對模式／slave 台數任一項與上次印出時不同就立即印，狀態變化不會被吃掉。
+  static int hbLogCounter = 0;
+  static uint8_t lastLoggedChannel = 0xFF;   // 0xFF 為不可能值，確保開機第一次必定印
+  static uint8_t lastLoggedPairing = 0xFF;
+  static uint8_t lastLoggedSlaveCount = 0xFF;
+
+  hbLogCounter++;
+  bool changed = (hb.channel != lastLoggedChannel) ||
+                 (hb.pairingMode != lastLoggedPairing) ||
+                 (hb.slaveCount != lastLoggedSlaveCount);
+
+  if (changed || hbLogCounter >= HEARTBEAT_LOG_EVERY) {
+    hbLogCounter = 0;
+    lastLoggedChannel = hb.channel;
+    lastLoggedPairing = hb.pairingMode;
+    lastLoggedSlaveCount = hb.slaveCount;
+    Serial.printf("[心跳] channel=%u 配對模式=%s slave=%u\n",
+                  hb.channel, hb.pairingMode ? "是" : "否", hb.slaveCount);
+  }
 }
 
 // channel 改變的當下連發數次心跳（設計規格要求）。
 // 換 channel 後 slave 還停在舊 channel，得等 30 秒失聯門檻才開始輪掃；
 // 連發能讓「剛好已在輪掃、正巧停在新 channel」的 slave 立刻命中，不必再等下一輪。
 void sendHeartbeatBurst() {
+  // 心跳 log 已降頻，連發的 4 次裡只有第一次（channel 剛變）會印，
+  // 這裡另外印一行讓「連發確實有發生」在序列埠上仍然可驗證
+  Serial.printf("[心跳] channel 已變更，連發 %d 次（間隔 %d ms）\n",
+                HEARTBEAT_BURST_COUNT, HEARTBEAT_BURST_GAP);
   for (int i = 0; i < HEARTBEAT_BURST_COUNT; i++) {
     sendHeartbeat();
     if (i < HEARTBEAT_BURST_COUNT - 1) delay(HEARTBEAT_BURST_GAP);

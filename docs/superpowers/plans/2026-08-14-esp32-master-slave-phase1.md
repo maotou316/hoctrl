@@ -515,6 +515,11 @@ if ($Reset) {
     }
 }
 
+# 已知限制（補修）：上述自動下載電路存在於「有 USB-serial 橋接晶片」的板子
+#（CP2102／CH340，例如 master 的 ESP32 WROOM DevKit）。
+# 若板子走 ESP32-C3 原生 USB CDC（FQBN 帶 CDCOnBoot=cdc，例如 hoSlave1），
+# RTS／DTR 並沒有接到 EN／GPIO 9，-Reset 可能仍然無效，此時請手動按 EN 鍵重啟。
+
 Write-Host "監聽 $Port，共 $Seconds 秒…" -ForegroundColor Cyan
 
 $proc = Start-Process -FilePath $cli `
@@ -811,7 +816,40 @@ void sendHeartbeat() {
   Serial.printf("[心跳] channel=%u 配對模式=%s slave=%u\n",
                 hb.channel, hb.pairingMode ? "是" : "否", hb.slaveCount);
 }
+```
 
+> **補修（最終審查回饋 b）：心跳 log 降頻**
+> 心跳**發送**頻率必須維持 1 秒（最終審查修正 3 的核心，保證 slave 掃描一輪必定命中），
+> 但每秒印一行會把序列埠洗版，人工照回歸清單逐項比對時看不到其他訊息。
+> 因此上面的 `Serial.printf` 改為受 `HEARTBEAT_LOG_EVERY`（= 10）控制：
+> 平常每 10 次印一行，channel／配對模式／slave 台數任一項與上次印出時不同就立即印。
+>
+> ```cpp
+> static int hbLogCounter = 0;
+> static uint8_t lastLoggedChannel = 0xFF;   // 0xFF 為不可能值，確保開機第一次必定印
+> static uint8_t lastLoggedPairing = 0xFF;
+> static uint8_t lastLoggedSlaveCount = 0xFF;
+>
+> hbLogCounter++;
+> bool changed = (hb.channel != lastLoggedChannel) ||
+>                (hb.pairingMode != lastLoggedPairing) ||
+>                (hb.slaveCount != lastLoggedSlaveCount);
+>
+> if (changed || hbLogCounter >= HEARTBEAT_LOG_EVERY) {
+>   hbLogCounter = 0;
+>   lastLoggedChannel = hb.channel;
+>   lastLoggedPairing = hb.pairingMode;
+>   lastLoggedSlaveCount = hb.slaveCount;
+>   Serial.printf("[心跳] channel=%u 配對模式=%s slave=%u\n",
+>                 hb.channel, hb.pairingMode ? "是" : "否", hb.slaveCount);
+> }
+> ```
+>
+> slave 端收到心跳的 log 同樣降頻（改以 master MAC／channel／配對模式判斷是否變化）。
+> `sendHeartbeatBurst()` 另外印一行「channel 已變更，連發 N 次」，
+> 讓連發在 log 降頻後仍然可驗證。
+
+```cpp
 // ── ESP-NOW 初始化 ──
 void setupEspNow() {
   WiFi.mode(WIFI_STA);
@@ -891,8 +929,11 @@ Run：
 ```
 
 Expected：開機訊息出現設備 ID 與 `ESP-NOW 就緒，channel=1`，
-之後每 1 秒一行 `[心跳] channel=1 配對模式=否 slave=0`，15 秒內至少 10 行。
-（最終審查修正 3：心跳由 5 秒改為 1 秒。）
+之後約每 10 秒一行 `[心跳] channel=1 配對模式=否 slave=0`，15 秒內至少 2 行
+（開機第一次必定印，之後每 10 秒一行）。
+（最終審查修正 3：心跳**發送**由 5 秒改為 1 秒；
+補修：心跳**印出**降頻為每 10 次一行 `HEARTBEAT_LOG_EVERY`，避免每秒一行洗版妨礙人工驗證。
+狀態有變化時仍會立即印。）
 
 **若出現 `[ESP-NOW] 送出失敗`**：檢查廣播 peer 有沒有加成功。
 廣播封包不會有 ACK，正常情況下 `status` 一律回 `ESP_NOW_SEND_SUCCESS`。
@@ -904,7 +945,8 @@ git add ho_master1/
 git commit -m "新增 Master 韌體骨架與 ESP-NOW 心跳廣播
 
 - ESP-NOW 初始化、廣播 peer 註冊、收送 callback
-- 每 1 秒廣播一次心跳，帶出目前 channel 與配對模式狀態（最終審查修正 3 前為 5 秒）
+- 每 1 秒廣播一次心跳，帶出目前 channel 與配對模式狀態（最終審查修正 3 前為 5 秒）；
+  序列埠每 10 次才印一行（補修：心跳 log 降頻），狀態變化時立即印
 - 沿用 ho_relay1 的 WROOM GPIO 定義，保留繼電器驅動（硬體可接可不接）
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
@@ -1082,16 +1124,27 @@ void onMasterFound(const uint8_t mac[6], uint8_t channel) {
   bool isNewMaster = !masterKnown || memcmp(masterMac, mac, 6) != 0;
   bool channelChanged = (lockedChannel != channel);
 
+  // 補修（心跳 log 降頻的連帶修正）：先記下這次是不是「從輪掃中恢復」。
+  // master 只是重開機、channel 沒變時，isNewMaster 與 channelChanged 都是 false，
+  // 心跳 log 又已降頻，序列埠會有最多 10 秒完全沒有輸出，
+  // 回歸測試清單第 10 項（master 斷電復電後 slave 自動找回）就無從判定成功。
+  bool wasScanning = scanning;
+
   memcpy(masterMac, mac, 6);
   lockedChannel = channel;
   scanning = false;
   lastHeartbeatTime = millis();
 
-  if (isNewMaster || channelChanged) {
+  if (isNewMaster || channelChanged || wasScanning) {
     char id[20];
     hoFormatDeviceId(mac, id);
     Serial.printf("[鎖定] master=%s channel=%u\n", id, channel);
-    if (masterKnown) savePairing();  // 只有已配對過才更新 EEPROM
+  }
+
+  // EEPROM 只在真的換了 master 或 channel 時才寫，
+  // 單純的掃描恢復不必多寫一次（減少 EEPROM 寫入次數）
+  if ((isNewMaster || channelChanged) && masterKnown) {
+    savePairing();
   }
 }
 
@@ -1250,7 +1303,7 @@ Expected：slave 輪掃到 master 所在的 channel 時收到心跳，輸出：
 [心跳] 來自 hoban-<masterMac> channel=1 配對模式=否 rssi=-42
 [鎖定] master=hoban-<masterMac> channel=1
 ```
-之後每 1 秒一行心跳，不再出現 `[channel] 切換到`。
+之後約每 10 秒一行心跳（心跳 log 已降頻），不再出現 `[channel] 切換到`。
 
 **若一直掃不到**：確認兩片板子的 `HO_ESPNOW_SHARED_KEY` 一致（都來自同一份 library），
 以及 master 確實在發心跳（另開一個視窗看 master 的序列埠）。
@@ -2613,7 +2666,8 @@ BOOT 9、RESET 1、板載 LED 3、面板 LED 0、繼電器 4 與 7（兩支同�
 Slave 不連 WiFi，無從得知 master 在哪個 channel，靠三層機制解決：
 
 1. 配對時把 master 的 channel 存進 EEPROM，開機直接切過去
-2. Master 每 1 秒廣播心跳，帶出目前 channel；channel 改變當下另外連發 4 次（間隔 200ms）
+2. Master 每 1 秒廣播心跳，帶出目前 channel；channel 改變當下另外連發 4 次（間隔 200ms）。
+   序列埠上的心跳每 10 次才印一行（補修：log 降頻），狀態變化時立即印
 3. 超過 30 秒沒收到心跳，輪掃 channel 1~13（每個停 1200ms，一輪 15.6 秒）
 
 dwell（1200ms）必須大於心跳間隔（1000ms），一輪之內才保證命中。
@@ -2696,7 +2750,7 @@ CRC 混入共享密鑰過濾誤觸發，不使用 ESP-NOW 原生加密（原生�
 
 接著人工驗證這份清單，每項打勾：
 
-- [ ] Master 開機每 1 秒發一次心跳
+- [ ] Master 每 1 秒發一次心跳，序列埠每 10 次印一行
 - [ ] Slave 首次開機進入輪掃，找到 master 後鎖定
 - [ ] 短按 master → 短按 slave → 配對成功，slave LED 快閃 3 下
 - [ ] 兩邊斷電再上電，配對記錄都還在，slave 不需重新掃描

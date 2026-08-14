@@ -72,6 +72,11 @@ unsigned long scanChannelStart = 0;
 const unsigned long SCAN_DWELL_MS = 1200;
 const unsigned long HEARTBEAT_TIMEOUT = 30000; // 超過這麼久沒心跳就重掃
 
+// 收到心跳「印出序列埠」的降頻倍數（收訊與鎖定邏輯不受影響）。
+// master 每 1 秒發一次，每 10 次印一行 ≈ 每 10 秒一行；
+// master MAC／channel／配對模式有變化時仍會立即印，詳見 onEspNowRecv()
+const int HEARTBEAT_LOG_EVERY = 10;
+
 const uint8_t BROADCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 // ── 繼電器（鐵則：initRelayPins() 必須是 setup() 第一行）──
@@ -255,6 +260,7 @@ void startChannelScan() {
 void onMasterFound(const uint8_t mac[6], uint8_t channel) {
   bool isNewMaster = !masterKnown || memcmp(masterMac, mac, 6) != 0;
   bool channelChanged = (lockedChannel != channel);
+  bool wasScanning = scanning;   // 這次是「從輪掃中恢復」
 
   memcpy(masterMac, mac, 6);
 
@@ -271,11 +277,19 @@ void onMasterFound(const uint8_t mac[6], uint8_t channel) {
   scanning = false;
   lastHeartbeatTime = millis();
 
-  if (isNewMaster || channelChanged) {
+  // 「從輪掃中恢復」也要印 [鎖定]：master 只是重開機、channel 沒變時，
+  // isNewMaster 與 channelChanged 都是 false，加上心跳 log 已降頻，
+  // 序列埠上會完全看不出恢復發生過，回歸清單第 10 項就無從判定成功
+  if (isNewMaster || channelChanged || wasScanning) {
     char id[20];
     hoFormatDeviceId(mac, id);
     Serial.printf("[鎖定] master=%s channel=%u\n", id, channel);
-    if (masterKnown) savePairing();  // 只有已配對過才更新 EEPROM
+  }
+
+  // EEPROM 只在真的換了 master 或 channel 時才寫，
+  // 單純的掃描恢復不必多寫一次（減少 EEPROM 寫入次數）
+  if ((isNewMaster || channelChanged) && masterKnown) {
+    savePairing();
   }
 }
 
@@ -383,10 +397,32 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
       return;
     }
 
-    char id[20];
-    hoFormatDeviceId(info->src_addr, id);
-    Serial.printf("[心跳] 來自 %s channel=%u 配對模式=%s rssi=%d\n",
-                  id, hb.channel, hb.pairingMode ? "是" : "否", info->rx_ctrl->rssi);
+    // ── 心跳 log 降頻 ──
+    // master 每 1 秒廣播一次心跳，若每次都印，序列埠會被洗版、
+    // 人工照回歸清單逐項比對時看不到其他訊息。
+    // 只降低印出頻率，收訊與鎖定邏輯完全不受影響（[鎖定] 那行仍照舊印）；
+    // master MAC／channel／配對模式任一項與上次印出時不同就立即印，狀態變化不會被吃掉。
+    static int hbLogCounter = 0;
+    static uint8_t lastLoggedMac[6] = { 0 };
+    static uint8_t lastLoggedChannel = 0xFF;   // 0xFF 為不可能值，確保第一次必定印
+    static uint8_t lastLoggedPairing = 0xFF;
+
+    hbLogCounter++;
+    bool logChanged = (memcmp(lastLoggedMac, info->src_addr, 6) != 0) ||
+                      (hb.channel != lastLoggedChannel) ||
+                      (hb.pairingMode != lastLoggedPairing);
+
+    if (logChanged || hbLogCounter >= HEARTBEAT_LOG_EVERY) {
+      hbLogCounter = 0;
+      memcpy(lastLoggedMac, info->src_addr, 6);
+      lastLoggedChannel = hb.channel;
+      lastLoggedPairing = hb.pairingMode;
+
+      char id[20];
+      hoFormatDeviceId(info->src_addr, id);
+      Serial.printf("[心跳] 來自 %s channel=%u 配對模式=%s rssi=%d\n",
+                    id, hb.channel, hb.pairingMode ? "是" : "否", info->rx_ctrl->rssi);
+    }
 
     masterInPairingMode = (hb.pairingMode == 1);
     onMasterFound(info->src_addr, hb.channel);

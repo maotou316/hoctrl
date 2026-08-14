@@ -34,6 +34,11 @@ Phase 2 會接上 WiFi + MQTT，成為 App 與所有 slave 之間的唯一對外
 心跳固定每 1 秒廣播一次（不分是否在配對模式）。這個值與 slave 每個 channel 停留
 1200ms 是一組的：dwell 大於心跳間隔，slave 輪掃時一輪內必定命中正確 channel。
 
+**序列埠上的心跳只有每 10 次印一行**（`HEARTBEAT_LOG_EVERY`），約 10 秒一行 ——
+發送頻率不受影響，純粹是避免每秒一行把序列埠洗版、蓋掉其他訊息。
+channel／配對模式／slave 台數任一項變化時會立即印一行，狀態變化不會被吃掉。
+`ch <n>` 切換 channel 時另外印一行 `[心跳] channel 已變更，連發 4 次（間隔 200 ms）`。
+
 名冊存在 NVS（`Preferences`，命名空間 `homaster`），斷電不遺失。
 開機時 `setup()` 會在 `setupEspNow()` 之後呼叫 `registerAllPeers()`，
 把名冊上每一台重新註冊成 ESP-NOW peer —— ESP-NOW 的 peer 表只存在 RAM，

@@ -29,13 +29,20 @@
 
 ## 人工驗證清單（14 項）
 
-### 1. Master 開機每 1 秒發一次心跳
+### 1. Master 每 1 秒發一次心跳，序列埠每 10 次印一行
 
 - 操作：master 開機後不做任何事，觀察 master 序列埠。
-- 預期：每隔約 1 秒印一行（`HEARTBEAT_INTERVAL` = 1000ms，配對模式與否都一樣）
+- 預期：開機後**立即**印一行，之後每隔約 **10 秒**印一行
   ```
   [心跳] channel=<目前 channel> 配對模式=否 slave=<目前台數>
   ```
+- 說明：**發送**頻率是每 1 秒（`HEARTBEAT_INTERVAL` = 1000ms，配對模式與否都一樣），
+  這是 slave 輪掃一輪必定命中的前提，不可更動；
+  **印出**頻率則刻意降到每 10 次一行（`HEARTBEAT_LOG_EVERY`），
+  否則每秒一行會把序列埠洗版，下面十幾項都沒辦法比對。
+  channel／配對模式／slave 台數任一項變化時會立即印一行，不必等滿 10 次。
+- 若要確認「確實每秒都有發」而非每 10 秒才發一次：執行第 11 項的 `ch <n>`，
+  slave 端最壞 46 秒內會重新鎖定；若心跳真的只有 10 秒一次，該項必然失敗。
 - [ ] 通過
 
 ### 2. Slave 首次開機進入輪掃，找到 master 後鎖定
@@ -53,6 +60,9 @@
   [心跳] 來自 hoban-xxxxxxxxxxxx channel=<N> 配對模式=否 rssi=<負數>
   [鎖定] master=hoban-xxxxxxxxxxxx channel=<N>
   ```
+- 說明：slave 端的心跳 log 同樣降頻到每 10 次一行（`HEARTBEAT_LOG_EVERY`），
+  但**第一次**收到、以及 master MAC／channel／配對模式有變化時都會立即印，
+  所以上面兩行一定看得到；之後穩定運行時約每 10 秒才會再出現一行 `[心跳] 來自 …`。
 - [ ] 通過
 
 ### 3. 短按 master → 短按 slave → 配對成功，slave LED 快閃 3 下
@@ -70,7 +80,10 @@
 
 - 操作：master、slave 都拔電重插（master 名冊存 NVS、slave 存 EEPROM，兩者都不會因斷電遺失）。
 - 預期：slave 開機印 `已配對 master: hoban-xxxxxxxxxxxx，上次 channel=<N>`，
-  接著直接鎖定該 channel（不會印「開始輪掃」），很快收到心跳並印 `[鎖定]`；
+  接著直接鎖定該 channel（不會印「開始輪掃」），很快印出
+  `[心跳] 來自 hoban-xxxxxxxxxxxx channel=<N> …`（開機後第一次收到必定印，不受降頻影響）。
+  注意此時**不會**印 `[鎖定]` —— master 與 channel 都沒變、也沒經過輪掃，屬正常；
+  `[鎖定]` 只在「換 master／換 channel／從輪掃中恢復」三種情況才印。
   master 開機後應印 `[名冊] 已重新註冊 <N>／<N> 台為 ESP-NOW peer`，
   `list` 應直接看到剛才配對的 slave，且**重開機後 `on 0` / `off 0` / `pulse 0` 仍能正常控制**
   （ESP-NOW peer 表只存在 RAM，若沒有重新註冊，指令會全部失敗且永不自我修復）。
@@ -82,8 +95,10 @@
 - 預期：
   ```
   ── Slave 名冊（1／20）──
-    1. hoban-xxxxxxxxxxxx  online  rssi=<負數>
+    0. hoban-xxxxxxxxxxxx  在線  rssi=<負數>
   ```
+- 注意：編號從 **0** 開始（`printSlaveList()` 的 `i` 由 0 起算），
+  所以第一台要用 `on 0` / `off 0` / `pulse 0` 控制，不是 `on 1`。
 - [ ] 通過
 
 ### 6. `pulse 0` 讓 slave 繼電器動作 2 秒後自動關閉
@@ -127,15 +142,26 @@
 - 預期：slave 印 `[失聯] 超過 30 秒沒收到心跳`，接著印 `[安全] 失去 master，繼電器已關閉`
   （若當時繼電器是通電狀態）與 `[掃描] 開始輪掃 channel 1~13 尋找 master`；
   master 復電後 slave 應在**一輪掃描內（最多約 15.6 秒＝13 × `SCAN_DWELL_MS` 1200ms）**
-  收到心跳並印 `[鎖定]`。因 dwell（1200ms）大於心跳間隔（1000ms），
-  掃到正確 channel 時必定涵蓋至少一次心跳，一輪內保證命中。
+  收到心跳並印 `[鎖定] master=hoban-xxxxxxxxxxxx channel=<N>`。
+  因 dwell（1200ms）大於心跳間隔（1000ms），掃到正確 channel 時必定涵蓋至少一次心跳，
+  一輪內保證命中。
+- 說明：master 只是重開機、channel 沒變時，`isNewMaster` 與 `channelChanged` 都是 false，
+  而心跳 log 已降頻，本項若只看 `[心跳]` 會有最多 10 秒看不到任何輸出。
+  因此 `onMasterFound()` 已改成「從輪掃中恢復」也印 `[鎖定]`，本項一律以這行為判定依據。
 - [ ] 通過
 
 ### 11. `ch 6` 切換 channel 後，slave 最壞約 46 秒內重新鎖定到 channel 6
 
 - 操作：master 輸入 `ch 6`。
-- 預期：master 印 `[channel] master 切換到 6`，並**連續印 4 行 `[心跳] channel=6 …`**
-  （間隔 200ms，`sendHeartbeatBurst()`）；slave 因超過 30 秒沒收到心跳（頻道已變）
+- 預期：master 依序印
+  ```
+  [channel] master 切換到 6
+  [心跳] channel 已變更，連發 4 次（間隔 200 ms）
+  [心跳] channel=6 配對模式=否 slave=<台數>
+  ```
+  （連發 4 次心跳，但 log 已降頻，只有 channel 剛變的第一次會印出 `[心跳] channel=6`；
+  `sendHeartbeatBurst()` 另外印的那行讓「連發確實發生」仍可驗證）；
+  slave 因超過 30 秒沒收到心跳（頻道已變）
   進入輪掃，印 `[失聯]` 與 `[掃描]`，掃到 channel 6 時收到心跳並印
   `[鎖定] master=hoban-xxxxxxxxxxxx channel=6`。
   整體時間 = 30 秒失聯門檻 + 最多一輪掃描 15.6 秒，**最壞約 46 秒、典型約 38 秒**
@@ -158,7 +184,8 @@
 
 - 操作：按住按鈕約 4 秒（已進入閃爍階段但未滿 5 秒）後放開。
 - 預期：序列埠印 `按鈕放開，取消重置`；配對記錄不受影響，
-  重新查詢（例如觀察下一次心跳鎖定）仍是原本配對的 master。
+  且**不會**出現 `[配對] 已通知 master 解除配對`（沒走到 `clearPairing()`）；
+  等下一行 `[心跳] 來自 …`（約 10 秒內）仍是原本配對的 master。
 - [ ] 通過
 
 ### 14. `unpair 0` 後 slave 重啟並回到未配對狀態，master 名冊剩 0 台

@@ -28,6 +28,13 @@ if ($Reset) {
     # 而 DTR 必須全程維持 false，否則會把 GPIO 9 拉低：板子會改進 UART 下載模式，
     # 且與「按鈕腳位卡在 LOW」的症狀無法區分（見 .claude/rules/button-pin-stuck-low.md）。
     # 舊版只開關一次序列埠、完全沒碰 RTS，實際上是 no-op，抓不到開機輸出。
+    #
+    # 已知限制：上述自動下載電路存在於「有 USB-serial 橋接晶片」的板子
+    #（CP2102／CH340，例如 master 的 ESP32 WROOM DevKit）。
+    # 若板子走 ESP32-C3 原生 USB CDC（FQBN 帶 CDCOnBoot=cdc，例如 hoSlave1），
+    # RTS／DTR 並沒有接到 EN／GPIO 9，這個 -Reset 可能仍然無效 ——
+    # 此時序列埠不會出現 setup() 的開機訊息，請手動按板子上的 EN 鍵重啟，
+    # 這不是操作錯誤。（尚未在實體板子上確認過屬於哪一種。）
     try {
         $sp = New-Object System.IO.Ports.SerialPort $Port, 115200
         $sp.Open()
