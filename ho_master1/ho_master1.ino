@@ -707,6 +707,28 @@ void sendHeartbeat() {
   }
 }
 
+// ── ESP-NOW 維持機制 ──
+// Phase 2a 引入 WiFi/MQTT 後，連線流程有大量阻塞等待。
+// slave 的失聯門檻是 30 秒，超過就會判定失聯、開始輪掃、並強制關閉繼電器。
+// 所以所有等待都必須走這裡，讓心跳在阻塞期間照常發出。
+void maintainEspNow() {
+  static unsigned long lastBeat = 0;
+  unsigned long now = millis();
+  if (now - lastBeat >= HEARTBEAT_INTERVAL) {
+    lastBeat = now;
+    sendHeartbeat();
+  }
+}
+
+// 取代 delay()：等待期間維持心跳，並保留按鈕重置的可用性
+void espNowDelay(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    maintainEspNow();
+    delay(10);
+  }
+}
+
 // channel 改變的當下連發數次心跳（設計規格要求）。
 // 換 channel 後 slave 還停在舊 channel，得等 30 秒失聯門檻才開始輪掃；
 // 連發能讓「剛好已在輪掃、正巧停在新 channel」的 slave 立刻命中，不必再等下一輪。
@@ -781,7 +803,6 @@ void setup() {
 }
 
 void loop() {
-  static unsigned long lastHeartbeat = 0;
   unsigned long now = millis();
 
   // ── 短按 BOOT 進入配對模式 ──
@@ -813,11 +834,9 @@ void loop() {
     setLeds(((now / 500) % 2) ? true : false);
   }
 
-  // 心跳固定 1 秒一次（HEARTBEAT_INTERVAL），配對模式不再另開一組等值計時器
-  if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
-    lastHeartbeat = now;
-    sendHeartbeat();
-  }
+  // 心跳固定 1 秒一次（HEARTBEAT_INTERVAL），計時併入 maintainEspNow()，
+  // 避免與 Phase 2a 阻塞流程內的維持機制形成兩套計時器、重複發送
+  maintainEspNow();
 
   // ── 分散式輪詢 slave 狀態，每次 loop() 最多問一台（見 pollNextSlave()）──
   pollNextSlave();
