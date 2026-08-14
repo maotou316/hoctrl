@@ -257,6 +257,11 @@ EOF
   - `void onWiFiEvent(WiFiEvent_t, WiFiEventInfo_t)`
   - 全域：`volatile uint8_t lastWifiDisconnectReason`、`unsigned long wifiConnectedTime`
 
+> **2026-08-15 review 修正**：以下 Step 1/2/4 的程式碼區塊已更新為 review 後的最終版本
+> （原始 brief 版本有 2 個 Critical + 1 個 Important + 1 個 Minor 問題，詳見本節末尾
+> 「Review 修正紀錄」）。Step 3（`onWifiChannelMayHaveChanged()`）與 Step 5
+> （`setup()` 接上 WiFi）的程式碼未受影響，維持原樣。
+
 - [ ] **Step 1: 加入全域與事件回調**
 
 ```cpp
@@ -265,6 +270,15 @@ volatile uint8_t lastWifiDisconnectReason = 0;
 unsigned long wifiConnectedTime = 0;
 uint8_t lastKnownChannel = 0;     // 用於偵測 channel 變化
 
+// 記住上次成功關聯的 AP channel／BSSID，重連時可直接指定、跳過 WiFi.begin() 內建的
+// 全頻道掃描（review 發現：即使不呼叫 WiFi.scanNetworks()，WiFi.begin(ssid, password)
+// 不帶 channel/BSSID 時，ESP-IDF 底層關聯流程仍會自己全頻道掃一輪，約 1.5 秒，
+// 且 setAutoReconnect(true) 失敗後會立刻再掃，對 ESP-NOW 心跳命中率殺傷力等同
+// 顯式呼叫 scanNetworks()）。只存 RAM 不寫 NVS：開機第一次本來就要掃，沒有歷史資料可用。
+uint8_t lastApChannel = 0;
+uint8_t lastApBssid[6] = { 0 };
+bool haveLastApBssid = false;
+
 // WiFi 事件回調：取得底層斷線原因碼，並在取得 IP 時通知 slave 新 channel
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
@@ -272,6 +286,10 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     Serial.printf("[WiFi] 斷線原因碼: %d\n", lastWifiDisconnectReason);
     // 常見：2=AUTH_EXPIRE 15=4WAY_HANDSHAKE_TIMEOUT 201=NO_AP_FOUND 202=AUTH_FAIL
   } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    // 設在事件回調而非 connectToWiFi() 的成功分支（review 修正 Important）：
+    // setAutoReconnect(true) 背景重連成功時不會經過 connectToWiFi()，若只在那裡設值，
+    // 背景重連後 wifiConnectedTime 會停留在舊值，Task 4~7 拿它算連線時長會讀到錯值。
+    wifiConnectedTime = millis();
     Serial.printf("[WiFi] 取得 IP: %s\n", WiFi.localIP().toString().c_str());
   }
 }
@@ -287,7 +305,11 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 
 ```cpp
 // ESP-NOW 友善的 WiFi 連線
-// 與 ho_relay2 的差異見上方註釋。最壞阻塞約 30 秒，期間心跳照常發出。
+// 與 ho_relay2 的差異：不掃描頻道、不關閉 WiFi 驅動、等待迴圈走 maintainEspNow()。
+// 最壞阻塞約 15 秒，期間心跳照常發出（review 修正：maxWaitMs 由 30000 降到 15000）。
+//
+// 已知限制（裁決不補）：不像 ho_relay2 那樣針對不同 auth mode 重試多種連線方式，
+// 遇到需要特殊退避流程的路由器可能連不上，詳見 ho_master1/readme.md「已知限制」章節。
 void connectToWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
   if (!hasWifiConfig()) return;
@@ -295,14 +317,26 @@ void connectToWiFi() {
   Serial.printf("[WiFi] 連線到 %s …\n", ssid);
   lastWifiDisconnectReason = 0;
 
-  // 只斷開連線，不關閉 WiFi 驅動（ESP-NOW 要靠它活著）
+  // WiFi.disconnect(wifioff=false, eraseap=false)：第一個參數是 wifioff，不是「是否抹除
+  // 設定」。傳 false 代表只斷開目前的 AP 連線、WiFi 驅動繼續存活，這正是 ESP-NOW 需要的；
+  // ho_relay2 用的 disconnect(true) 其實是把 wifioff 設成 true、等同關閉 WiFi 驅動，
+  // 跟它自己註釋寫的「抹除設定」是兩回事（ho_relay2 那處註釋本身寫錯）。
   WiFi.disconnect(false);
   espNowDelay(100);
 
-  WiFi.begin(ssid, password);
+  // WiFi.begin(ssid, password) 不指定 channel/BSSID 時，ESP-IDF 底層關聯流程仍會自己
+  // 全頻道掃描一輪（約 1.5 秒），這正是我們想擋掉的行為，只是被包在 begin() 裡面
+  // （review 修正 Critical）。若有上次成功關聯的紀錄，直接帶 channel/BSSID 跳過掃描；
+  // 沒有（開機後第一次）才退回不帶參數的一般連線。
+  if (haveLastApBssid) {
+    Serial.printf("[WiFi] 使用已知 channel=%u 的 BSSID 直接關聯，跳過掃描\n", lastApChannel);
+    WiFi.begin(ssid, password, lastApChannel, lastApBssid);
+  } else {
+    WiFi.begin(ssid, password);
+  }
 
-  // 等待最多 30 秒，期間持續發心跳
-  const int maxWaitMs = 30000;
+  // 等待最多 15 秒，期間持續發心跳
+  const int maxWaitMs = 15000;
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < maxWaitMs) {
     maintainEspNow();
@@ -317,13 +351,22 @@ void connectToWiFi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    wifiConnectedTime = millis();
+    // wifiConnectedTime 改在 onWiFiEvent() 的 GOT_IP 分支設定，這裡不重複設
     Serial.printf("[WiFi] 已連線 IP=%s RSSI=%d\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    lastApChannel = WiFi.channel();
+    memcpy(lastApBssid, WiFi.BSSID(), 6);
+    haveLastApBssid = true;
     onWifiChannelMayHaveChanged();
   } else {
     Serial.printf("[WiFi] 連線失敗，狀態=%d 原因碼=%d\n",
                   WiFi.status(), lastWifiDisconnectReason);
+    // 帶 channel/BSSID 關聯失敗：AP 可能換了 BSSID 或已關機重啟，清掉記錄，
+    // 讓下一次重試（loop() 的重連邏輯會再呼叫這裡）退回不帶參數的一般連線
+    if (haveLastApBssid) {
+      Serial.println("[WiFi] 已知 channel/BSSID 連線失敗，清除記錄，下次改用一般連線");
+      haveLastApBssid = false;
+    }
   }
 }
 ```
@@ -366,11 +409,12 @@ void onWifiChannelMayHaveChanged() {
   static unsigned long wifiPauseUntil = 0;   // 取代 ho_relay2 會 unsigned 下溢的寫法
 
   if (hasWifiConfig() && now - lastWiFiCheck > 5000) {
-    lastWiFiCheck = now;
-
     if (WiFi.status() != WL_CONNECTED) {
-      if (wifiPauseUntil != 0 && now < wifiPauseUntil) {
-        // 連續失敗過多，暫停重試中
+      // wrap-safe 寫法（review 修正 Minor）：(long)(now - wifiPauseUntil) < 0
+      // 等同「now 還沒到 wifiPauseUntil」，millis() 溢位時仍成立；
+      // 原本的 `now < wifiPauseUntil` 在溢位當下不 wrap-safe。
+      if (wifiPauseUntil != 0 && (long)(now - wifiPauseUntil) < 0) {
+        // 連續失敗過多，暫停重試中：不更新 lastWiFiCheck，暫停一過期下次檢查立即生效
       } else {
         wifiPauseUntil = 0;
         wifiFailCount++;
@@ -386,20 +430,53 @@ void onWifiChannelMayHaveChanged() {
           connectToWiFi();
         }
 
+        // review 修正 Critical：connectToWiFi() 最壞阻塞 15 秒，若沿用進入本區塊前的
+        // now 記錄 lastWiFiCheck，下一輪 loop() 的 now 已經超前 15 秒以上，
+        // (now - lastWiFiCheck > 5000) 立刻成立，15 秒的嘗試會背靠背重試。
+        // 必須在阻塞呼叫「之後」用新的 millis() 記錄。
+        lastWiFiCheck = millis();
+
         if (WiFi.status() == WL_CONNECTED) {
           wifiFailCount = 0;
         } else if (wifiFailCount > 10) {
           wifiFailCount = 0;
-          wifiPauseUntil = now + 60000;   // 暫停 60 秒再試
+          wifiPauseUntil = lastWiFiCheck + 60000;   // 暫停 60 秒再試
           Serial.println("[WiFi] 連續失敗過多，暫停 60 秒");
         }
       }
     } else {
+      lastWiFiCheck = now;
       wifiFailCount = 0;
       onWifiChannelMayHaveChanged();   // AP 可能不斷線就換頻
     }
   }
 ```
+
+**另一處 review 修正 Critical（與本區塊相鄰、需一併理解）**：`loop()` 原本在這個
+WiFi 區塊之後才做點動（`pulseActive`）結束檢查，但 `connectToWiFi()` 最壞阻塞 15 秒，
+期間這段檢查完全不會跑，等於點動會被拖長到「阻塞時間＋原訂點動秒數」（`allpulse` 2 秒
+可能被拖到 15~30 秒）。修法是把點動結束檢查搬進 Task 2 的 `maintainEspNow()`
+（所有阻塞等待都會呼叫到的地方），`loop()` 原本那段檢查移除：
+
+```cpp
+void maintainEspNow() {
+  static unsigned long lastBeat = 0;
+  unsigned long now = millis();
+  if (now - lastBeat >= HEARTBEAT_INTERVAL) {
+    lastBeat = now;
+    sendHeartbeat();
+  }
+
+  // 點動結束檢查併入這裡，確保無論卡在哪個阻塞點，繼電器都能準時關閉
+  if (pulseActive && (now - pulseStartTime) >= pulseDuration) {
+    pulseActive = false;
+    setRelayPins(false);
+  }
+}
+```
+
+這處修改實際落在 Task 2 產出的 `maintainEspNow()` 內，但問題是本 Task（WiFi 連線引入
+長阻塞）才觸發的，記在此處而非回改 Task 2 的區塊。
 
 - [ ] **Step 5: setup() 接上 WiFi**
 
@@ -417,6 +494,31 @@ void onWifiChannelMayHaveChanged() {
 
 **順序很重要**：ESP-NOW 必須先 init，WiFi 才連線。反過來會讓 `esp_now_init()` 在
 STA 已連線的狀態下執行，peer 的 channel 跟隨行為可能不如預期。
+
+### Review 修正紀錄（2026-08-15）
+
+最強模型 review 原始實作後抓到 2 個 Critical + 1 個 Important + 1 個 Minor：
+
+1. **Critical－點動被拖長到 60 秒**：`loop()` 把點動結束檢查排在 WiFi 管理區塊之後，
+   而 `connectToWiFi()` 最壞阻塞（原 30 秒），阻塞期間該檢查完全不會跑。
+   修法：檢查併入 `maintainEspNow()`（見上方 Step 4 附帶的修正），
+   所有阻塞等待都會呼叫到，繼電器準時關閉。
+2. **Critical－`WiFi.begin()` 內建掃描 + `lastWiFiCheck` 時序錯誤**：即使不呼叫
+   `WiFi.scanNetworks()`，`WiFi.begin(ssid, password)` 不帶 channel/BSSID 時 ESP-IDF
+   底層仍會全頻道掃描一輪；且 `lastWiFiCheck = now;` 原本設在阻塞呼叫之前，
+   下一輪 `loop()` 的 `now` 已超前，「每 5 秒檢查」在失敗情境下形同虛設、變成背靠背重試。
+   三處修法：(a) `lastWiFiCheck` 改在 `connectToWiFi()` 之後用新 `millis()` 記錄；
+   (b) 記住上次成功關聯的 channel/BSSID，重連時直接指定跳過掃描，關聯失敗就清除記錄
+   退回一般連線；(c) `maxWaitMs` 由 30000 降到 15000。
+3. **Important－`wifiConnectedTime` 在背景重連時不會更新**：`setAutoReconnect(true)`
+   背景重連成功不經過 `connectToWiFi()`。修法：改在 `onWiFiEvent()` 的
+   `ARDUINO_EVENT_WIFI_STA_GOT_IP` 分支設定。
+4. **Minor－`wifiPauseUntil` 的 millis 溢位**：`now < wifiPauseUntil` 不是 wrap-safe。
+   修法：改成 `(long)(now - wifiPauseUntil) < 0`。
+
+**裁決不修**：reviewer 另外提到拿掉 `ho_relay2` 的 5 段 auth mode 退避會讓需要特殊
+退避流程的路由器連不上。這輪不補——補回退避會讓阻塞時間再拉長數倍，與這輪壓縮阻塞
+時間的方向直接衝突。已記錄在 `ho_master1/readme.md`「已知限制」章節。
 
 - [ ] **Step 6: 編譯驗證**
 

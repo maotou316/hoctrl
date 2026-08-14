@@ -73,6 +73,27 @@ channel／配對模式／slave 台數任一項變化時會立即印一行，狀�
 兩者共用同一套自檢／判斷函式，行為由 GPIO 陣列決定，不需要另外分支。
 詳見 `.claude/rules/button-pin-stuck-low.md`。
 
+## WiFi 連線（ESP-NOW 友善版）
+
+`connectToWiFi()` 與 `ho_relay2` 的差異、以及 loop() 重連策略，詳見程式碼中
+`connectToWiFi()` 與 `loop()` WiFi 管理區塊的註釋。重點：不呼叫 `WiFi.scanNetworks()`、
+不呼叫 `WiFi.mode(WIFI_OFF)`、所有等待都走 `maintainEspNow()` 讓心跳照常發出，
+最壞阻塞 15 秒。重連時若有上次成功關聯的 channel／BSSID 記錄，會直接指定跳過
+`WiFi.begin()` 內建的全頻道掃描（該掃描即使不呼叫 `scanNetworks()` 仍會發生）。
+
+### 已知限制：WiFi 連線沒有 auth mode 退避
+
+`ho_relay2` 的 `connectToWiFi()` 針對連線失敗會依序嘗試多種 auth mode 組合退避重試，
+`ho_master1` **刻意不補這段**。若目標 AP 需要特殊的認證退避流程才能連上，
+master 只會用預設方式嘗試一次、失敗就等下一輪重連（見 `loop()` 的
+`wifiFailCount` / `wifiPauseUntil` 邏輯），不會自動切換 auth mode。
+
+裁決理由：本輪修正的方向是壓縮 WiFi 連線流程的阻塞時間（`maxWaitMs` 已由 30 秒
+降到 15 秒），把 `ho_relay2` 那套多段式 auth mode 退避搬回來，會讓單次連線嘗試的
+阻塞時間再拉長好幾倍，與這個方向直接衝突。目前部署對象的 AP 已知可用預設方式連線；
+若之後遇到真的連不上的路由器，屆時再針對該款 AP 補特定的重試模式，
+比現在盲目加五段退避更務實。
+
 ## 編譯與燒錄
 
 ```powershell
