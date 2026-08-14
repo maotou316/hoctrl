@@ -931,6 +931,29 @@ BLE + WiFi + MQTT + ESP-NOW 同時存在是 `ho_relay2` 從未有過的組合
 
 若編譯後 RAM 用量超過 80%，在 report 中明確標示風險。
 
+> **實作後補記（2026-08-15，計畫當初沒預見）：WROOM 板需要 `PartitionScheme=custom`
+> 才放得下 BLE。**
+>
+> `flash.ps1` 的 `master` 型號原本用 `esp32:esp32:esp32`（板子預設 OTA 雙槽分區，
+> 每槽 1.31MB）。加入 BLE 後，Bluedroid stack 本身就要吃掉數百 KB 程式碼段，
+> BLE + WiFi + MQTT + ESP-NOW 全部連結進同一顆映像，編譯結果超出這個分區容量
+> 28%（1,680,051 / 1,310,720 bytes），直接編譯失敗（連結錯誤：本文區已超出開發板
+> 的可用空間）。`master-c3` 沒遇到這問題，因為它的 FQBN 本來就帶
+> `PartitionScheme=custom`，讀取 `ho_master1/partitions.csv`（app0/app1 各 1.94MB）。
+>
+> 修法：把 `flash.ps1` 的 `master` FQBN 也改成
+> `esp32:esp32:esp32:PartitionScheme=custom`，讓 WROOM 與 C3 共用同一份
+> `ho_master1/partitions.csv`。這份分區表總和剛好等於 WROOM DevKit 的 4MB flash
+> （`0x400000`），且**保留了 OTA 雙槽**（app0 + app1 各 0x1F0000），沒有改用
+> `huge_app` 之類犧牲雙槽的方案——Phase 4 的轉送 OTA 需要雙槽。
+>
+> 改完後兩種板子都編譯成功，但 WROOM 的 flash 用量對真實 app0 分區
+> （2,031,616 bytes）達到 **82.7%**（1,680,083 bytes），已超過原訂的 80% 風險線，
+> 只剩約 351KB 餘裕。**後續 Phase（尤其 Phase 2b 加 slaves 陣列進狀態 JSON、
+> Phase 4 加轉送 OTA 邏輯）在 WROOM 板上要留意 flash 餘裕，必要時考慮拿掉
+> BLE 改用其他配網方式，或評估 NimBLE 取代 Bluedroid（NimBLE 體積小很多，
+> 是獨立的技術評估，未在本輪處理）。**
+
 - [ ] **Step 5: Commit**
 
 ---
@@ -1004,6 +1027,7 @@ MQTT topic 與指令表、狀態 JSON 範例、與 `ho_relay2` 的差異說明�
 | 風險 | 影響 | 緩解 |
 |---|---|---|
 | BLE + WiFi + MQTT + ESP-NOW 並存的 heap 壓力 | 可能 OOM 重啟 | Task 6 Step 4 檢查 RAM 用量；BLE 僅在未配網時啟動且配網後 restart |
+| WROOM 板 flash 用量偏緊（Task 6 實作後補記，計畫當初沒預見）| 後續 Phase 加程式碼可能編不過 | 已改用 `PartitionScheme=custom`（1.94MB app0，與 C3 共用 `partitions.csv`），但目前用量已達 82.7%，餘裕約 351KB；後續加功能前先跑 `.\flash.ps1 -Model master` 確認 |
 | C3 單核跑滿四套協定的即時性 | 心跳延遲、封包遺失 | 回歸清單第 8、9 項專測此情境；必要時 master 改用 WROOM |
 | `WiFi.begin()` 不掃描直接連，對隱藏 SSID 或特殊 AP 可能失敗 | 配網後連不上 | 保留 30 秒等待與原因碼診斷；若實測有問題再考慮首次連線才掃描（此時 ESP-NOW 尚未有 peer，掃描無害） |
 | MQTT 狀態 JSON 加入 `slaves` 陣列後（2b）可能超過 1024 | publish 失敗 | 已 `setBufferSize(1024)`；2b 若 20 台會超過需再擴或分頁 |

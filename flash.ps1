@@ -40,7 +40,12 @@ $configs = @{
     }
     'master' = @{
         Dir  = 'ho_master1'
-        Fqbn = 'esp32:esp32:esp32'
+        # Task 6（BLE 配網）加入 BLE 後，板子預設的 OTA 雙槽分區（每槽 1.31MB）放不下
+        # BLE + WiFi + MQTT + ESP-NOW 全部連結進同一顆映像（Bluedroid stack 本身就要
+        # 數百 KB），編譯會超出 flash 容量 28%。改用 PartitionScheme=custom 讀
+        # ho_master1/partitions.csv（app0/app1 各 1.94MB，仍保留 OTA 雙槽，Phase 4
+        # 轉送 OTA 需要），總和剛好等於 WROOM DevKit 的 4MB flash。
+        Fqbn = 'esp32:esp32:esp32:PartitionScheme=custom'
         Label = 'hoMaster1 (ESP32 WROOM，ESP-NOW 主控)'
     }
     'master-c3' = @{
