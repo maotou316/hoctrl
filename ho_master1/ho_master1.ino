@@ -6,6 +6,8 @@
 #include <esp_wifi.h>
 #include <HoEspNowProtocol.h>
 #include <Preferences.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 const char* firmwareVersion = "1.0.0";
 const char* deviceModel = "hoMaster1";
@@ -73,6 +75,28 @@ bool useCustomServer = false;
 bool hasRelay = false;        // master 硬體有沒有接繼電器（韌體無法自動偵測）
 
 Preferences netPrefs;         // 與 Phase 1 名冊用的 prefs 分開，避免鍵名衝突
+
+// ── MQTT 多伺服器設定 ──
+struct MqttServerConfig {
+  const char* server;
+  int port;
+  const char* username;
+  const char* password;
+};
+
+// 與 Flutter App 的 multi_mqtt_service.dart 保持一致
+const MqttServerConfig DEFAULT_SERVERS[] = {
+  {"mqttgo.io",               1883, NULL,         NULL},
+  {"broker.hoban.tw",         1883, "hoban_user", "hoban_pass"},
+  {"mqtt.eclipseprojects.io", 1883, NULL,         NULL},
+  {"broker.emqx.io",          1883, NULL,         NULL},
+  {"broker.hivemq.com",       1883, NULL,         NULL},
+};
+const int DEFAULT_SERVER_COUNT = sizeof(DEFAULT_SERVERS) / sizeof(DEFAULT_SERVERS[0]);
+int currentServerIndex = 0;
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
 // 配對模式
 unsigned long pairingStartTime = 0;
@@ -866,6 +890,118 @@ void connectToWiFi() {
   }
 }
 
+// ── MQTT 連線 ──
+// 連線到指定的預設伺服器
+bool quickConnectToIndex(int index) {
+  if (index < 0 || index >= DEFAULT_SERVER_COUNT) return false;
+  const MqttServerConfig& cfg = DEFAULT_SERVERS[index];
+
+  mqttClient.setServer(cfg.server, cfg.port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setKeepAlive(30);
+  // ho_relay2 沒設這兩個，導致：
+  // - buffer 預設 256，帶 server 欄位的狀態 JSON 必定超過而 publish 靜默失敗
+  // - socket timeout 預設 15 秒，5 台輪一輪最壞阻塞 77 秒
+  mqttClient.setBufferSize(1024);
+  mqttClient.setSocketTimeout(3);
+
+  const char* deviceId = getDeviceId();
+  String statusTopic = String("hoban/") + deviceId + "/status";
+
+  StaticJsonDocument<160> willDoc;
+  willDoc["device_id"] = deviceId;
+  willDoc["status"] = "offline";
+  willDoc["server"] = cfg.server;
+  willDoc["timestamp"] = millis() / 1000;
+  char willBuf[160];
+  serializeJson(willDoc, willBuf);
+
+  Serial.printf("[MQTT] 嘗試 %s …\n", cfg.server);
+  bool res = mqttClient.connect(deviceId, cfg.username, cfg.password,
+                                statusTopic.c_str(), 1, true, willBuf, true);
+  if (!res) {
+    Serial.printf("[MQTT] %s 失敗，state=%d\n", cfg.server, mqttClient.state());
+    return false;
+  }
+
+  String controlTopic = String("hoban/") + deviceId + "/control";
+  mqttClient.subscribe(controlTopic.c_str());
+  currentServerIndex = index;
+  Serial.printf("[MQTT] 已連線 %s，訂閱 %s\n", cfg.server, controlTopic.c_str());
+  publishStatus();
+  return true;
+}
+
+// 連線到使用者自訂伺服器。結構與 quickConnectToIndex() 相同，差別：
+// 用 mqttServer/mqttPort，帳密有值才傳、否則傳 NULL，且不更新 currentServerIndex
+// （currentServerIndex 只追蹤「輪詢到預設清單的第幾台」，自訂伺服器不佔用這個游標，
+// 避免自訂伺服器斷線後，預設清單的輪詢起點被誤導到不相關的位置）。
+bool quickConnectCustom() {
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setKeepAlive(30);
+  mqttClient.setBufferSize(1024);
+  mqttClient.setSocketTimeout(3);
+
+  const char* deviceId = getDeviceId();
+  String statusTopic = String("hoban/") + deviceId + "/status";
+
+  StaticJsonDocument<160> willDoc;
+  willDoc["device_id"] = deviceId;
+  willDoc["status"] = "offline";
+  willDoc["server"] = mqttServer;
+  willDoc["timestamp"] = millis() / 1000;
+  char willBuf[160];
+  serializeJson(willDoc, willBuf);
+
+  const char* user = (strlen(mqttUsername) > 0) ? mqttUsername : NULL;
+  const char* pass = (strlen(mqttPassword) > 0) ? mqttPassword : NULL;
+
+  Serial.printf("[MQTT] 嘗試自訂伺服器 %s …\n", mqttServer);
+  bool res = mqttClient.connect(deviceId, user, pass,
+                                statusTopic.c_str(), 1, true, willBuf, true);
+  if (!res) {
+    Serial.printf("[MQTT] 自訂伺服器 %s 失敗，state=%d\n", mqttServer, mqttClient.state());
+    return false;
+  }
+
+  String controlTopic = String("hoban/") + deviceId + "/control";
+  mqttClient.subscribe(controlTopic.c_str());
+  Serial.printf("[MQTT] 已連線自訂伺服器 %s，訂閱 %s\n", mqttServer, controlTopic.c_str());
+  publishStatus();
+  return true;
+}
+
+// 依序嘗試：自訂伺服器 → 從上次成功的位置輪詢預設清單
+void smartConnect() {
+  if (!WiFi.isConnected()) return;
+
+  if (useCustomServer && strlen(mqttServer) > 0) {
+    if (quickConnectCustom()) return;
+  }
+
+  for (int i = 0; i < DEFAULT_SERVER_COUNT; i++) {
+    int index = (currentServerIndex + i) % DEFAULT_SERVER_COUNT;
+    if (quickConnectToIndex(index)) return;
+    espNowDelay(300);   // 錯開重試，期間維持心跳
+  }
+
+  currentServerIndex = (currentServerIndex + 1) % DEFAULT_SERVER_COUNT;
+  Serial.println("[MQTT] 所有伺服器都連不上");
+}
+
+// Task 5 會擴充成完整的狀態 JSON
+void publishStatus() {
+  if (!mqttClient.connected()) return;
+  String topic = String("hoban/") + getDeviceId() + "/status";
+  mqttClient.publish(topic.c_str(), "{\"status\":\"online\"}", true);
+}
+
+// Task 5 會擴充成完整的指令分派
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.printf("[MQTT] 收到訊息，長度 %u（指令處理待 Task 5 實作）\n", length);
+}
+
 // ── ESP-NOW 初始化 ──
 void setupEspNow() {
   WiFi.mode(WIFI_STA);
@@ -1016,6 +1152,25 @@ void loop() {
       lastWiFiCheck = now;
       wifiFailCount = 0;
       onWifiChannelMayHaveChanged();   // AP 可能不斷線就換頻
+    }
+  }
+
+  // ── MQTT 連線管理 ──
+  static unsigned long lastReconnect = 0;
+  static unsigned long lastStatusPub = 0;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected()) {
+      if (now - lastReconnect > 10000) {
+        lastReconnect = now;
+        smartConnect();
+      }
+    } else {
+      mqttClient.loop();
+      if (now - lastStatusPub > 10000) {   // 每 10 秒發一次狀態，master 還要發心跳與輪詢 slave，比 ho_relay2 的 3 秒寬鬆
+        lastStatusPub = now;
+        publishStatus();
+      }
     }
   }
 
