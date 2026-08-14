@@ -58,6 +58,20 @@ void initRelayPins() {
   relayState = false;
 }
 
+void setRelayPins(bool on) {
+  for (int i = 0; i < relayPinCount; i++) {
+    digitalWrite(relayPins[i], on ? HIGH : LOW);
+  }
+  relayState = on;
+}
+
+unsigned long pulseEndTime = 0;
+
+void pulseRelay(uint16_t ms) {
+  setRelayPins(true);
+  pulseEndTime = millis() + ms;
+}
+
 // ── 設備 ID ──
 const char* getDeviceId() {
   if (deviceIdString.length() == 0) {
@@ -165,6 +179,130 @@ void exitPairingMode() {
   Serial.println("[配對] 離開配對模式");
 }
 
+// ── 控制 slave ──
+void sendCmdToSlave(int idx, HoRelayCmd cmd, uint16_t pulseMs) {
+  if (idx < 0 || idx >= slaveCount) {
+    Serial.println("[控制] 編號超出範圍");
+    return;
+  }
+  HoCmdPayload payload;
+  payload.cmd = (uint8_t)cmd;
+  payload.pulseMs = pulseMs;
+
+  char id[20];
+  hoFormatDeviceId(slaves[idx].mac, id);
+  Serial.printf("[控制] 送指令 %u 給 %s\n", (uint8_t)cmd, id);
+  espNowSendTo(slaves[idx].mac, HO_PKT_CMD, &payload, sizeof(payload));
+}
+
+void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
+  Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, slaveCount);
+  for (int i = 0; i < slaveCount; i++) {
+    sendCmdToSlave(i, cmd, pulseMs);
+    delay(20);   // 錯開送出時間，降低同頻碰撞
+  }
+  // master 自己的繼電器也跟著動作
+  if (cmd == HO_CMD_ON) {
+    setRelayPins(true);
+  } else if (cmd == HO_CMD_OFF) {
+    setRelayPins(false);
+  } else if (cmd == HO_CMD_PULSE) {
+    pulseRelay(pulseMs > 0 ? pulseMs : 2000);
+  }
+}
+
+void requestSlaveState(int idx) {
+  if (idx < 0 || idx >= slaveCount) return;
+  espNowSendTo(slaves[idx].mac, HO_PKT_STATE_REQ, nullptr, 0);
+}
+
+void unpairSlave(int idx) {
+  if (idx < 0 || idx >= slaveCount) {
+    Serial.println("[配對] 編號超出範圍");
+    return;
+  }
+  char id[20];
+  hoFormatDeviceId(slaves[idx].mac, id);
+
+  espNowSendTo(slaves[idx].mac, HO_PKT_UNPAIR, nullptr, 0);
+  delay(100);   // 給對方時間收到再刪 peer
+
+  esp_now_del_peer(slaves[idx].mac);
+  for (int i = idx; i < slaveCount - 1; i++) slaves[i] = slaves[i + 1];
+  slaveCount--;
+  saveSlaves();
+  Serial.printf("[配對] 已移除 %s，剩 %d 台\n", id, slaveCount);
+}
+
+void printSlaveList() {
+  Serial.printf("── Slave 名冊（%d／%d）──\n", slaveCount, HO_ESPNOW_MAX_SLAVES);
+  if (slaveCount == 0) {
+    Serial.println("  （空）");
+    return;
+  }
+  unsigned long now = millis();
+  for (int i = 0; i < slaveCount; i++) {
+    char id[20];
+    hoFormatDeviceId(slaves[i].mac, id);
+    bool online = slaves[i].lastSeen > 0 &&
+                  (now - slaves[i].lastSeen) < SLAVE_OFFLINE_TIMEOUT;
+    Serial.printf("  %d. %s  %s  rssi=%d\n",
+                  i, id, online ? "在線" : "離線", slaves[i].rssi);
+  }
+}
+
+// ── 序列埠測試指令（Phase 2 接上 MQTT 後仍保留，方便現場除錯）──
+void printHelp() {
+  Serial.println("── 可用指令 ──");
+  Serial.println("  list          列出所有 slave");
+  Serial.println("  pair          進入／離開配對模式");
+  Serial.println("  on <n>        開啟第 n 台（n 為 list 的編號）");
+  Serial.println("  off <n>       關閉第 n 台");
+  Serial.println("  pulse <n>     點動第 n 台 2 秒");
+  Serial.println("  allon         全部開啟（含 master 自己）");
+  Serial.println("  alloff        全部關閉（含 master 自己）");
+  Serial.println("  allpulse      全部點動 2 秒");
+  Serial.println("  state <n>     要求第 n 台回報狀態");
+  Serial.println("  unpair <n>    解除第 n 台配對");
+  Serial.println("  help          顯示這份說明");
+}
+
+void handleSerialCommand(const String& line) {
+  String cmd = line;
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  int spacePos = cmd.indexOf(' ');
+  String verb = (spacePos < 0) ? cmd : cmd.substring(0, spacePos);
+  int arg = (spacePos < 0) ? -1 : cmd.substring(spacePos + 1).toInt();
+
+  if (verb == "list") {
+    printSlaveList();
+  } else if (verb == "pair") {
+    if (pairingMode) exitPairingMode(); else enterPairingMode();
+  } else if (verb == "on") {
+    sendCmdToSlave(arg, HO_CMD_ON, 0);
+  } else if (verb == "off") {
+    sendCmdToSlave(arg, HO_CMD_OFF, 0);
+  } else if (verb == "pulse") {
+    sendCmdToSlave(arg, HO_CMD_PULSE, 2000);
+  } else if (verb == "allon") {
+    sendCmdToAll(HO_CMD_ON, 0);
+  } else if (verb == "alloff") {
+    sendCmdToAll(HO_CMD_OFF, 0);
+  } else if (verb == "allpulse") {
+    sendCmdToAll(HO_CMD_PULSE, 2000);
+  } else if (verb == "state") {
+    requestSlaveState(arg);
+  } else if (verb == "unpair") {
+    unpairSlave(arg);
+  } else if (verb == "help") {
+    printHelp();
+  } else {
+    Serial.printf("未知指令：%s（輸入 help 看說明）\n", verb.c_str());
+  }
+}
+
 // ── ESP-NOW callbacks ──
 void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   HoPacketHeader header;
@@ -222,6 +360,25 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
       saveSlaves();
       Serial.printf("[配對] %s 已解除配對，剩 %d 台\n", senderId, slaveCount);
     }
+    return;
+  }
+
+  if (header.type == HO_PKT_STATE && payloadLen >= sizeof(HoStatePayload)) {
+    int idx = findSlave(info->src_addr);
+    if (idx < 0) {
+      Serial.printf("[狀態] 收到未配對設備 %s 的回報，忽略\n", senderId);
+      return;
+    }
+    HoStatePayload st;
+    memcpy(&st, payload, sizeof(st));
+
+    slaves[idx].online = true;
+    slaves[idx].rssi = info->rx_ctrl->rssi;
+    slaves[idx].lastSeen = millis();
+
+    Serial.printf("[狀態] %s relay=%u 版本=%u.%u.%u 運行=%lus rssi=%d\n",
+                  senderId, st.relay, st.fwMajor, st.fwMinor, st.fwPatch,
+                  (unsigned long)st.uptimeSec, info->rx_ctrl->rssi);
     return;
   }
 }
@@ -318,6 +475,7 @@ void setup() {
   setupEspNow();
 
   Serial.printf("設備 ID: %s\n", getDeviceId());
+  printHelp();
   Serial.println("就緒");
 }
 
@@ -363,5 +521,25 @@ void loop() {
   if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
     lastHeartbeat = now;
     sendHeartbeat();
+  }
+
+  if (pulseEndTime != 0 && now >= pulseEndTime) {
+    pulseEndTime = 0;
+    setRelayPins(false);
+  }
+
+  // ── 序列埠指令 ──
+  static String serialBuffer = "";
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialBuffer.length() > 0) {
+        handleSerialCommand(serialBuffer);
+        serialBuffer = "";
+      }
+    } else {
+      serialBuffer += c;
+      if (serialBuffer.length() > 64) serialBuffer = "";  // 防溢位
+    }
   }
 }

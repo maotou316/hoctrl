@@ -67,6 +67,32 @@ void setRelayPins(bool on) {
   relayState = on;
 }
 
+// 點動：開啟 ms 毫秒後自動關閉。
+// 用非阻塞方式，避免點動期間收不到 ESP-NOW 封包。
+unsigned long pulseEndTime = 0;
+
+void pulseRelay(uint16_t ms) {
+  setRelayPins(true);
+  pulseEndTime = millis() + ms;
+  Serial.printf("[繼電器] 點動 %u ms\n", ms);
+}
+
+void sendState() {
+  if (!masterKnown) return;
+
+  HoStatePayload st;
+  st.relay = relayState ? 1 : 0;
+  st.fwMajor = 1;
+  st.fwMinor = 0;
+  st.fwPatch = 0;
+  st.uptimeSec = millis() / 1000;
+
+  uint8_t buf[250];
+  size_t total = hoPackPacket(buf, sizeof(buf), HO_PKT_STATE, txSeq++, &st, sizeof(st));
+  esp_now_send(masterMac, buf, total);
+  Serial.printf("[狀態] 已回報 relay=%u\n", st.relay);
+}
+
 // ── 設備 ID ──
 String deviceIdString;
 const char* getDeviceId() {
@@ -131,6 +157,16 @@ void onMasterFound(const uint8_t mac[6], uint8_t channel) {
   bool channelChanged = (lockedChannel != channel);
 
   memcpy(masterMac, mac, 6);
+
+  if (!esp_now_is_peer_exist(mac)) {
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, mac, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
+    peer.ifidx = WIFI_IF_STA;
+    esp_now_add_peer(&peer);
+  }
+
   lockedChannel = channel;
   scanning = false;
   lastHeartbeatTime = millis();
@@ -225,6 +261,52 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
       Serial.printf("[配對] 被拒絕：%s\n", why);
       blinkLed(3, 400);   // 慢閃 3 下表示失敗
     }
+    return;
+  }
+
+  // 只接受已配對 master 的控制指令
+  if (!masterKnown || memcmp(masterMac, info->src_addr, 6) != 0) {
+    return;
+  }
+
+  if (header.type == HO_PKT_CMD && payloadLen >= sizeof(HoCmdPayload)) {
+    HoCmdPayload cmd;
+    memcpy(&cmd, payload, sizeof(cmd));
+
+    switch (cmd.cmd) {
+      case HO_CMD_ON:
+        setRelayPins(true);
+        pulseEndTime = 0;
+        Serial.println("[繼電器] 開啟");
+        break;
+      case HO_CMD_OFF:
+        setRelayPins(false);
+        pulseEndTime = 0;
+        Serial.println("[繼電器] 關閉");
+        break;
+      case HO_CMD_PULSE:
+        pulseRelay(cmd.pulseMs > 0 ? cmd.pulseMs : 2000);
+        break;
+      default:
+        Serial.printf("[繼電器] 未知指令 %u\n", cmd.cmd);
+        return;
+    }
+    sendState();
+    return;
+  }
+
+  if (header.type == HO_PKT_STATE_REQ) {
+    sendState();
+    return;
+  }
+
+  if (header.type == HO_PKT_UNPAIR) {
+    Serial.println("[配對] master 要求解除配對");
+    EEPROM.begin(EEPROM_SIZE);
+    EEPROM.write(EE_ADDR_MAGIC, 0);
+    EEPROM.commit();
+    delay(500);
+    ESP.restart();
     return;
   }
 }
@@ -323,6 +405,14 @@ void loop() {
       setChannel(scanChannel);
     }
     return;
+  }
+
+  // 點動時間到，自動關閉
+  if (pulseEndTime != 0 && now >= pulseEndTime) {
+    pulseEndTime = 0;
+    setRelayPins(false);
+    Serial.println("[繼電器] 點動結束，已關閉");
+    sendState();
   }
 
   // 已鎖定：超時沒收到心跳就重新掃描
