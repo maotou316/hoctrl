@@ -40,6 +40,15 @@ unsigned long pairReqTime = 0;
 const unsigned long PAIR_ACK_TIMEOUT = 5000;
 bool masterInPairingMode = false;   // 從心跳得知 master 是否在配對模式
 
+// ── 長按重置（與 ho_relay2 行為一致）──
+const int LONG_PRESS_TIME = 3000;
+const int BLINK_CONFIRM_TIME = 2000;
+const int BLINK_INTERVAL = 250;
+const int CONFIRM_SOLID_TIME = 700;
+unsigned long resetPressTime = 0;
+unsigned long resetBlinkStart = 0;
+bool resetBlinking = false;
+
 // 掃描狀態
 bool scanning = false;
 uint8_t scanChannel = 1;
@@ -140,6 +149,15 @@ void savePairing() {
   }
   EEPROM.write(EE_ADDR_CHANNEL, lockedChannel);
   EEPROM.commit();
+}
+
+void clearPairing() {
+  EEPROM.begin(EEPROM_SIZE);
+  for (int i = 0; i < EEPROM_SIZE; i++) EEPROM.write(i, 0);
+  EEPROM.commit();
+  Serial.println("配對記錄已清除，重新啟動中…");
+  delay(1000);
+  ESP.restart();
 }
 
 // ── Channel 控制 ──
@@ -389,21 +407,60 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // ── 短按 BOOT 送出配對請求 ──
-  static bool lastButtonState = HIGH;
-  static unsigned long buttonDownTime = 0;
-  bool buttonState = digitalRead(bootButton);
+  // ── 按鈕：短按配對，長按重置 ──
+  // 兩顆按鈕任一顆都可以，與 ho_relay2 一致
+  bool bootState = digitalRead(bootButton);
+  bool resetState = digitalRead(resetButton);
+  bool anyPressed = (bootState == LOW || resetState == LOW);
 
-  if (lastButtonState == HIGH && buttonState == LOW) {
-    buttonDownTime = now;
+  static bool lastAnyPressed = false;
+
+  if (anyPressed && !lastAnyPressed) {
+    resetPressTime = now;
   }
-  if (lastButtonState == LOW && buttonState == HIGH) {
-    unsigned long pressDuration = now - buttonDownTime;
-    if (pressDuration >= 50 && pressDuration < 1000) {
+
+  if (anyPressed) {
+    unsigned long pressDuration = now - resetPressTime;
+
+    if (!resetBlinking && pressDuration >= LONG_PRESS_TIME) {
+      resetBlinking = true;
+      resetBlinkStart = now;
+      Serial.println("長按 3 秒達成，繼續按住 2 秒清除配對…");
+    }
+
+    if (resetBlinking) {
+      unsigned long blinkDuration = now - resetBlinkStart;
+      if (blinkDuration < BLINK_CONFIRM_TIME) {
+        bool ledOn = (blinkDuration % BLINK_INTERVAL) < (BLINK_INTERVAL / 2);
+        digitalWrite(ledOnFace, ledOn ? HIGH : LOW);
+        digitalWrite(ledOnBoard, ledOn ? HIGH : LOW);
+      } else {
+        Serial.println("確認清除配對");
+        digitalWrite(ledOnFace, HIGH);
+        digitalWrite(ledOnBoard, HIGH);
+        delay(CONFIRM_SOLID_TIME);
+        digitalWrite(ledOnFace, LOW);
+        digitalWrite(ledOnBoard, LOW);
+        clearPairing();
+      }
+    }
+  } else if (lastAnyPressed) {
+    // 放開：短按觸發配對，長按中途放開則取消
+    unsigned long pressDuration = now - resetPressTime;
+    if (!resetBlinking && pressDuration >= 50 && pressDuration < 1000) {
       requestPairing();
     }
+    if (resetBlinking) {
+      Serial.println("按鈕放開，取消重置");
+    }
+    resetBlinking = false;
+    resetPressTime = 0;
+    // 還原繼電器對應的 LED 狀態
+    digitalWrite(ledOnFace, relayState ? HIGH : LOW);
+    digitalWrite(ledOnBoard, relayState ? HIGH : LOW);
   }
-  lastButtonState = buttonState;
+
+  lastAnyPressed = anyPressed;
 
   // ── 配對請求逾時 ──
   if (waitingPairAck && now - pairReqTime >= PAIR_ACK_TIMEOUT) {
