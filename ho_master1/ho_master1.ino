@@ -375,6 +375,117 @@ void setupBLE() {
   Serial.printf("[BLE] 已啟動，名稱: %s\n", deviceId);
 }
 
+// ── LED：一次性閃爍請求（Task 7）──
+// 這套機制沿用 ho_slave1.ino 的 updateBlink() 設計，用於配對接受／拒絕等
+// 「單次事件」的視覺回饋（閃 N 下就結束），與下方 updateStatusLed() 的
+// 「只要條件成立就一直閃」持續式狀態指示是兩種不同用途，刻意不合併成一個函式：
+// 硬合併會讓「配對結果閃 3 下」與「WiFi 未連快閃」互相覆蓋，行為難以預測。
+//
+// 分工與優先權：updateBlink() 進行中（blinkActive）時暫時接管 LED；
+// 播完（blinkActive 轉回 false）的同一輪 loop() 就會呼叫 updateStatusLed()，
+// 該函式一開頭就檢查 blinkActive，是的話直接讓出 LED，兩者不會互相覆蓋。
+// 呼叫順序見 loop() 尾端：每輪先 updateBlink() 推進一次性閃爍，再呼叫 updateStatusLed()。
+//
+// onEspNowRecv() 依 ESP-IDF 規定在 WiFi task context 執行、不可做冗長操作，
+// 這裡呼叫 requestBlink() 只寫入 volatile 旗標、立即返回，與 slaveCount 的
+// 跨 context 存取是同一個理由。
+volatile uint8_t blinkRequestTimes = 0;      // 待執行的閃爍次數（由 callback 登記）
+volatile uint16_t blinkRequestInterval = 0;  // 亮／滅各自的毫秒數
+
+bool blinkActive = false;        // loop() 是否正在執行一次性閃爍
+uint8_t blinkRemaining = 0;      // 還剩幾次
+uint16_t blinkInterval = 0;
+bool blinkPhaseOn = false;       // 目前是「亮」的半週期
+unsigned long blinkPhaseStart = 0;
+
+// 供 ESP-NOW callback 呼叫：只寫旗標，立即返回，不在 WiFi task 裡做耗時操作
+void requestBlink(uint8_t times, uint16_t intervalMs) {
+  blinkRequestInterval = intervalMs;
+  blinkRequestTimes = times;   // 次數最後寫，確保 loop() 讀到時間隔已就緒
+}
+
+void updateBlink(unsigned long now) {
+  // 有新的登記且目前沒在閃 → 啟動
+  if (!blinkActive && blinkRequestTimes > 0) {
+    blinkRemaining = blinkRequestTimes;
+    blinkInterval = blinkRequestInterval;
+    blinkRequestTimes = 0;
+    blinkActive = true;
+    blinkPhaseOn = true;
+    blinkPhaseStart = now;
+    setLeds(true);
+    return;
+  }
+  if (!blinkActive) return;
+  if (now - blinkPhaseStart < blinkInterval) return;   // 無號數減法，不怕 millis() 溢位
+
+  blinkPhaseStart = now;
+  if (blinkPhaseOn) {
+    blinkPhaseOn = false;   // 亮的半週期結束 → 轉滅
+    setLeds(false);
+    return;
+  }
+
+  // 滅的半週期結束 → 完成一次閃爍
+  blinkRemaining--;
+  if (blinkRemaining == 0) {
+    blinkActive = false;
+    // 這裡刻意不設定 LED 最終狀態：loop() 同一輪緊接著會呼叫 updateStatusLed()，
+    // LED 該亮或滅交由持續式狀態指示決定（master 沒有 slave 那種「還原成繼電器
+    // 狀態」的 LED 語義，master 的 LED 代表的是連線狀態，不是繼電器狀態）
+    return;
+  }
+  blinkPhaseOn = true;
+  setLeds(true);
+}
+
+// ── LED：持續式狀態指示（Task 7）──
+// 互斥判斷，優先序由高到低：
+//   1. bleConfigMode（BLE 配網中）      → 慢閃 1000ms
+//   2. pairingMode（配對模式中）        → 慢閃 500ms
+//   3. WiFi 未連線                      → 快閃 300ms，滿 30 秒後熄滅省電
+//   4. WiFi 已連但 MQTT 未連            → 一長二短
+//   5. 全部正常                          → 熄滅
+// 與 updateBlink() 的分工見上方註釋；這裡只需在開頭檢查 blinkActive 即可。
+unsigned long wifiDownSince = 0;   // 0 表示目前是連線狀態，尚未開始計時省電熄燈
+
+void updateStatusLed(unsigned long now) {
+  if (blinkActive) return;   // 一次性閃爍進行中，暫時讓出 LED
+
+  if (bleConfigMode) {
+    setLeds((now / 1000) % 2 == 0);
+    return;
+  }
+
+  if (pairingMode) {
+    setLeds((now / 500) % 2 == 0);
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiDownSince == 0) wifiDownSince = now;
+    if (now - wifiDownSince >= 30000) {
+      setLeds(false);   // 滿 30 秒後熄滅省電
+    } else {
+      setLeds((now / 300) % 2 == 0);   // 快閃 300ms
+    }
+    return;
+  }
+  wifiDownSince = 0;   // 已連線：重置計時，下次斷線才重新從 0 開始算 30 秒
+
+  if (!mqttClient.connected()) {
+    // 一長二短，週期 2000ms：600ms 亮 → 200ms 滅 → 150ms 亮 → 200ms 滅 → 150ms 亮 → 700ms 滅
+    unsigned long phase = now % 2000;
+    bool on = (phase < 600) ||
+              (phase >= 800 && phase < 950) ||
+              (phase >= 1150 && phase < 1300);
+    setLeds(on);
+    return;
+  }
+
+  setLeds(false);   // 全部正常：熄滅
+}
+
 // ── WiFi 狀態 ──
 volatile uint8_t lastWifiDisconnectReason = 0;
 unsigned long wifiConnectedTime = 0;
@@ -796,10 +907,12 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     } else if (!addSlave(info->src_addr)) {
       ack.accepted = 0;
       ack.reason = HO_PAIR_FULL;
+      requestBlink(3, 400);   // 慢閃 3 下：拒絕（語義沿用 ho_slave1.ino 的「失敗閃 3 下」）
       Serial.printf("[配對] 拒絕 %s：已達 %d 台上限\n", senderId, HO_ESPNOW_MAX_SLAVES);
     } else {
       ack.accepted = 1;
       ack.reason = HO_PAIR_OK;
+      requestBlink(3, 100);   // 快閃 3 下：接受（語義沿用 ho_slave1.ino 的「成功閃 3 下」）
       Serial.printf("[配對] 接受 %s，目前共 %d 台\n", senderId, slaveCount);
     }
 
@@ -1330,10 +1443,12 @@ void loop() {
     exitPairingMode();
   }
 
-  // ── 配對模式時 LED 慢閃 ──
-  if (pairingMode) {
-    setLeds(((now / 500) % 2) ? true : false);
-  }
+  // ── LED 狀態指示（Task 7）──
+  // 先推進一次性閃爍請求（配對接受／拒絕），播完的同一輪就會被 updateStatusLed()
+  // 接手判斷持續式狀態（BLE 配網／配對模式／WiFi／MQTT／正常），兩者分工與
+  // 優先權詳見各自函式上方註釋
+  updateBlink(now);
+  updateStatusLed(now);
 
   // 心跳固定 1 秒一次（HEARTBEAT_INTERVAL），計時併入 maintainEspNow()，
   // 避免與 Phase 2a 阻塞流程內的維持機制形成兩套計時器、重複發送
