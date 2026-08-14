@@ -2,10 +2,31 @@
 
 ## 硬體
 
-- 開發板：ESP32 WROOM DevKit
-- GPIO：BOOT 按鈕 0、第二按鈕 14、板載 LED 2、繼電器 13
+同一份 `ho_master1.ino` 用 `CONFIG_IDF_TARGET_ESP32C3` / `CONFIG_IDF_TARGET_ESP32`
+條件編譯支援兩種板子，**不是兩份 sketch**，燒錄時用 `flash.ps1` 的型號區分：
+
+| 型號 | 開發板 | BOOT | 第二按鈕 | LED | 繼電器 |
+|---|---|---|---|---|---|
+| `master`（預設分區） | ESP32 WROOM DevKit | GPIO 0 | GPIO 14（未接線，僅供自檢） | 板載 GPIO 2 | GPIO 13 |
+| `master-c3`（custom 分區） | ESP32-C3 Dev Module | GPIO 9 | GPIO 1（RESET） | 板載 GPIO 3 ＋ 面板 GPIO 0 | GPIO 4 與 7（同時驅動） |
+
+C3 版 GPIO 對齊 `ho_slave1.ino`（同一塊硬體）。
+
 - 繼電器為**選配**：只有 `allon` / `alloff` / `allpulse` 會驅動 master 自己的繼電器，
   沒接則這段空跑。`on <n>` / `off <n>` / `pulse <n>` 控制的是**第 n 台 slave**，與 master 自己的繼電器無關
+
+## WROOM 版 vs C3 版怎麼選
+
+1. **CPU**：C3 是單核 RISC-V，WROOM 是雙核。Phase 1（純 ESP-NOW 序列埠操作）沒差，
+   但 Phase 2 的 master 要同時跑 WiFi + MQTT（5 台 broker）+ BLE + ESP-NOW，
+   單核的 C3 壓力明顯較大，目前尚未實測，屆時若效能不足應優先選 WROOM。
+2. **Flash 空間**：反而是 C3 較寬鬆——custom 分區的 app0 約 1.94MB（`partitions.csv`
+   的 `0x1F0000`），目前燒錄用量約 5 成；WROOM 用預設分區（app 約 1.31MB），目前已用
+   將近 7 成。長期看 C3 的 OTA 升級空間比較不吃緊。
+3. **C3 版若要接繼電器，有硬體限制**：GPIO 4/7 是 ESP32-C3 的 JTAG 腳（MTMS/MTDO），
+   reset 後由 ROM 配置、不保證低電位，開機瞬間繼電器會短暫通電，這是硬體限制、
+   韌體無法根治，跟 `ho_relay2` 完全同源。需硬體在 MOS gate 對地加 10kΩ 下拉才能根治。
+   WROOM 版的 GPIO 13 沒有這個問題。詳見 `ho_relay2/readme.md` 的「已知硬體限制」章節。
 
 ## 角色
 
@@ -47,11 +68,16 @@ channel／配對模式／slave 台數任一項變化時會立即印一行，狀�
 ## 按鈕自檢
 
 開機時取樣 BOOT／第二按鈕 500ms，整段都是 LOW 的腳判定為短路／未接，本次開機停用其功能
-（`checkStuckButtons()`）。詳見 `.claude/rules/button-pin-stuck-low.md`。
+（`checkStuckButtons()`）。WROOM 版的第二按鈕（GPIO 14）目前沒接線，自檢與
+`anyResetButtonPressed()` 對它只是空跑；C3 版的第二按鈕是真正接線的 RESET（GPIO 1），
+兩者共用同一套自檢／判斷函式，行為由 GPIO 陣列決定，不需要另外分支。
+詳見 `.claude/rules/button-pin-stuck-low.md`。
 
 ## 編譯與燒錄
 
 ```powershell
-.\flash.ps1 -Model master           # 只編譯
-.\flash.ps1 -Model master -Upload   # 編譯並燒錄
+.\flash.ps1 -Model master              # WROOM 版，只編譯
+.\flash.ps1 -Model master -Upload      # WROOM 版，編譯並燒錄
+.\flash.ps1 -Model master-c3           # C3 版，只編譯
+.\flash.ps1 -Model master-c3 -Upload   # C3 版，編譯並燒錄
 ```

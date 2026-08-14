@@ -10,7 +10,7 @@
 #     擴充自帶的 0.31.0。擴充的板子清單解析不了 esp32 core 3.3.7，所以改走指令。
 
 param(
-    [ValidateSet('1', '2', '3', 'master', 'slave', 'test')]
+    [ValidateSet('1', '2', '3', 'master', 'master-c3', 'slave', 'test')]
     [string]$Model = '2',
     [switch]$Upload,
     [switch]$KeepConfig,
@@ -42,6 +42,13 @@ $configs = @{
         Dir  = 'ho_master1'
         Fqbn = 'esp32:esp32:esp32'
         Label = 'hoMaster1 (ESP32 WROOM，ESP-NOW 主控)'
+    }
+    'master-c3' = @{
+        # 同一份 ho_master1/ho_master1.ino，靠 CONFIG_IDF_TARGET_ESP32C3 條件編譯切換 GPIO，
+        # 不是複製出來的第二個 sketch。FQBN 照抄 slave 型號（同款 C3 開發板）。
+        Dir  = 'ho_master1'
+        Fqbn = 'esp32:esp32:esp32c3:CDCOnBoot=cdc,CPUFreq=160,DebugLevel=error,EraseFlash={0},FlashFreq=80,FlashMode=dio,FlashSize=4M,JTAGAdapter=default,PartitionScheme=custom,UploadSpeed=921600,ZigbeeMode=default'
+        Label = 'hoMaster1-C3 (ESP32-C3，ESP-NOW 主控，同一份 sketch 條件編譯)'
     }
     'slave' = @{
         Dir  = 'ho_slave1'

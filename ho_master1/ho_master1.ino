@@ -1,5 +1,5 @@
 // 齁控 Master — ESP-NOW 主控端
-// 硬體：ESP32 WROOM DevKit（GPIO 定義與 ho_relay1 一致）
+// 硬體：ESP32 WROOM DevKit 或 ESP32-C3（GPIO 依晶片條件編譯，詳見下方 GPIO 定義區塊）
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -10,11 +10,32 @@
 const char* firmwareVersion = "1.0.0";
 const char* deviceModel = "hoMaster1";
 
-// ── GPIO（ESP32 WROOM，沿用 ho_relay1 的定義）──
+// ── GPIO（用條件編譯讓同一份 sketch 同時支援 ESP32 WROOM 與 ESP32-C3）──
+// 為什麼不複製第二個 sketch：本專案已有 ho_relay1/2/3 三份高度重複程式碼的教訓
+//（ho_relay3.ino 的 deviceModel 至今還誤寫成 hoRelay2，就是複製後沒同步的後果）。
+// master 之後還有 Phase 2~5 要改，複製出 master-c3 版只會讓每次改動都要同步兩處。
+// ESP32 Arduino core 3.x 會依燒錄目標自動定義 CONFIG_IDF_TARGET_ESP32C3 或
+// CONFIG_IDF_TARGET_ESP32（已用 #error 實測確認兩種 FQBN 各自命中對應分支）。
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+// ESP32-C3 版：GPIO 對齊 ho_slave1.ino（同一塊硬體），沿用其命名習慣
+const int bootButton = 9;
+const int secondButton = 1;    // C3 版對應的是實體 RESET 按鈕，非備用腳
+const int ledPins[] = { 3, 0 };  // 板載 LED(3) ＋ 面板 LED(0)，兩顆需同步驅動
+// C3 的 GPIO 4/7 是 JTAG 腳（MTMS/MTDO），reset 後由 ROM 配置、不保證低電位，
+// 上電到第一行使用者程式之間的空窗韌體管不到，會繼承跟 ho_relay2 一樣的
+// 「開機瞬間繼電器短暫通電」硬體限制，需硬體在 MOS gate 對地加 10kΩ 下拉才能根治。
+// 詳見 ho_relay2/readme.md「已知硬體限制」章節。
+const int relayPins[] = { 4, 7 };
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+// ESP32 WROOM 版：與 ho_relay1 一致
 const int bootButton = 0;
-const int secondButton = 14;
-const int ledOnBoard = 2;
+const int secondButton = 14;   // 目前未實際接線，僅供按鈕自檢與 Phase 2 預留功能用
+const int ledPins[] = { 2 };   // 只有板載 LED，GPIO 13 不是 JTAG 腳，沒有 C3 那個開機通電風險
 const int relayPins[] = { 13 };
+#else
+#error "未知的目標晶片，master 目前只支援 esp32 或 esp32c3 這兩種 FQBN"
+#endif
+const int ledPinCount = sizeof(ledPins) / sizeof(ledPins[0]);
 const int relayPinCount = sizeof(relayPins) / sizeof(relayPins[0]);
 
 // ── 全域狀態 ──
@@ -70,6 +91,22 @@ const unsigned long BTN_SELFTEST_DURATION = 500;  // 自檢取樣總長度 (毫�
 const unsigned long BTN_SELFTEST_INTERVAL = 50;   // 取樣間隔 (毫秒)
 bool bootButtonUsable = true;                     // BOOT 按鈕是否可用
 bool secondButtonUsable = true;                   // 第二按鈕是否可用
+
+// ── LED（WROOM 只有板載 LED 一顆；C3 另有面板 LED，兩顆須同步驅動）──
+// 用 ledPins[]／ledPinCount 迴圈寫，而非寫死單一顆，理由與繼電器的 relayPins[] 一致：
+// 條件編譯只需改陣列內容，這兩個函式在兩種板子配置下都不用另外分支。
+void initLeds() {
+  for (int i = 0; i < ledPinCount; i++) {
+    pinMode(ledPins[i], OUTPUT);
+    digitalWrite(ledPins[i], LOW);
+  }
+}
+
+void setLeds(bool on) {
+  for (int i = 0; i < ledPinCount; i++) {
+    digitalWrite(ledPins[i], on ? HIGH : LOW);
+  }
+}
 
 // ── 繼電器 ──
 // 與 ho_relay2 相同的鐵則：initRelayPins() 必須是 setup() 第一行
@@ -666,8 +703,7 @@ void setup() {
   Serial.println("齁控 Master v" + String(firmwareVersion));
   Serial.println("================");
 
-  pinMode(ledOnBoard, OUTPUT);
-  digitalWrite(ledOnBoard, LOW);
+  initLeds();
   pinMode(bootButton, INPUT_PULLUP);
   pinMode(secondButton, INPUT_PULLUP);
   delay(50);  // 等內部提升電阻把腳位拉穩再取樣
@@ -713,7 +749,7 @@ void loop() {
 
   // ── 配對模式時 LED 慢閃 ──
   if (pairingMode) {
-    digitalWrite(ledOnBoard, ((now / 500) % 2) ? HIGH : LOW);
+    setLeds(((now / 500) % 2) ? true : false);
   }
 
   // 心跳固定 1 秒一次（HEARTBEAT_INTERVAL），配對模式不再另開一組等值計時器
