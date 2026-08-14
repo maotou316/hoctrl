@@ -60,6 +60,20 @@ SlaveEntry slaves[HO_ESPNOW_MAX_SLAVES];
 volatile int slaveCount = 0;
 Preferences prefs;
 
+// ── 網路設定（存 NVS 命名空間 hoban，與 slave 名冊的 homaster 分開）──
+// ho_relay2 用 EEPROM 128 bytes 且 mqttPassword 與 mqttPort 位址重疊，
+// 導致 MQTT 密碼實際只能 12 字元。改用 NVS 後各欄位獨立，長度依 MQTT 規格給足。
+char ssid[33] = "";           // WiFi SSID 上限 32 字元
+char password[65] = "";       // WPA2 PSK 上限 63 字元
+char mqttServer[64] = "";
+char mqttUsername[33] = "";
+char mqttPassword[65] = "";
+int  mqttPort = 1883;
+bool useCustomServer = false;
+bool hasRelay = false;        // master 硬體有沒有接繼電器（韌體無法自動偵測）
+
+Preferences netPrefs;         // 與 Phase 1 名冊用的 prefs 分開，避免鍵名衝突
+
 // 配對模式
 unsigned long pairingStartTime = 0;
 const unsigned long PAIRING_TIMEOUT = 60000;  // 60 秒
@@ -136,6 +150,52 @@ void pulseRelay(uint16_t ms) {
   pulseStartTime = millis();
   pulseDuration = ms;
   pulseActive = true;
+}
+
+// ── 網路設定的 NVS 存取 ──
+void loadNetConfig() {
+  netPrefs.begin("hoban", true);   // 唯讀
+  netPrefs.getString("ssid", ssid, sizeof(ssid));
+  netPrefs.getString("pass", password, sizeof(password));
+  netPrefs.getString("mqttsrv", mqttServer, sizeof(mqttServer));
+  netPrefs.getString("mqttuser", mqttUsername, sizeof(mqttUsername));
+  netPrefs.getString("mqttpass", mqttPassword, sizeof(mqttPassword));
+  mqttPort = netPrefs.getInt("mqttport", 1883);
+  useCustomServer = netPrefs.getBool("customsrv", false);
+  hasRelay = netPrefs.getBool("hasrelay", false);
+  netPrefs.end();
+
+  if (mqttPort <= 0 || mqttPort > 65535) mqttPort = 1883;
+
+  Serial.printf("[設定] SSID=%s 自訂伺服器=%s 繼電器=%s\n",
+                strlen(ssid) > 0 ? ssid : "(未設定)",
+                useCustomServer ? "是" : "否",
+                hasRelay ? "有" : "無");
+}
+
+void saveNetConfig() {
+  netPrefs.begin("hoban", false);
+  netPrefs.putString("ssid", ssid);
+  netPrefs.putString("pass", password);
+  netPrefs.putString("mqttsrv", mqttServer);
+  netPrefs.putString("mqttuser", mqttUsername);
+  netPrefs.putString("mqttpass", mqttPassword);
+  netPrefs.putInt("mqttport", mqttPort);
+  netPrefs.putBool("customsrv", useCustomServer);
+  netPrefs.putBool("hasrelay", hasRelay);
+  netPrefs.end();
+  Serial.println("[設定] 已儲存到 NVS");
+}
+
+void clearNetConfig() {
+  netPrefs.begin("hoban", false);
+  netPrefs.clear();
+  netPrefs.end();
+  Serial.println("[設定] NVS 網路設定已清除");
+}
+
+bool hasWifiConfig() {
+  return strlen(ssid) > 0;
 }
 
 // ── 設備 ID ──
@@ -710,6 +770,7 @@ void setup() {
 
   checkStuckButtons();  // 必須早於任何按鈕流程，卡住的腳會在此被排除
 
+  loadNetConfig();  // 載入網路設定，Task 2~7 會用到
   loadSlaves();     // 只讀 NVS，可以在 ESP-NOW 初始化之前
   setupEspNow();
   registerAllPeers();  // 必須在 esp_now_init() 之後，否則名冊上的 slave 全部送不出指令
