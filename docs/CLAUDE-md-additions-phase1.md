@@ -32,7 +32,7 @@ CRC 混入共享密鑰過濾誤觸發，不使用 ESP-NOW 原生加密（原生�
 
 ## 插入點 2：「### 編譯與上傳」章節的程式碼區塊之後
 
-```markdown
+````markdown
 本專案實際燒錄一律走 `flash.ps1`（見 `.claude/rules/vscode-arduino-toolchain.md`）：
 
 ```powershell
@@ -41,4 +41,4 @@ CRC 混入共享密鑰過濾誤觸發，不使用 ESP-NOW 原生加密（原生�
 .\flash.ps1 -Model slave -Upload      # hoSlave1
 .\flash.ps1 -Model test -Upload       # ESP-NOW 協定測試
 ```
-```
+````

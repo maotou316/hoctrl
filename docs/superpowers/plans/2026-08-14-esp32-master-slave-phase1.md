@@ -483,22 +483,33 @@ param(
     [Parameter(Mandatory = $true)][string]$Port,
     [string]$Expect = '',
     [int]$Seconds = 10,
-    [switch]$Reset   # 開始前先用 DTR 重置板子
+    [switch]$Reset   # 開始前用 RTS 脈衝硬體重啟板子，才抓得到 setup() 的開機輸出
 )
 
 $ErrorActionPreference = 'Stop'
 $cli = 'A:\server\arduino-cli\arduino-cli.exe'
 $logFile = Join-Path $env:TEMP "ho_serial_$(Get-Random).log"
 
+if (-not (Test-Path $cli)) {
+    Write-Host "找不到 arduino-cli：$cli" -ForegroundColor Red
+    exit 1
+}
+
+# 最終審查修正 8：原版只開關一次序列埠、完全沒碰 RTS，實際上是 no-op，
+# 抓不到開機輸出，而回歸清單有多項要看開機訊息。
+# ESP32 自動下載電路：DTR 驅動 GPIO 9(BOOT)、RTS 驅動 EN，
+# 因此硬體重啟要用 RTS 短暫拉高再放開，DTR 全程維持 false
+#（見 .claude/rules/button-pin-stuck-low.md）。
 if ($Reset) {
-    # 開關一次序列埠讓板子重新啟動，才能抓到 setup() 的輸出
     try {
         $sp = New-Object System.IO.Ports.SerialPort $Port, 115200
-        $sp.DtrEnable = $false
         $sp.Open()
-        Start-Sleep -Milliseconds 200
+        $sp.DtrEnable = $false
+        $sp.RtsEnable = $true    # 拉高 RTS → EN 拉低 → 板子進入 reset
+        Start-Sleep -Milliseconds 100
+        $sp.RtsEnable = $false   # 放開 → 板子重新啟動
         $sp.Close()
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 200
     } catch {
         Write-Host "重置序列埠失敗（可忽略）：$_" -ForegroundColor Yellow
     }
@@ -635,7 +646,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ## Task 2：Master 骨架與心跳廣播
 
-建立 master 韌體，初始化 ESP-NOW 並每 5 秒廣播一次心跳。
+建立 master 韌體，初始化 ESP-NOW 並每 1 秒廣播一次心跳（最終審查修正 3 前為 5 秒）。
 
 **Files:**
 - Create: `ho_master1/ho_master1.ino`
@@ -718,7 +729,9 @@ String deviceIdString;
 uint16_t txSeq = 0;
 
 const uint8_t BROADCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-const unsigned long HEARTBEAT_INTERVAL = 5000;
+// 最終審查修正 3：原為 5000，與 slave 的 SCAN_DWELL_MS 比例失衡，改為 1000。
+// 心跳間隔必須小於 slave 每個 channel 的停留時間（1200ms），輪掃一輪才保證命中。
+const unsigned long HEARTBEAT_INTERVAL = 1000;
 
 // ── 繼電器 ──
 // 與 ho_relay2 相同的鐵則：initRelayPins() 必須是 setup() 第一行
@@ -878,7 +891,8 @@ Run：
 ```
 
 Expected：開機訊息出現設備 ID 與 `ESP-NOW 就緒，channel=1`，
-之後每 5 秒一行 `[心跳] channel=1 配對模式=否 slave=0`，15 秒內至少 2 行。
+之後每 1 秒一行 `[心跳] channel=1 配對模式=否 slave=0`，15 秒內至少 10 行。
+（最終審查修正 3：心跳由 5 秒改為 1 秒。）
 
 **若出現 `[ESP-NOW] 送出失敗`**：檢查廣播 peer 有沒有加成功。
 廣播封包不會有 ACK，正常情況下 `status` 一律回 `ESP_NOW_SEND_SUCCESS`。
@@ -890,7 +904,7 @@ git add ho_master1/
 git commit -m "新增 Master 韌體骨架與 ESP-NOW 心跳廣播
 
 - ESP-NOW 初始化、廣播 peer 註冊、收送 callback
-- 每 5 秒廣播一次心跳，帶出目前 channel 與配對模式狀態
+- 每 1 秒廣播一次心跳，帶出目前 channel 與配對模式狀態（最終審查修正 3 前為 5 秒）
 - 沿用 ho_relay1 的 WROOM GPIO 定義，保留繼電器驅動（硬體可接可不接）
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
@@ -981,7 +995,8 @@ uint16_t txSeq = 0;
 bool scanning = false;
 uint8_t scanChannel = 1;
 unsigned long scanChannelStart = 0;
-const unsigned long SCAN_DWELL_MS = 600;      // 每個 channel 停留時間
+// 最終審查修正 3：原為 600（小於 master 心跳間隔），改為 1200 以保證一輪內命中
+const unsigned long SCAN_DWELL_MS = 1200;     // 每個 channel 停留時間
 const unsigned long HEARTBEAT_TIMEOUT = 30000; // 超過這麼久沒心跳就重掃
 
 const uint8_t BROADCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -1219,7 +1234,7 @@ ESP-NOW 就緒
 [channel] 切換到 2
 ...
 ```
-12 秒內應看到 channel 從 1 數到 13 再繞回 1（每個 600ms，一輪約 7.8 秒）。
+20 秒內應看到 channel 從 1 數到 13 再繞回 1（每個 1200ms，一輪 15.6 秒；最終審查修正 3 前為 600ms／7.8 秒）。
 
 - [ ] **Step 5: 兩片板子端到端驗證鎖定**
 
@@ -1235,7 +1250,7 @@ Expected：slave 輪掃到 master 所在的 channel 時收到心跳，輸出：
 [心跳] 來自 hoban-<masterMac> channel=1 配對模式=否 rssi=-42
 [鎖定] master=hoban-<masterMac> channel=1
 ```
-之後每 5 秒一行心跳，不再出現 `[channel] 切換到`。
+之後每 1 秒一行心跳，不再出現 `[channel] 切換到`。
 
 **若一直掃不到**：確認兩片板子的 `HO_ESPNOW_SHARED_KEY` 一致（都來自同一份 library），
 以及 master 確實在發心跳（另開一個視窗看 master 的序列埠）。
@@ -1251,7 +1266,7 @@ git commit -m "新增 Slave 韌體骨架與 channel 掃描鎖定
 
 - 沿用 ho_relay2 的雙 OTA 分區表，為 Phase 4 的轉送 OTA 預留空間
 - 不連 WiFi，只跑 ESP-NOW，EEPROM 只用 32 bytes 存 master MAC 與 channel
-- 找不到 master 時輪掃 channel 1~13，每個停留 600ms
+- 找不到 master 時輪掃 channel 1~13，每個停留 1200ms（最終審查修正 3 前為 600ms）
 - 收到心跳即鎖定 channel，超過 30 秒沒心跳自動重新掃描
 - 沿用 ho_relay2 的 GPIO 與繼電器安全初始化順序
 
@@ -1460,7 +1475,25 @@ void exitPairingMode() {
 
 - [ ] **Step 3: Master 加入按鈕與配對逾時**
 
-在 `setup()` 的 `setupEspNow();` 之前插入 `loadSlaves();`，
+在 `setup()` 的 `setupEspNow();` 之前插入 `loadSlaves();`（只讀 NVS，可早於 ESP-NOW init），
+並在 `setupEspNow();` **之後**插入 `registerAllPeers();`。
+
+> **最終審查修正 2（合併阻斷級）**：原版只在 `addSlave()` 與 PAIR_REQ 處理時呼叫
+> `registerPeer()`，兩者都只發生在配對當下。ESP-NOW 的 peer 表只存在 RAM，
+> master 重開機後 `loadSlaves()` 雖然還原了 MAC，卻沒有任何地方重新註冊 peer，
+> 導致 `esp_now_send()` 回 `ESP_ERR_ESPNOW_NOT_FOUND`、所有指令失敗且不會自我修復。
+> 更嚴重的是 slave 仍收得到廣播心跳，其「30 秒失聯強制關閉繼電器」的保護永遠不會觸發。
+>
+> ```cpp
+> void registerAllPeers() {
+>   int okCount = 0;
+>   for (int i = 0; i < slaveCount; i++) {
+>     if (registerPeer(slaves[i].mac)) okCount++;
+>   }
+>   Serial.printf("[名冊] 已重新註冊 %d／%d 台為 ESP-NOW peer\n", okCount, slaveCount);
+> }
+> ```
+
 並把 `sendHeartbeat()` 裡的 `hb.slaveCount = 0;` 改成：
 
 ```cpp
@@ -1498,13 +1531,11 @@ void exitPairingMode() {
     digitalWrite(ledOnBoard, ((now / 500) % 2) ? HIGH : LOW);
   }
 
-  // ── 配對模式時心跳加快到 1 秒，讓 slave 更快找到 ──
-  static unsigned long lastPairingHeartbeat = 0;
-  if (pairingMode && now - lastPairingHeartbeat >= 1000) {
-    lastPairingHeartbeat = now;
-    sendHeartbeat();
-  }
 ```
+
+> **最終審查修正 3**：原本這裡還有一段「配對模式時心跳加快到 1 秒」的獨立計時器
+> （`lastPairingHeartbeat`）。`HEARTBEAT_INTERVAL` 已改為 1000ms，兩者等值，
+> 留著只是兩個做同一件事的計時器，故整段刪除。
 
 - [ ] **Step 4: Slave 送出配對請求並處理 ACK**
 
@@ -1519,17 +1550,22 @@ bool masterInPairingMode = false;   // 從心跳得知 master 是否在配對模
 
 在 `onMasterFound()` 之後加入：
 
+> **最終審查修正 5**：原版是阻塞式 `blinkLed(int times, int intervalMs)`，
+> 直接被 ESP-NOW recv callback 呼叫（最長 3×400×2 = 2400ms 的 `delay()`）。
+> ESP-IDF 明文要求 recv callback 在 WiFi task 執行、不可做冗長操作，
+> 會丟封包、最壞觸發 task watchdog reset。已改成 callback 只登記旗標、
+> loop() 用 millis 非阻塞推進。實作見 `ho_slave1.ino` 的
+> `requestBlink()` / `cancelBlink()` / `updateBlink()`，
+> 長按重置流程進入閃爍時會先呼叫 `cancelBlink()` 讓出 LED，閃爍結束則還原成繼電器狀態。
+
 ```cpp
-// LED 快閃指定次數（阻塞，只在配對結果時用）
-void blinkLed(int times, int intervalMs) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(ledOnFace, HIGH);
-    digitalWrite(ledOnBoard, HIGH);
-    delay(intervalMs);
-    digitalWrite(ledOnFace, LOW);
-    digitalWrite(ledOnBoard, LOW);
-    delay(intervalMs);
-  }
+// 非阻塞閃爍：callback 只登記，loop() 執行
+volatile uint8_t blinkRequestTimes = 0;
+volatile uint16_t blinkRequestInterval = 0;
+
+void requestBlink(uint8_t times, uint16_t intervalMs) {
+  blinkRequestInterval = intervalMs;
+  blinkRequestTimes = times;   // 次數最後寫，確保 loop() 讀到時間隔已就緒
 }
 
 void requestPairing() {
@@ -1563,6 +1599,13 @@ void requestPairing() {
 
 ```cpp
   if (header.type == HO_PKT_PAIR_ACK && payloadLen >= sizeof(HoPairAckPayload)) {
+    // 最終審查修正 7：沒有主動送出配對請求就收到 PAIR_ACK 一律忽略，
+    // 否則任何持有共享密鑰的設備主動送一個 PAIR_ACK 就能劫持已配對的 slave
+    if (!waitingPairAck) {
+      Serial.println("[配對] 收到非預期的 PAIR_ACK，忽略");
+      return;
+    }
+
     HoPairAckPayload ack;
     memcpy(&ack, payload, sizeof(ack));
     waitingPairAck = false;
@@ -1576,13 +1619,13 @@ void requestPairing() {
       char id[20];
       hoFormatDeviceId(masterMac, id);
       Serial.printf("[配對] 成功，master=%s channel=%u\n", id, ack.channel);
-      blinkLed(3, 100);   // 快閃 3 下表示成功
+      requestBlink(3, 100);   // 快閃 3 下表示成功（最終審查修正 5：改為非阻塞）
     } else {
       const char* why = (ack.reason == HO_PAIR_FULL) ? "master 已達 20 台上限"
                       : (ack.reason == HO_PAIR_NOT_PAIRING) ? "master 不在配對模式"
                       : "未知原因";
       Serial.printf("[配對] 被拒絕：%s\n", why);
-      blinkLed(3, 400);   // 慢閃 3 下表示失敗
+      requestBlink(3, 400);   // 慢閃 3 下表示失敗（最終審查修正 5：改為非阻塞）
     }
     return;
   }
@@ -1687,7 +1730,7 @@ git add ho_master1/ ho_slave1/
 git commit -m "實作 ESP-NOW 配對流程與名冊持久化
 
 - Master：短按 BOOT 進入配對模式 60 秒，名冊存 NVS，上限 20 台
-- Master：配對模式下心跳加快到 1 秒、LED 慢閃
+- Master：配對模式下 LED 慢閃（心跳原本在此加快到 1 秒，最終審查修正 3 後全時段皆為 1 秒）
 - Slave：短按 BOOT 送出配對請求，成功存 EEPROM 並快閃 3 下
 - 拒絕情境：master 不在配對模式、名冊已滿，各有對應的 LED 與訊息
 
@@ -2267,7 +2310,7 @@ Slave Expected：
 ...
 ```
 
-Master 復電後 Expected：slave 在一輪掃描內（約 8 秒）重新鎖定：
+Master 復電後 Expected：slave 在一輪掃描內（最多約 15.6 秒）重新鎖定：
 ```
 [心跳] 來自 hoban-<masterMac> channel=1 ...
 ```
@@ -2287,7 +2330,9 @@ Phase 1 的 master 不連 WiFi，channel 固定為 1，無法自然改變。
       esp_wifi_set_channel((uint8_t)arg, WIFI_SECOND_CHAN_NONE);
       currentChannel = (uint8_t)arg;
       Serial.printf("[channel] master 切換到 %d\n", arg);
-      sendHeartbeat();
+      // 最終審查修正 3：設計規格要求 channel 改變時立刻多發幾次心跳，
+      // 原本只發一次。sendHeartbeatBurst() 連發 4 次、間隔 200ms。
+      sendHeartbeatBurst();
     } else {
       Serial.println("channel 需在 1~13 之間");
     }
@@ -2314,7 +2359,15 @@ Slave Expected（30 秒失聯逾時後）：
 之後 slave 斷電再上電，應直接鎖定 channel 6 不掃描（EEPROM 已更新）。
 
 **這一項是整個 Phase 1 風險最高的驗證，務必實測通過。**
-恢復時間應在 40 秒內（30 秒逾時 + 最多 8 秒掃描一輪）。
+
+最終審查修正 3 後的恢復時間：30 秒失聯門檻 + 最多一輪掃描 15.6 秒
+（13 × `SCAN_DWELL_MS` 1200ms）＝ **最壞約 46 秒、典型約 38 秒**。
+因 dwell（1200ms）大於心跳間隔（1000ms），掃到正確 channel 時必定涵蓋一次心跳，
+一輪內保證命中。另外 `ch <n>` 指令改為呼叫 `sendHeartbeatBurst()`，
+切換 channel 當下連發 4 次心跳（間隔 200ms），讓恰好已停在新 channel 的 slave 立刻命中。
+
+（原文寫「40 秒內（30 秒逾時 + 最多 8 秒掃描一輪）」，是舊參數下的嚴重低估：
+dwell 600ms 小於心跳 5000ms，命中率只有約 7.7%，期望要十幾次心跳、約 65 秒才鎖得回來。）
 
 - [ ] **Step 7: Commit**
 
@@ -2368,6 +2421,17 @@ bool resetBlinking = false;
 
 ```cpp
 void clearPairing() {
+  // 最終審查修正 4：先通知 master 解除配對，再清 EEPROM。
+  // HO_PKT_UNPAIR 是雙向協定，master 端早已實作接收處理（移除名冊 + esp_now_del_peer），
+  // 但 slave 從不送出，那段等於死程式碼；名冊與 peer 表會永久留下無法自動移除的殘留項目。
+  if (masterKnown) {
+    uint8_t buf[250];
+    size_t total = hoPackPacket(buf, sizeof(buf), HO_PKT_UNPAIR, txSeq++, nullptr, 0);
+    esp_now_send(masterMac, buf, total);
+    delay(100);   // 給封包送出的時間
+    Serial.println("[配對] 已通知 master 解除配對");
+  }
+
   EEPROM.begin(EEPROM_SIZE);
   for (int i = 0; i < EEPROM_SIZE; i++) EEPROM.write(i, 0);
   EEPROM.commit();
@@ -2377,6 +2441,18 @@ void clearPairing() {
 }
 ```
 
+> **最終審查修正 1（合併阻斷級）**：`ho_slave1` 沿用 hoRelay2 的完全相同硬體與 GPIO
+> （BOOT 9、RESET 1，兩顆都 `INPUT_PULLUP`），一旦某支腳短路或走線接地而恆為 LOW，
+> 上面這套長按流程會在開機當下就被判定成「使用者按住」，約 7.7 秒後清空配對並重啟，
+> 無限循環且不可自救（未配對的 slave 更是永遠沒機會被配對）。
+> 已從 `ho_relay2.ino` 移植 `checkStuckButtons()` 與 `anyResetButtonPressed()`，
+> 常數為 `BTN_SELFTEST_DURATION` 500ms／`BTN_SELFTEST_INTERVAL` 50ms，
+> 旗標為 `bootButtonUsable` / `resetButtonUsable`。
+> 呼叫點在 `setup()` 的 `pinMode(resetButton, INPUT_PULLUP)` 之後、`loadPairing()` 之前，
+> **絕不能早於 `initRelayPins()`**（繼電器安全鐵則）。
+> `ho_master1.ino` 同樣補上（BOOT 0 / 第二按鈕 14），為 Phase 2 的重置功能預先防呆。
+> 詳見 `.claude/rules/button-pin-stuck-low.md`。
+
 把 `loop()` 裡 Task 4 Step 5 加入的「短按 BOOT 送出配對請求」整塊刪掉
 （從 `static bool lastButtonState = HIGH;` 到 `lastButtonState = buttonState;`，
 連同上面的註釋），換成下面同時處理短按與長按的版本。
@@ -2384,10 +2460,9 @@ void clearPairing() {
 
 ```cpp
   // ── 按鈕：短按配對，長按重置 ──
-  // 兩顆按鈕任一顆都可以，與 ho_relay2 一致
-  bool bootState = digitalRead(bootButton);
-  bool resetState = digitalRead(resetButton);
-  bool anyPressed = (bootState == LOW || resetState == LOW);
+  // 兩顆按鈕任一顆都可以，與 ho_relay2 一致；
+  // 最終審查修正 1：改走 anyResetButtonPressed()，開機自檢判定卡在 LOW 的腳會被排除
+  bool anyPressed = anyResetButtonPressed();
 
   static bool lastAnyPressed = false;
 
@@ -2401,6 +2476,7 @@ void clearPairing() {
     if (!resetBlinking && pressDuration >= LONG_PRESS_TIME) {
       resetBlinking = true;
       resetBlinkStart = now;
+      cancelBlink();   // 最終審查修正 5：重置閃爍要接手 LED，先取消配對結果的閃爍
       Serial.println("長按 3 秒達成，繼續按住 2 秒清除配對…");
     }
 
@@ -2466,7 +2542,8 @@ Expected：
 
 - 開發板：ESP32 WROOM DevKit
 - GPIO：BOOT 按鈕 0、第二按鈕 14、板載 LED 2、繼電器 13
-- 繼電器為**選配**：接了就能用 `on`/`off` 控制，沒接則指令空跑
+- 繼電器為**選配**：只有 `allon` / `alloff` / `allpulse` 會驅動 master 自己的繼電器，沒接則這段空跑。
+  `on <n>` / `off <n>` / `pulse <n>` 控制的是第 n 台 **slave**（最終審查修正 6：原文寫錯）
 
 ## 角色
 
@@ -2489,7 +2566,7 @@ Phase 2 會接上 WiFi + MQTT，成為 App 與所有 slave 之間的唯一對外
 
 ## 配對
 
-短按 BOOT 進入配對模式 60 秒，LED 慢閃，心跳加快到 1 秒。
+短按 BOOT 進入配對模式 60 秒，LED 慢閃（心跳固定 1 秒一次，不分是否在配對模式）。
 此時短按 slave 的按鈕即可加入。上限 20 台。
 
 名冊存在 NVS（`Preferences`，命名空間 `homaster`），斷電不遺失。
@@ -2536,10 +2613,13 @@ BOOT 9、RESET 1、板載 LED 3、面板 LED 0、繼電器 4 與 7（兩支同�
 Slave 不連 WiFi，無從得知 master 在哪個 channel，靠三層機制解決：
 
 1. 配對時把 master 的 channel 存進 EEPROM，開機直接切過去
-2. Master 每 5 秒廣播心跳（配對模式時 1 秒），帶出目前 channel
-3. 超過 30 秒沒收到心跳，輪掃 channel 1~13（每個停 600ms，一輪約 8 秒）
+2. Master 每 1 秒廣播心跳，帶出目前 channel；channel 改變當下另外連發 4 次（間隔 200ms）
+3. 超過 30 秒沒收到心跳，輪掃 channel 1~13（每個停 1200ms，一輪 15.6 秒）
 
-Master 換路由器導致 channel 改變時，恢復時間約 40 秒。
+dwell（1200ms）必須大於心跳間隔（1000ms），一輪之內才保證命中。
+
+Master 換路由器導致 channel 改變時，恢復時間最壞約 46 秒、典型約 38 秒。
+（最終審查修正 3；原文的「每停 600ms、一輪約 8 秒、恢復約 40 秒」是舊參數下的嚴重低估。）
 
 ## 安全預設
 
@@ -2616,7 +2696,7 @@ CRC 混入共享密鑰過濾誤觸發，不使用 ESP-NOW 原生加密（原生�
 
 接著人工驗證這份清單，每項打勾：
 
-- [ ] Master 開機每 5 秒發一次心跳
+- [ ] Master 開機每 1 秒發一次心跳
 - [ ] Slave 首次開機進入輪掃，找到 master 後鎖定
 - [ ] 短按 master → 短按 slave → 配對成功，slave LED 快閃 3 下
 - [ ] 兩邊斷電再上電，配對記錄都還在，slave 不需重新掃描
@@ -2626,7 +2706,7 @@ CRC 混入共享密鑰過濾誤觸發，不使用 ESP-NOW 原生加密（原生�
 - [ ] `allpulse` 讓所有 slave 與 master 自己同時動作
 - [ ] Slave 斷電 40 秒後 master 標記離線，復電後自動恢復在線
 - [ ] Master 斷電 40 秒後 slave 開始輪掃，復電後自動找回
-- [ ] `ch 6` 切換 channel 後，slave 在 40 秒內重新鎖定到 channel 6
+- [ ] `ch 6` 切換 channel 後，slave 最壞約 46 秒內重新鎖定到 channel 6
 - [ ] Slave 長按 5 秒清除配對，重啟後回到未配對狀態
 - [ ] Slave 長按中途放開會取消，配對記錄保留
 - [ ] `unpair 0` 後 slave 重啟並回到未配對狀態，master 名冊剩 0 台

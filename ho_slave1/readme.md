@@ -22,15 +22,33 @@ BOOT 9、RESET 1、板載 LED 3、面板 LED 0、繼電器 4 與 7（兩支同�
 
 兩顆按鈕（BOOT／RESET）任一顆都可以。
 
+清除配對時會先送一個 `HO_PKT_UNPAIR` 通知 master，master 收到後會從名冊移除並刪除 peer，
+避免名冊留下永遠離線又無法自動移除的殘留項目。
+
+### 按鈕自檢
+
+開機時取樣兩支按鈕腳 500ms，整段都是 LOW 的腳判定為短路／未接，本次開機停用其按鈕功能
+（`checkStuckButtons()`）。這是為了擋掉「開機即清除配對 → 重啟 → 再清除」的無限迴圈 ——
+2026-08 在同硬體的 hoRelay2 上實際發生過。副作用是「按住按鈕再上電」會被擋掉，
+放開後重新上電即恢復。詳見 `.claude/rules/button-pin-stuck-low.md`。
+
 ## Channel 同步
 
 Slave 不連 WiFi，無從得知 master 在哪個 channel，靠三層機制解決：
 
 1. 配對時把 master 的 channel 存進 EEPROM，開機直接切過去
-2. Master 每 5 秒廣播心跳（配對模式時 1 秒），帶出目前 channel
-3. 超過 30 秒沒收到心跳，輪掃 channel 1~13（每個停 600ms，一輪約 8 秒）
+2. Master 每 1 秒廣播心跳（`HEARTBEAT_INTERVAL`），帶出目前 channel；
+   channel 改變的當下另外連發 4 次（間隔 200ms）
+3. 超過 30 秒沒收到心跳（`HEARTBEAT_TIMEOUT`），輪掃 channel 1~13
+   （每個停 1200ms＝`SCAN_DWELL_MS`，一輪 15.6 秒）
 
-Master 換路由器導致 channel 改變時，恢復時間約 40 秒。
+**dwell（1200ms）必須大於心跳間隔（1000ms）**，這樣只要 master 就在某個 channel，
+掃到它時的停留期間必定涵蓋至少一次心跳，一輪之內保證鎖定，不是碰運氣。
+（舊值 dwell 600ms 搭配心跳 5000ms 剛好相反，命中率只有約 7.7%，
+期望要十幾次心跳、約一分鐘才鎖得回來，且沒有上界。）
+
+Master 換路由器導致 channel 改變時的恢復時間：
+30 秒失聯門檻 + 最多一輪掃描 15.6 秒 = **最壞約 46 秒，典型約 38 秒**。
 
 ## 安全預設
 

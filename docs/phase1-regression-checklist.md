@@ -29,10 +29,10 @@
 
 ## 人工驗證清單（14 項）
 
-### 1. Master 開機每 5 秒發一次心跳
+### 1. Master 開機每 1 秒發一次心跳
 
 - 操作：master 開機後不做任何事，觀察 master 序列埠。
-- 預期：每隔約 5 秒印一行
+- 預期：每隔約 1 秒印一行（`HEARTBEAT_INTERVAL` = 1000ms，配對模式與否都一樣）
   ```
   [心跳] channel=<目前 channel> 配對模式=否 slave=<目前台數>
   ```
@@ -43,6 +43,7 @@
 - 操作：slave 用 `-Upload`（不帶 `-KeepConfig`）燒錄後開機，此時 EEPROM 是乾淨的。
 - 預期：slave 序列埠依序印
   ```
+  按鈕自檢: 正常
   EEPROM 無配對記錄
   ...
   [掃描] 開始輪掃 channel 1~13 尋找 master
@@ -70,7 +71,9 @@
 - 操作：master、slave 都拔電重插（master 名冊存 NVS、slave 存 EEPROM，兩者都不會因斷電遺失）。
 - 預期：slave 開機印 `已配對 master: hoban-xxxxxxxxxxxx，上次 channel=<N>`，
   接著直接鎖定該 channel（不會印「開始輪掃」），很快收到心跳並印 `[鎖定]`；
-  master 開機後 `list` 應直接看到剛才配對的 slave。
+  master 開機後應印 `[名冊] 已重新註冊 <N>／<N> 台為 ESP-NOW peer`，
+  `list` 應直接看到剛才配對的 slave，且**重開機後 `on 0` / `off 0` / `pulse 0` 仍能正常控制**
+  （ESP-NOW peer 表只存在 RAM，若沒有重新註冊，指令會全部失敗且永不自我修復）。
 - [ ] 通過
 
 ### 5. `list` 顯示 slave 在線
@@ -111,8 +114,10 @@
 - 操作：拔掉 slave 電源，等 40 秒（master 判離線門檻 `SLAVE_OFFLINE_TIMEOUT` 是 30 秒，
   40 秒留餘裕確保跨過門檻），觀察 master 序列埠；再重新供電。
 - 預期：master 印 `[離線] hoban-xxxxxxxxxxxx 超過 30 秒沒回應`；
-  slave 復電並重新鎖定 master 後，master 下次收到該 slave 的心跳／狀態回報即自動恢復 `online`，
-  `list` 顯示回 `online`。
+  slave 復電並重新鎖定 master 後，master 下一次輪詢（`pollNextSlave()` 發出 `HO_PKT_STATE_REQ`）
+  收到該 slave 的狀態回報即自動恢復在線，`list` 顯示回 `在線`。
+  （注意：slave 端**不會主動送心跳**，只在收到 `HO_PKT_STATE_REQ` 或執行完指令時才回報狀態，
+  所以恢復在線是靠 master 主動輪詢，不是靠 slave 自己上報。）
 - [ ] 通過
 
 ### 10. Master 斷電 40 秒後 slave 開始輪掃，復電後自動找回
@@ -121,16 +126,20 @@
   觀察 slave 序列埠；再重新供電。
 - 預期：slave 印 `[失聯] 超過 30 秒沒收到心跳`，接著印 `[安全] 失去 master，繼電器已關閉`
   （若當時繼電器是通電狀態）與 `[掃描] 開始輪掃 channel 1~13 尋找 master`；
-  master 復電後 slave 應在一輪掃描內（約 8 秒）收到心跳並印 `[鎖定]`。
+  master 復電後 slave 應在**一輪掃描內（最多約 15.6 秒＝13 × `SCAN_DWELL_MS` 1200ms）**
+  收到心跳並印 `[鎖定]`。因 dwell（1200ms）大於心跳間隔（1000ms），
+  掃到正確 channel 時必定涵蓋至少一次心跳，一輪內保證命中。
 - [ ] 通過
 
-### 11. `ch 6` 切換 channel 後，slave 在 40 秒內重新鎖定到 channel 6
+### 11. `ch 6` 切換 channel 後，slave 最壞約 46 秒內重新鎖定到 channel 6
 
 - 操作：master 輸入 `ch 6`。
-- 預期：master 印 `[channel] master 切換到 6`；slave 因超過 30 秒沒收到心跳（頻道已變）
+- 預期：master 印 `[channel] master 切換到 6`，並**連續印 4 行 `[心跳] channel=6 …`**
+  （間隔 200ms，`sendHeartbeatBurst()`）；slave 因超過 30 秒沒收到心跳（頻道已變）
   進入輪掃，印 `[失聯]` 與 `[掃描]`，掃到 channel 6 時收到心跳並印
-  `[鎖定] master=hoban-xxxxxxxxxxxx channel=6`，整體應在 40 秒內完成
-  （對應 `ho_slave1/readme.md` 所述「Master 換路由器導致 channel 改變時，恢復時間約 40 秒」）。
+  `[鎖定] master=hoban-xxxxxxxxxxxx channel=6`。
+  整體時間 = 30 秒失聯門檻 + 最多一輪掃描 15.6 秒，**最壞約 46 秒、典型約 38 秒**
+  （對應 `ho_slave1/readme.md` 的「Channel 同步」章節）。
 - [ ] 通過
 
 ### 12. Slave 長按 5 秒清除配對，重啟後回到未配對狀態
@@ -139,8 +148,10 @@
 - 預期：
   - 第 3 秒：LED 開始以 250ms 週期閃爍，序列埠印 `長按 3 秒達成，繼續按住 2 秒清除配對…`
   - 再過 2 秒（總計約第 5 秒）：LED 長亮 0.7 秒，序列埠依序印
-    `確認清除配對`、`配對記錄已清除，重新啟動中…`
+    `確認清除配對`、`[配對] 已通知 master 解除配對`、`配對記錄已清除，重新啟動中…`
   - 重啟後印 `EEPROM 無配對記錄` 並開始輪掃
+  - **master 端**應印 `[配對] hoban-xxxxxxxxxxxx 已解除配對，剩 <N-1> 台`，
+    `list` 不再顯示該台（slave 主動送出 `HO_PKT_UNPAIR`，避免名冊留下無法自動移除的殘留）
 - [ ] 通過
 
 ### 13. Slave 長按中途放開會取消，配對記錄保留

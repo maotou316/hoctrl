@@ -10,22 +10,34 @@ param(
     [Parameter(Mandatory = $true)][string]$Port,
     [string]$Expect = '',
     [int]$Seconds = 10,
-    [switch]$Reset   # 開始前先用 DTR 重置板子
+    [switch]$Reset   # 開始前用 RTS 脈衝硬體重啟板子，才抓得到 setup() 的開機輸出
 )
 
 $ErrorActionPreference = 'Stop'
 $cli = 'A:\server\arduino-cli\arduino-cli.exe'
 $logFile = Join-Path $env:TEMP "ho_serial_$(Get-Random).log"
 
+if (-not (Test-Path $cli)) {
+    Write-Host "找不到 arduino-cli：$cli" -ForegroundColor Red
+    exit 1
+}
+
 if ($Reset) {
-    # 開關一次序列埠讓板子重新啟動，才能抓到 setup() 的輸出
+    # ESP32 自動下載電路：DTR 驅動 GPIO 9(BOOT)、RTS 驅動 EN。
+    # 因此硬體重啟要用 RTS 短暫拉高（EN 拉低 → 進 reset）再放開，
+    # 而 DTR 必須全程維持 false，否則會把 GPIO 9 拉低：板子會改進 UART 下載模式，
+    # 且與「按鈕腳位卡在 LOW」的症狀無法區分（見 .claude/rules/button-pin-stuck-low.md）。
+    # 舊版只開關一次序列埠、完全沒碰 RTS，實際上是 no-op，抓不到開機輸出。
     try {
         $sp = New-Object System.IO.Ports.SerialPort $Port, 115200
-        $sp.DtrEnable = $false
         $sp.Open()
-        Start-Sleep -Milliseconds 200
+        $sp.DtrEnable = $false
+        $sp.RtsEnable = $true    # 拉高 RTS → EN 拉低 → 板子進入 reset
+        Start-Sleep -Milliseconds 100
+        $sp.RtsEnable = $false   # 放開 → 板子重新啟動
         $sp.Close()
-        Start-Sleep -Milliseconds 500
+        # 只等到序列埠釋放即可，太久會錯過開機訊息
+        Start-Sleep -Milliseconds 200
     } catch {
         Write-Host "重置序列埠失敗（可忽略）：$_" -ForegroundColor Yellow
     }
