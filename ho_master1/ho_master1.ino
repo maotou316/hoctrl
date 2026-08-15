@@ -67,6 +67,17 @@ struct SlaveEntry {
   bool online;
   int8_t rssi;
   unsigned long lastSeen;
+  // ── Phase 2b 新增：代發 slave 狀態需要的欄位 ──
+  // 這些值由 onEspNowRecv() 收到 HO_PKT_STATE 時填入（WiFi task context），
+  // 由 loop() 讀取來組 JSON。跨 context 但都是單一 byte 的存取，
+  // 讀到新舊混合的一組值最多讓某一輪代發的資料稍舊，下一輪就會更正，
+  // 不會造成錯誤動作，因此沿用 Phase 1 對 slaves[] 的既有做法不加鎖。
+  uint8_t relay;      // 0 / 1
+  uint8_t fwMajor;
+  uint8_t fwMinor;
+  uint8_t fwPatch;
+  // 有變化就代發，不必等輪播輪到它（見 Task 3 的排程器）
+  bool dirty;
 };
 
 SlaveEntry slaves[HO_ESPNOW_MAX_SLAVES];
@@ -193,8 +204,8 @@ const size_t SLAVES_KEY_OVERHEAD = 11;
 const size_t STATUS_BUF_SIZE = 3072;
 
 // PubSubClient 的 buffer 要放得下「固定標頭(最多 5) + topic 長度欄位(2) + topic + payload」。
-// topic 最長是 "hoban/hoban-a0b1c2d3e4f5/status" = 32 bytes。
-// 3072 + 5 + 2 + 32 = 3111，取 3328 留餘裕。
+// topic 最長是 "hoban/hoban-a0b1c2d3e4f5/status" = 31 bytes。
+// 3072 + 5 + 2 + 31 = 3110，取 3328 留餘裕。
 const size_t MQTT_BUFFER_SIZE = 3328;
 
 // 編譯期保證：statusBuf 一定放得下 HO_ESPNOW_MAX_SLAVES 台的完整陣列。
@@ -421,7 +432,7 @@ class MyCallbacks : public BLECharacteristicCallbacks {
     DeserializationError err = deserializeJson(doc, buffer);
 
     if (err || !doc.containsKey("wifi")) {
-      StaticJsonDocument<200> res;
+      JsonDocument res;
       res["status"] = "error";
       res["message"] = "無效的JSON格式";
       char resBuf[200];
@@ -440,7 +451,7 @@ class MyCallbacks : public BLECharacteristicCallbacks {
     int newMqttPort = doc["wifi"]["mqtt_port"] | 1883;            // 選用，預設 1883
 
     if (!newSsid || !newPassword || !newMqttServer) {
-      StaticJsonDocument<200> res;
+      JsonDocument res;
       res["status"] = "error";
       res["message"] = "SSID、密碼或伺服器格式錯誤";
       char resBuf[200];
@@ -475,7 +486,7 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 
     saveNetConfig();
 
-    StaticJsonDocument<350> res;
+    JsonDocument res;
     res["status"] = "success";
     res["message"] = "WiFi 和 MQTT 設定已儲存";
     res["data"]["device_id"] = getDeviceId();
@@ -862,6 +873,9 @@ void loadSlaves() {
         slaves[i].online = false;
         slaves[i].rssi = 0;
         slaves[i].lastSeen = 0;
+        slaves[i].relay = 0;
+        slaves[i].fwMajor = slaves[i].fwMinor = slaves[i].fwPatch = 0;
+        slaves[i].dirty = false;
       }
     }
   }
@@ -921,6 +935,9 @@ bool addSlave(const uint8_t mac[6]) {
   slaves[slaveCount].online = true;
   slaves[slaveCount].rssi = 0;
   slaves[slaveCount].lastSeen = millis();
+  slaves[slaveCount].relay = 0;
+  slaves[slaveCount].fwMajor = slaves[slaveCount].fwMinor = slaves[slaveCount].fwPatch = 0;
+  slaves[slaveCount].dirty = true;   // 新加入的直接代發一次，不必等輪播輪到它
   slaveCount++;
 
   registerPeer(mac);
@@ -1016,11 +1033,13 @@ void updateSlaveOnlineStatus() {
     bool wasOnline = slaves[i].online;
     bool isOnline = slaves[i].lastSeen > 0 &&
                     (now - slaves[i].lastSeen) < SLAVE_OFFLINE_TIMEOUT;
-    if (wasOnline && !isOnline) {
+    if (wasOnline != isOnline) {
       char id[20];
       hoFormatDeviceId(slaves[i].mac, id);
-      Serial.printf("[離線] %s 超過 %lu 秒沒回應\n",
-                    id, SLAVE_OFFLINE_TIMEOUT / 1000);
+      Serial.printf("[%s] %s（超過 %lu 秒沒回應即判離線）\n",
+                    isOnline ? "上線" : "離線", id, SLAVE_OFFLINE_TIMEOUT / 1000);
+      // 上下線翻轉一定要立刻代發，否則 App 最壞要等一整輪輪播才看到
+      slaves[i].dirty = true;
     }
     slaves[i].online = isOnline;
   }
@@ -1061,6 +1080,53 @@ void printSlaveList() {
   }
 }
 
+// slave 版本號 → "1.0.0"。out 至少 16 bytes。
+// 尚未回報過狀態的 slave（fwMajor/Minor/Patch 都是 0）填 "0.0.0"，
+// 不留空字串 —— App 端的解析比較單純，寧可給一個明確的無效值。
+void formatSlaveVersion(int idx, char* out, size_t outSize) {
+  snprintf(out, outSize, "%u.%u.%u",
+           slaves[idx].fwMajor, slaves[idx].fwMinor, slaves[idx].fwPatch);
+}
+
+// 把 slaves 陣列加進 master 的狀態 doc。
+// 條目數量以 Task 1 的容量常數推算的上界為準；照現行數值（3072/512/96）
+// maxEntries = 26 ≥ HO_ESPNOW_MAX_SLAVES = 20，這條截斷路徑永遠走不到，
+// 且已有 static_assert 在編譯期擋住「有人把 statusBuf 改小」。
+// 保留執行期截斷的意義是：萬一真的走到，App 看得到 slaves_truncated、
+// 序列埠也會告警，而不是靜默給出一份不完整的清單。
+void appendSlavesArray(JsonDocument& doc) {
+  const int maxEntries =
+      (int)((STATUS_BUF_SIZE - 1 - STATUS_BASE_MAX_BYTES - SLAVES_KEY_OVERHEAD)
+            / SLAVE_ENTRY_MAX_BYTES);
+
+  int shown = slaveCount;
+  if (shown > maxEntries) shown = maxEntries;
+
+  JsonArray arr = doc["slaves"].to<JsonArray>();
+  for (int i = 0; i < shown; i++) {
+    char id[20];
+    hoFormatDeviceId(slaves[i].mac, id);
+    char ver[16];
+    formatSlaveVersion(i, ver, sizeof(ver));
+
+    JsonObject o = arr.add<JsonObject>();
+    // id 與 ver 都是區域 char[]（非 const char*），ArduinoJson 會複製一份進 doc，
+    // 離開本次迴圈後仍然有效。若改成 const char* 會只存指標而變成懸空指標。
+    o["id"] = id;
+    o["relay"] = slaves[i].relay ? 1 : 0;
+    o["online"] = slaves[i].online;
+    o["rssi"] = slaves[i].rssi;
+    o["version"] = ver;
+  }
+
+  if (shown < slaveCount) {
+    doc["slaves_truncated"] = true;
+    doc["slaves_shown"] = shown;
+    Serial.printf("⚠ [MQTT] slaves 陣列被截斷：名冊 %d 台，只放得下 %d 台\n",
+                  slaveCount, shown);
+  }
+}
+
 // ── 序列埠測試指令（Phase 2 接上 MQTT 後仍保留，方便現場除錯）──
 void printHelp() {
   Serial.println("── 可用指令 ──");
@@ -1075,6 +1141,8 @@ void printHelp() {
   Serial.println("  state <n>     要求第 n 台回報狀態");
   Serial.println("  unpair <n>    解除第 n 台配對");
   Serial.println("  ch <n>        測試用：切換 master 的 channel（1~13）");
+  Serial.println("  fakeslaves <n> 測試用：把名冊灌成 n 台假 slave，實測容量（不寫 NVS）");
+  Serial.println("  jsonsize      測試用：印出目前狀態 JSON 的實際大小");
   Serial.println("  help          顯示這份說明");
 }
 
@@ -1105,7 +1173,8 @@ void handleSerialCommand(const String& line) {
   // ch 雖然不是編號而是 channel，但同樣要求純數字，沿用同一套驗證避免 String::toInt()
   // 對非數字輸入靜默回傳 0（例如 ch abc 誤觸發切到 channel 0）
   bool needsArg = (verb == "on" || verb == "off" || verb == "pulse" ||
-                   verb == "state" || verb == "unpair" || verb == "ch");
+                   verb == "state" || verb == "unpair" || verb == "ch" ||
+                   verb == "fakeslaves");
   int arg = -1;
   if (needsArg && !parseIndexArg(argStr, arg)) {
     Serial.println("[指令] 參數必須是數字，例如：on 0（輸入 help 看說明）");
@@ -1146,6 +1215,10 @@ void handleSerialCommand(const String& line) {
     } else {
       Serial.println("channel 需在 1~13 之間");
     }
+  } else if (verb == "fakeslaves") {
+    fakeSlavesForCapacityTest(arg);
+  } else if (verb == "jsonsize") {
+    printStatusJsonSize();
   } else if (verb == "help") {
     printHelp();
   } else {
@@ -1224,9 +1297,25 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     HoStatePayload st;
     memcpy(&st, payload, sizeof(st));
 
+    // 只有「內容真的變了」才設 dirty，避免每 15 秒的例行輪詢回報都觸發一次
+    // 額外代發（例行輪播本來就會發，重複發是浪費頻寬）。
+    bool changed = (!slaves[idx].online) ||
+                   (slaves[idx].relay != st.relay) ||
+                   (slaves[idx].fwMajor != st.fwMajor) ||
+                   (slaves[idx].fwMinor != st.fwMinor) ||
+                   (slaves[idx].fwPatch != st.fwPatch);
+
     slaves[idx].online = true;
     slaves[idx].rssi = info->rx_ctrl->rssi;
     slaves[idx].lastSeen = millis();
+    slaves[idx].relay = st.relay;
+    slaves[idx].fwMajor = st.fwMajor;
+    slaves[idx].fwMinor = st.fwMinor;
+    slaves[idx].fwPatch = st.fwPatch;
+    // 這裡只設旗標，絕不在此發 MQTT ——
+    // 本函式跑在 WiFi task，不是 loop() context，在這裡呼叫 PubSubClient
+    // 等於從另一個 task 動同一個 socket，是明確的競態。
+    if (changed) slaves[idx].dirty = true;
 
     Serial.printf("[狀態] %s relay=%u 版本=%u.%u.%u 運行=%lus rssi=%d\n",
                   senderId, st.relay, st.fwMajor, st.fwMinor, st.fwPatch,
@@ -1753,14 +1842,11 @@ bool publishJsonDoc(const char* topic, JsonDocument& doc, bool retain) {
   return res;
 }
 
-// 發布 master 自身狀態。Task 2 會在這裡加上 slaves 陣列。
-void publishStatus() {
-  if (!mqttClient.connected()) return;
-
+// 組出 master 自身狀態的 doc（不發布）。供 publishStatus() 與 Step 6 的
+// jsonsize 測試指令（printStatusJsonSize()）共用，讓測試指令不必真的連上 MQTT
+// 就能量出「實際會發布的那份 JSON」的真實大小。
+void buildStatusDoc(JsonDocument& doc) {
   const char* deviceId = getDeviceId();
-  String topic = String("hoban/") + deviceId + "/status";
-
-  JsonDocument doc;
   doc["device_id"] = deviceId;
   doc["status"] = "online";
   doc["version"] = firmwareVersion;
@@ -1783,7 +1869,51 @@ void publishStatus() {
   dev["long_range"] = longRangeEnabled;
   dev["free_heap"] = (uint32_t)ESP.getFreeHeap();
 
+  appendSlavesArray(doc);
+}
+
+// 發布 master 自身狀態（含代發的 slaves 陣列）。
+void publishStatus() {
+  if (!mqttClient.connected()) return;
+
+  const char* deviceId = getDeviceId();
+  String topic = String("hoban/") + deviceId + "/status";
+
+  JsonDocument doc;
+  buildStatusDoc(doc);
   publishJsonDoc(topic.c_str(), doc, true);
+}
+
+// ── 容量實測測試工具（Phase 2b）──
+// 測試用：把名冊灌成 n 台假 slave，用來實測 20 台時狀態 JSON 的真實大小。
+// 刻意「不」呼叫 saveSlaves()、也不註冊 peer —— 這是純記憶體內的假資料，
+// 重開機即消失，不會污染 NVS 名冊、也不會對不存在的 MAC 送出封包。
+// 只開放序列埠，不接到 MQTT：這是開發驗證工具，不是產品功能。
+void fakeSlavesForCapacityTest(int n) {
+  if (n < 0) n = 0;
+  if (n > HO_ESPNOW_MAX_SLAVES) n = HO_ESPNOW_MAX_SLAVES;
+  for (int i = 0; i < n; i++) {
+    slaves[i].mac[0] = 0xAA; slaves[i].mac[1] = 0xBB; slaves[i].mac[2] = 0xCC;
+    slaves[i].mac[3] = 0xDD; slaves[i].mac[4] = 0xEE; slaves[i].mac[5] = (uint8_t)i;
+    slaves[i].online = false;      // false 比 true 多 1 byte，取最壞
+    slaves[i].rssi = -100;         // 3 位數負值，取最壞
+    slaves[i].lastSeen = 0;
+    slaves[i].relay = 1;
+    slaves[i].fwMajor = 255; slaves[i].fwMinor = 255; slaves[i].fwPatch = 255;
+    slaves[i].dirty = false;
+  }
+  slaveCount = n;
+  Serial.printf("[測試] 名冊已灌成 %d 台假 slave（未寫入 NVS，重開機即消失）\n", n);
+}
+
+// 印出目前狀態 JSON 的實際大小，與各層預算比對
+void printStatusJsonSize() {
+  JsonDocument doc;
+  buildStatusDoc(doc);
+  size_t n = measureJson(doc);
+  Serial.printf("[測試] 狀態 JSON 實際 %u bytes／statusBuf %u／mqtt buffer %u（名冊 %d 台）\n",
+                (unsigned)n, (unsigned)sizeof(statusBuf),
+                (unsigned)mqttClient.getBufferSize(), slaveCount);
 }
 
 // 指令分派。Phase 2a 只處理 master 自己的指令；ALL:*、PAIR:*、UNPAIR:* 等
