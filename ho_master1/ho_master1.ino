@@ -66,6 +66,19 @@ SlaveEntry slaves[HO_ESPNOW_MAX_SLAVES];
 volatile int slaveCount = 0;
 Preferences prefs;
 
+// ── slave 目前鎖定的 channel（存 homaster 命名空間，與名冊同生共死）──
+// 與下方 lastApChannel 是兩個不同用途的值，刻意分開存在兩個命名空間：
+// - lastApChannel（hoban／apch）服務「WiFi 關聯」：下次要用哪個 channel 關聯 AP。
+//   clearNetConfig() 會清掉它，這是對的 —— 連 SSID 都沒了，這個提示反而會害下次
+//   配了新 AP 之後，還一直在舊 channel 上白試十次才肯全頻掃描。
+// - slaveLockChannel（homaster／espch）服務「ESP-NOW 心跳」：名冊上的 slave 目前
+//   鎖在哪個 channel。它必須撐過 reset —— Critical 2 的情境正是「送 reset 後重開機
+//   進 BLE 配網」，若這個值跟著網路設定一起被清掉，master 仍會停在 channel 1，
+//   整段配網過程 slave 照樣失聯關籠，等於沒修。它跟著名冊走，名冊清空時自然失效
+//   （restoreEspNowChannelForOfflineBoot() 會檢查 slaveCount）。
+uint8_t slaveLockChannel = 0;
+uint8_t savedSlaveLockChannel = 0;   // NVS 現值，避免沒變也重複寫入磨損 flash
+
 // ── 網路設定（存 NVS 命名空間 hoban，與 slave 名冊的 homaster 分開）──
 // ho_relay2 用 EEPROM 128 bytes 且 mqttPassword 與 mqttPort 位址重疊，
 // 導致 MQTT 密碼實際只能 12 字元。改用 NVS 後各欄位獨立，長度依 MQTT 規格給足。
@@ -79,6 +92,26 @@ bool useCustomServer = false;
 bool hasRelay = false;        // master 硬體有沒有接繼電器（韌體無法自動偵測）
 
 Preferences netPrefs;         // 與 Phase 1 名冊用的 prefs 分開，避免鍵名衝突
+
+// ── 上次成功關聯的 AP channel／BSSID ──
+// （宣告放在這裡而非 WiFi 區塊，因為 loadNetConfig()／saveNetConfig() 要用到）
+// 重連時可直接指定 channel／BSSID，跳過 WiFi.begin() 內建的全頻道掃描
+//（review 發現：即使不呼叫 WiFi.scanNetworks()，WiFi.begin(ssid, password)
+// 不帶 channel/BSSID 時，ESP-IDF 底層關聯流程仍會自己全頻道掃一輪，約 1.5 秒，
+// 失敗後會立刻再掃，對 ESP-NOW 心跳命中率殺傷力等同顯式呼叫 scanNetworks()）。
+//
+// lastApChannel 有寫進 NVS，lastApBssid 沒有。兩者用途不同：
+// - BSSID 只服務「WiFi 關聯」，開機第一次本來就沒有歷史資料可用，存了也不保證有效
+//   （AP 可能已換機、換 BSSID），所以只存 RAM。
+// - channel 還服務「ESP-NOW 心跳」。開機後若不會關聯 WiFi（例如被 reset 清掉設定、
+//   進入 BLE 配網模式），setupEspNow() 的 WiFi.mode(WIFI_STA) 會把 channel 歸 1，
+//   而名冊上的 slave 仍鎖在舊 channel，整個配網過程（可能數分鐘）都收不到心跳、
+//   30 秒後失聯強制關閉繼電器＝籠子被打開。存 NVS 才能在開機時先切回舊 channel。
+// clearNetConfig() 會連同 apch 一起清掉，這是刻意的：連 SSID 都沒了，channel 也失去意義。
+uint8_t lastApChannel = 0;
+uint8_t lastApBssid[6] = { 0 };
+bool haveLastApBssid = false;
+uint8_t savedApChannel = 0;   // NVS 裡目前的值，用來避免沒變也重複寫入磨損 flash
 
 // ── MQTT 多伺服器設定 ──
 struct MqttServerConfig {
@@ -114,6 +147,15 @@ const uint8_t BROADCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 // 舊值 5000ms 大於 dwell，命中變成兩個週期的機率問題（約 7.7%），
 // 期望要十幾次心跳、約一分鐘才鎖得回來。廣播封包只有 11 bytes，加快到 1 秒的流量代價可忽略。
 const unsigned long HEARTBEAT_INTERVAL = 1000;
+
+// WiFi 關聯進行中的加密心跳間隔。關聯期間 master 有機會離開 slave 鎖定的 channel
+//（連續關聯失敗達 WIFI_CHANNEL_LOCK_MAX_FAIL 次時會升級成一次全頻掃描），
+// 停在舊 channel 的 slave 每則心跳命中率只剩約 1/13。1000ms 間隔下 30 秒只有 30 則，
+// 全數落空的機率約 9%，而落空的後果是 slave 強制關閉繼電器＝籠子被打開。
+// 加密到 200ms 後 30 秒有 150 則，全數落空機率降到 6×10⁻⁶。
+// 廣播封包只有 11 bytes，代價可忽略 —— 與當初把 HEARTBEAT_INTERVAL 由 5000 降到 1000
+// 的理由完全同源。
+const unsigned long HEARTBEAT_INTERVAL_ASSOC = 200;
 
 // channel 改變時立刻連發數次心跳，讓正在輪掃的 slave 更快命中
 const int HEARTBEAT_BURST_COUNT = 4;
@@ -160,18 +202,25 @@ void initRelayPins() {
   relayState = false;
 }
 
+// 用「起始時間＋持續時間」搭配無號數減法比較，而非「結束時間」搭配絕對值比較，
+// 避免 millis() 約 49.7 天溢位時，迴繞後的極小值被誤判為「時間已到」而提前關閉繼電器
+// （宣告必須早於 setRelayPins()，因為後者要清除 pulseActive）
+unsigned long pulseStartTime = 0;
+uint16_t pulseDuration = 0;
+bool pulseActive = false;
+
 void setRelayPins(bool on) {
   for (int i = 0; i < relayPinCount; i++) {
     digitalWrite(relayPins[i], on ? HIGH : LOW);
   }
   relayState = on;
+  // 明確的持續性 ON／OFF 指令必須撤銷進行中的點動計時。
+  // 少了這行的實際後果：MQTT 送 ON（點動 2 秒）後 1 秒內從序列埠下 allon，
+  // 繼電器先被 allon 設成持續開啟，但點動計時仍在跑，1 秒後逾時把它關掉，
+  // 等於使用者的 allon 被無聲撤銷 ——「命令保持開啟，卻自己關上」對籠門機構是危險行為。
+  // pulseRelay() 呼叫本函式之後才設 pulseActive = true，順序上不會被這行清掉。
+  pulseActive = false;
 }
-
-// 用「起始時間＋持續時間」搭配無號數減法比較，而非「結束時間」搭配絕對值比較，
-// 避免 millis() 約 49.7 天溢位時，迴繞後的極小值被誤判為「時間已到」而提前關閉繼電器
-unsigned long pulseStartTime = 0;
-uint16_t pulseDuration = 0;
-bool pulseActive = false;
 
 void pulseRelay(uint16_t ms) {
   setRelayPins(true);
@@ -191,14 +240,29 @@ void loadNetConfig() {
   mqttPort = netPrefs.getInt("mqttport", 1883);
   useCustomServer = netPrefs.getBool("customsrv", false);
   hasRelay = netPrefs.getBool("hasrelay", false);
+  lastApChannel = netPrefs.getUChar("apch", 0);
   netPrefs.end();
 
   if (mqttPort <= 0 || mqttPort > 65535) mqttPort = 1883;
+  if (lastApChannel > 13) lastApChannel = 0;   // 髒資料防呆
+  savedApChannel = lastApChannel;
 
-  Serial.printf("[設定] SSID=%s 自訂伺服器=%s 繼電器=%s\n",
+  Serial.printf("[設定] SSID=%s 自訂伺服器=%s 繼電器=%s 上次AP channel=%u\n",
                 strlen(ssid) > 0 ? ssid : "(未設定)",
                 useCustomServer ? "是" : "否",
-                hasRelay ? "有" : "無");
+                hasRelay ? "有" : "無",
+                lastApChannel);
+}
+
+// 只寫 channel 這一個鍵：連線成功時呼叫，值沒變就不寫，避免每次重連都磨損 flash
+void saveApChannel(uint8_t ch) {
+  if (ch < 1 || ch > 13) return;
+  if (ch == savedApChannel) return;
+  netPrefs.begin("hoban", false);
+  netPrefs.putUChar("apch", ch);
+  netPrefs.end();
+  savedApChannel = ch;
+  Serial.printf("[設定] 已記住 AP channel=%u（供下次開機在 BLE 配網模式維持心跳用）\n", ch);
 }
 
 void saveNetConfig() {
@@ -211,14 +275,17 @@ void saveNetConfig() {
   netPrefs.putInt("mqttport", mqttPort);
   netPrefs.putBool("customsrv", useCustomServer);
   netPrefs.putBool("hasrelay", hasRelay);
+  netPrefs.putUChar("apch", lastApChannel);
   netPrefs.end();
+  savedApChannel = lastApChannel;
   Serial.println("[設定] 已儲存到 NVS");
 }
 
 void clearNetConfig() {
   netPrefs.begin("hoban", false);
-  netPrefs.clear();
+  netPrefs.clear();   // 連 apch 一起清掉：連 SSID 都沒了，記住的 AP channel 也失去意義
   netPrefs.end();
+  savedApChannel = 0;
   Serial.println("[設定] NVS 網路設定已清除");
 }
 
@@ -491,14 +558,20 @@ volatile uint8_t lastWifiDisconnectReason = 0;
 unsigned long wifiConnectedTime = 0;
 uint8_t lastKnownChannel = 0;     // 用於偵測 channel 變化
 
-// 記住上次成功關聯的 AP channel／BSSID，重連時可直接指定、跳過 WiFi.begin() 內建的
-// 全頻道掃描（review 發現：即使不呼叫 WiFi.scanNetworks()，WiFi.begin(ssid, password)
-// 不帶 channel/BSSID 時，ESP-IDF 底層關聯流程仍會自己全頻道掃一輪，約 1.5 秒，
-// 且 setAutoReconnect(true) 失敗後會立刻再掃，對 ESP-NOW 心跳命中率殺傷力等同
-// 顯式呼叫 scanNetworks()）。只存 RAM 不寫 NVS：開機第一次本來就要掃，沒有歷史資料可用。
-uint8_t lastApChannel = 0;
-uint8_t lastApBssid[6] = { 0 };
-bool haveLastApBssid = false;
+// lastApChannel／lastApBssid／haveLastApBssid 的宣告與說明已上移到 netPrefs 附近，
+// 因為 loadNetConfig()／saveNetConfig() 要存取 lastApChannel。
+
+// 「WiFi 關聯進行中」旗標。關聯期間 master 可能離開 slave 鎖定的 channel
+//（限制在單一 channel 掃描仍有短暫的 off-channel 時間；升級成全頻掃描時更是整整一輪），
+// 此時把心跳間隔臨時加密到 HEARTBEAT_INTERVAL_ASSOC，用發送次數換命中率。
+// 由 connectToWiFi() 在 WiFi.begin() 前後設定，maintainEspNow() 讀取。
+bool wifiAssociating = false;
+
+// 連續幾次「鎖定 channel 關聯」失敗後，才判定 AP 真的換頻、升級成一次全頻掃描。
+// 取 10 而非 1~2：全頻掃描是心跳落空的主要來源，寧可多在舊 channel 上試幾次；
+// loop() 的重連節奏下 10 次約 1 分鐘，AP 真換頻時的恢復延遲仍在可接受範圍。
+const int WIFI_CHANNEL_LOCK_MAX_FAIL = 10;
+int wifiChannelLockFailCount = 0;
 
 // WiFi 事件回調：取得底層斷線原因碼，並在取得 IP 時通知 slave 新 channel
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -507,9 +580,13 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     Serial.printf("[WiFi] 斷線原因碼: %d\n", lastWifiDisconnectReason);
     // 常見：2=AUTH_EXPIRE 15=4WAY_HANDSHAKE_TIMEOUT 201=NO_AP_FOUND 202=AUTH_FAIL
   } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
-    // 設在事件回調而非 connectToWiFi() 的成功分支：setAutoReconnect(true) 背景重連
-    // 成功時不會經過 connectToWiFi()，若只在那裡設值，背景重連後 wifiConnectedTime
-    // 會停留在舊值（甚至仍是 0），Task 4~7 拿它算連線時長會讀到錯值。
+    // 設在事件回調而非 connectToWiFi() 的成功分支：GOT_IP 是「取得 IP」這件事本身的
+    // 唯一權威來源，不論它由哪條路徑觸發（connectToWiFi()、或底層自行重新關聯後
+    // 重新 DHCP）都會進來，值不會漏更新。
+    // 註：舊註釋用「setAutoReconnect(true) 背景重連不會經過 connectToWiFi()」來論證，
+    // 那個理由是錯的 —— core 3.3.7 的 _autoReconnect 只存在於建構子／setter／getter，
+    // STA_DISCONNECTED 事件處理完全沒有讀它，setAutoReconnect() 實際上是死碼。
+    // 結論（設在 GOT_IP）仍然正確，而且比設在 connectToWiFi() 更精確。
     wifiConnectedTime = millis();
     Serial.printf("[WiFi] 取得 IP: %s\n", WiFi.localIP().toString().c_str());
   }
@@ -588,6 +665,18 @@ void saveSlaves() {
   Serial.printf("[名冊] 已儲存 %d 台\n", slaveCount);
 }
 
+// 只寫 channel 這一個鍵，值沒變就不寫（理由同 saveApChannel()）
+void saveSlaveLockChannel(uint8_t ch) {
+  if (ch < 1 || ch > 13) return;
+  if (ch == savedSlaveLockChannel) return;
+  prefs.begin("homaster", false);
+  prefs.putUChar("espch", ch);
+  prefs.end();
+  slaveLockChannel = ch;
+  savedSlaveLockChannel = ch;
+  Serial.printf("[名冊] 已記住 slave 鎖定的 channel=%u（供下次開機不關聯 WiFi 時維持心跳）\n", ch);
+}
+
 void loadSlaves() {
   prefs.begin("homaster", true);
   slaveCount = prefs.getInt("count", 0);
@@ -608,9 +697,14 @@ void loadSlaves() {
       }
     }
   }
+  slaveLockChannel = prefs.getUChar("espch", 0);
   prefs.end();
 
-  Serial.printf("[名冊] 載入 %d 台 slave\n", slaveCount);
+  if (slaveLockChannel > 13) slaveLockChannel = 0;   // 髒資料防呆
+  savedSlaveLockChannel = slaveLockChannel;
+
+  Serial.printf("[名冊] 載入 %d 台 slave（上次心跳 channel=%u）\n",
+                slaveCount, slaveLockChannel);
   for (int i = 0; i < slaveCount; i++) {
     char id[20];
     hoFormatDeviceId(slaves[i].mac, id);
@@ -663,6 +757,12 @@ bool addSlave(const uint8_t mac[6]) {
 
   registerPeer(mac);
   saveSlaves();
+  // 名冊從空的變成有人，或又多一台：把目前 channel 一併記住。
+  // 少了這行，「先連上 WiFi、之後才配對 slave」這個最常見的順序下，espch 永遠不會被
+  // 寫入（connectToWiFi() 的成功分支在配對發生之前就跑完了），下次 reset 進 BLE 配網
+  // 仍然會停在 channel 1。這裡與既有的 saveSlaves() 同樣是在 ESP-NOW callback
+  // context 寫 NVS，沒有引入新的風險類別。
+  if (WiFi.status() == WL_CONNECTED) saveSlaveLockChannel(currentChannel);
   return true;
 }
 
@@ -1033,7 +1133,9 @@ void sendHeartbeat() {
 void maintainEspNow() {
   static unsigned long lastBeat = 0;
   unsigned long now = millis();
-  if (now - lastBeat >= HEARTBEAT_INTERVAL) {
+  // WiFi 關聯期間改用加密間隔（理由見 HEARTBEAT_INTERVAL_ASSOC 的註釋）
+  unsigned long interval = wifiAssociating ? HEARTBEAT_INTERVAL_ASSOC : HEARTBEAT_INTERVAL;
+  if (now - lastBeat >= interval) {
     lastBeat = now;
     sendHeartbeat();
   }
@@ -1084,8 +1186,49 @@ void onWifiChannelMayHaveChanged() {
                   lastKnownChannel, primary);
     lastKnownChannel = primary;
     currentChannel = primary;
+    // AP 不斷線就換頻（例如 DFS 或自動選台）也要更新 NVS 記錄，
+    // 否則下次開機進 BLE 配網模式會切回一個已經過時的 channel。
+    // 本函式只由 connectToWiFi() 成功分支與 loop() 的「WiFi 已連線」分支呼叫，
+    // 兩處都保證 WiFi 已連線；序列埠的 ch <n> 測試指令走另一條路，不會誤寫 NVS。
+    if (slaveCount > 0) saveSlaveLockChannel(primary);
     sendHeartbeatBurst();
   }
+}
+
+// 開機時若「這次開機不會關聯 WiFi」（沒有 WiFi 設定 → 進 BLE 配網模式），
+// 主動把 ESP-NOW 切回 NVS 記住的 AP channel。
+//
+// 為什麼需要（review 抓到的 Critical）：master 已連上 channel 6 的 AP 並配對多台
+// slave，使用者送 reset → 重開機 → 沒有 WiFi 設定 → setupEspNow() 的
+// WiFi.mode(WIFI_STA) 把 channel 歸 1 → 進入 BLE 配網模式。而
+// onWifiChannelMayHaveChanged() 只在 connectToWiFi() 成功分支與 loop() 的
+// 「WiFi 已連線」分支被呼叫，BLE 模式下兩者都不會執行，master 就永久停在 channel 1。
+// 原本鎖在 channel 6 的 slave 從此收不到任何心跳 → 30 秒後全部失聯、強制關閉繼電器、
+// 開始輪掃，整個配網過程（可能數分鐘）籠子都是開的。
+//
+// 呼叫時機限制：必須在 setupEspNow() 之後（esp_wifi_set_channel() 要 WiFi 已初始化
+// 才有效），但 lastApChannel 的值來自 loadNetConfig()，而它排在 setupEspNow() 之前，
+// 兩者順序在 setup() 裡已經滿足。
+void restoreEspNowChannelForOfflineBoot() {
+  if (slaveCount <= 0) {
+    // 名冊是空的，沒有 slave 在等心跳，切 channel 沒有意義
+    return;
+  }
+  if (slaveLockChannel < 1 || slaveLockChannel > 13) {
+    // 這台 master 從沒成功連上過 WiFi（或剛升級韌體、NVS 還沒這個鍵），
+    // 沒有歷史 channel 可用，只能停在 WIFI_STA 預設的 channel 1。
+    // 此時已配對的 slave 若鎖在別的 channel，仍會失聯並開始輪掃（約 16 秒重鎖到 1）。
+    Serial.printf("⚠ [channel] 名冊有 %d 台 slave，但 NVS 沒有 channel 記錄，"
+                  "只能停在 channel %u；鎖在其他 channel 的 slave 會先失聯再輪掃回來\n",
+                  slaveCount, currentChannel);
+    return;
+  }
+  esp_wifi_set_channel(slaveLockChannel, WIFI_SECOND_CHAN_NONE);
+  currentChannel = slaveLockChannel;
+  lastKnownChannel = slaveLockChannel;
+  Serial.printf("[channel] 本次開機不關聯 WiFi，切回 NVS 記住的 channel=%u，"
+                "維持 %d 台已配對 slave 的心跳\n", slaveLockChannel, slaveCount);
+  sendHeartbeatBurst();
 }
 
 // ESP-NOW 友善的 WiFi 連線
@@ -1109,23 +1252,36 @@ void connectToWiFi() {
   WiFi.disconnect(false);
   espNowDelay(100);
 
+  // 進入關聯階段：心跳改用加密間隔，直到本次關聯結束（成功或失敗）
+  wifiAssociating = true;
+
   // WiFi.begin(ssid, password) 不指定 channel/BSSID 時，ESP-IDF 底層關聯流程仍會自己
-  // 全頻道掃描一輪（約 1.5 秒），這正是我們想擋掉的行為，只是被包在 begin() 裡面。
-  // 若有上次成功關聯的紀錄，直接帶 channel/BSSID 跳過掃描；沒有（開機後第一次）才退回
-  // 不帶參數的一般連線。
+  // 全頻道掃描一輪（約 1.5 秒、一輪約 20 秒），這正是我們想擋掉的行為，只是被包在
+  // begin() 裡面。三段式優先序：
+  //   1. 有 channel＋BSSID → 直接定向關聯，完全不掃描（最快、對 ESP-NOW 最友善）
+  //   2. 只有 channel（BSSID 已在前次失敗時清掉）→ 仍把掃描限制在單一 channel，
+  //      master 不會跑遍 1~13，停在舊 channel 的 slave 心跳命中率幾乎不受影響
+  //   3. 兩者都沒有（開機第一次，或連續失敗到判定 AP 真的換頻了）→ 才退回全頻掃描
   if (haveLastApBssid) {
     Serial.printf("[WiFi] 使用已知 channel=%u 的 BSSID 直接關聯，跳過掃描\n", lastApChannel);
     WiFi.begin(ssid, password, lastApChannel, lastApBssid);
+  } else if (lastApChannel >= 1 && lastApChannel <= 13) {
+    Serial.printf("[WiFi] 不指定 BSSID，但把掃描限制在已知 channel=%u\n", lastApChannel);
+    WiFi.begin(ssid, password, lastApChannel, nullptr);
   } else {
+    Serial.println("[WiFi] 無已知 channel，退回全頻掃描關聯");
     WiFi.begin(ssid, password);
   }
 
-  // 等待最多 15 秒，期間持續發心跳
+  // 等待最多 15 秒，期間持續發心跳（關聯中心跳自動加密到 200ms，見 maintainEspNow()）
   const int maxWaitMs = 15000;
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < maxWaitMs) {
     maintainEspNow();
-    if (anyResetButtonPressed()) return;   // 讓長按重置仍可用
+    if (anyResetButtonPressed()) {
+      wifiAssociating = false;
+      return;   // 讓長按重置仍可用
+    }
     delay(100);
 
     // 認證失敗類的原因碼不必等滿，直接放棄本次
@@ -1135,6 +1291,8 @@ void connectToWiFi() {
     }
   }
 
+  wifiAssociating = false;
+
   if (WiFi.status() == WL_CONNECTED) {
     // wifiConnectedTime 改在 onWiFiEvent() 的 GOT_IP 分支設定，這裡不重複設
     Serial.printf("[WiFi] 已連線 IP=%s RSSI=%d\n",
@@ -1142,16 +1300,54 @@ void connectToWiFi() {
     lastApChannel = WiFi.channel();
     memcpy(lastApBssid, WiFi.BSSID(), 6);
     haveLastApBssid = true;
+    wifiChannelLockFailCount = 0;
+    // 兩個 NVS 記錄都更新：apch 給下次 WiFi 關聯用（reset 會清），
+    // espch 給下次開機不關聯 WiFi 時維持 ESP-NOW 心跳用（跟著名冊走，reset 不清）
+    saveApChannel(lastApChannel);
+    if (slaveCount > 0) saveSlaveLockChannel(lastApChannel);
     onWifiChannelMayHaveChanged();
   } else {
     Serial.printf("[WiFi] 連線失敗，狀態=%d 原因碼=%d\n",
                   WiFi.status(), lastWifiDisconnectReason);
-    // 帶 channel/BSSID 關聯失敗：AP 可能換了 BSSID 或已關機重啟，清掉記錄，
-    // 讓下一次重試（loop() 的重連邏輯會再呼叫這裡）退回不帶參數的一般連線，
-    // 避免卡在同一組錯誤的 channel/BSSID 反覆失敗
+    // 只清 BSSID，刻意「不」跟著清掉 lastApChannel。
+    // 舊版兩個一起清，導致路由器斷電 60 秒這種情境下，第 1 次重試還是單 channel 定向
+    // 關聯（安全），第 2 次起就全部退回全頻掃描，master 每輪約 20 秒跑遍 1~13，
+    // 停在舊 channel 的 slave 每則心跳命中率只剩約 1/13，30 秒 30 則全數落空的機率
+    // 約 9% —— 落空的後果是繼電器被強制打開，對動物管制設備不可接受。
     if (haveLastApBssid) {
-      Serial.println("[WiFi] 已知 channel/BSSID 連線失敗，清除記錄，下次改用一般連線");
+      Serial.println("[WiFi] 指定 BSSID 關聯失敗，清除 BSSID 記錄，下次改為只鎖定 channel 掃描");
       haveLastApBssid = false;
+    }
+    // 只有連續失敗到門檻，才判定「AP 真的換頻了」，升級成一次全頻掃描重新學習 channel。
+    // NVS 裡的 apch 刻意不同步清除：那份值只在下次開機、且沒有 WiFi 設定時用來維持
+    // ESP-NOW 心跳，就算 AP 已換頻，停在舊 channel 也遠優於一律停在 channel 1。
+    if (lastApChannel != 0) {
+      wifiChannelLockFailCount++;
+      if (wifiChannelLockFailCount >= WIFI_CHANNEL_LOCK_MAX_FAIL) {
+        wifiChannelLockFailCount = 0;
+        Serial.printf("[WiFi] 已連續 %d 次在 channel %u 上關聯失敗，下次改為全頻掃描重新學習\n",
+                      WIFI_CHANNEL_LOCK_MAX_FAIL, lastApChannel);
+        lastApChannel = 0;
+      }
+    }
+
+    // 關聯失敗後，射頻停在哪個 channel 是底層掃描流程的殘留狀態，沒有保證。
+    // 走過全頻掃描的那一次尤其危險：可能停在 channel 13，而接下來
+    // loop() 的重試節流（每 5 秒；連續失敗超過 10 次更會暫停整整 60 秒）期間，
+    // 心跳會一直打在錯的頻道上 —— 60 秒的暫停遠大於 slave 的 30 秒失聯門檻。
+    // 因此主動把 channel 切回 slave 鎖定的位置，兩次關聯嘗試之間的心跳才有意義。
+    if (slaveCount > 0 && slaveLockChannel >= 1 && slaveLockChannel <= 13) {
+      uint8_t primary = 0;
+      wifi_second_chan_t second;
+      esp_wifi_get_channel(&primary, &second);
+      if (primary != slaveLockChannel) {
+        esp_wifi_set_channel(slaveLockChannel, WIFI_SECOND_CHAN_NONE);
+        currentChannel = slaveLockChannel;
+        lastKnownChannel = slaveLockChannel;
+        Serial.printf("[channel] 關聯失敗後射頻停在 %u，切回 slave 鎖定的 %u 再繼續發心跳\n",
+                      primary, slaveLockChannel);
+        sendHeartbeatBurst();
+      }
     }
   }
 }
@@ -1238,22 +1434,68 @@ bool quickConnectCustom() {
   return true;
 }
 
-// 依序嘗試：自訂伺服器 → 從上次成功的位置輪詢預設清單
+// ── smartConnect() 的輪詢游標 ──
+// 語義維持不變：自訂伺服器優先，然後從上次成功的位置（currentServerIndex）輪詢預設清單。
+// 差別在於「一次呼叫只嘗試一台」，剩下的交給 loop() 既有的 10 秒重連節奏推進。
+//
+// 為什麼非改不可（review 抓到的 Critical）：單次 mqttClient.connect() 對不可達目標
+// 最壞約 18 秒 —— NetworkClient::connect(host, port) 會先做 Network.hostByName()
+// → getaddrinfo()，這段完全沒有 timeout 參數，由 lwIP 的 DNS_MAX_RETRIES 指數退避
+// 決定，約 15 秒；WIFI_CLIENT_DEF_CONN_TIMEOUT_MS = 3000 只管 TCP select()、
+// setSocketTimeout(3) 只管 CONNACK 等待。而 mqttClient.connect() 是不可中斷的阻塞
+// 呼叫，期間 maintainEspNow() 完全不會被叫到，心跳整段停擺。
+// 舊寫法在自訂伺服器失敗後「立刻」接第一台預設伺服器，兩次背靠背 = 36 秒 > slave 的
+// 30 秒失聯門檻，slave 會強制關閉繼電器＝籠子被打開。
+// 觸發條件很寫實：AP 正常但 WAN 斷線／DNS 不回應（路由器斷網、ISP 中斷），
+// 此時 WiFi 仍是 WL_CONNECTED，loop() 每 10 秒進來一次，每次都製造 36 秒的心跳真空。
+// 改成一次一台後，單次呼叫最壞阻塞降到約 18 秒（< 30 秒），且兩次呼叫之間必定隔著
+// loop() 的 10 秒節流，足以發出約 10 則心跳。
+bool mqttCustomTried = false;   // 本輪是否已試過自訂伺服器
+int  mqttProbeOffset = 0;       // 本輪已試過幾台預設伺服器
+bool mqttLastHasCustom = false; // 上次看到的「是否有自訂伺服器」，用於偵測設定變更
+
+// 把游標歸零，讓下一次 smartConnect() 重新從自訂伺服器開始。
+// FIND_BEST_SERVER 的語義是「重新挑一台最好的」，必須從頭挑，不能接著上次的位置。
+void resetMqttProbe() {
+  mqttCustomTried = false;
+  mqttProbeOffset = 0;
+}
+
 void smartConnect() {
   if (!WiFi.isConnected()) return;
 
-  if (useCustomServer && strlen(mqttServer) > 0) {
-    if (quickConnectCustom()) return;
+  bool hasCustom = (useCustomServer && strlen(mqttServer) > 0);
+  if (hasCustom != mqttLastHasCustom) {
+    // useCustomServer／mqttServer 被改動（BLE 配網、之後 Phase 的設定指令）：
+    // 游標對應的是舊設定，直接歸零重新開始，避免跳過自訂伺服器或停在無意義的位置
+    mqttLastHasCustom = hasCustom;
+    resetMqttProbe();
   }
 
-  for (int i = 0; i < DEFAULT_SERVER_COUNT; i++) {
-    int index = (currentServerIndex + i) % DEFAULT_SERVER_COUNT;
-    if (quickConnectToIndex(index)) return;
-    espNowDelay(300);   // 錯開重試，期間維持心跳
+  if (hasCustom && !mqttCustomTried) {
+    mqttCustomTried = true;
+    if (quickConnectCustom()) {
+      resetMqttProbe();
+      return;
+    }
+    return;   // 本次呼叫只嘗試這一台，其餘交給 loop() 的 10 秒節奏
   }
 
-  currentServerIndex = (currentServerIndex + 1) % DEFAULT_SERVER_COUNT;
-  Serial.println("[MQTT] 所有伺服器都連不上");
+  int index = (currentServerIndex + mqttProbeOffset) % DEFAULT_SERVER_COUNT;
+  mqttProbeOffset++;
+  if (quickConnectToIndex(index)) {
+    // quickConnectToIndex() 成功時會把 currentServerIndex 更新為 index，
+    // 下一輪重連自然從這台開始
+    resetMqttProbe();
+    return;
+  }
+
+  if (mqttProbeOffset >= DEFAULT_SERVER_COUNT) {
+    // 一輪都試完了：起點往後推一台，避免永遠卡在同一台開頭
+    currentServerIndex = (currentServerIndex + 1) % DEFAULT_SERVER_COUNT;
+    resetMqttProbe();
+    Serial.println("[MQTT] 本輪所有伺服器都連不上，下次改從下一台開始");
+  }
 }
 
 // 發布完整狀態（Phase 2a 先不含 slaves 陣列，那是 Phase 2b 才加）
@@ -1284,13 +1526,26 @@ void publishStatus() {
   dev["channel"] = currentChannel;
   dev["long_range"] = longRangeEnabled;
 
+  // 真正的容量瓶頸是 StaticJsonDocument<512> 與下方 char buf[512]，不是 mqttClient
+  // 的 1024 buffer。ArduinoJson 在文件放不下時是「截斷」而非溢位，截斷後的長度仍然
+  // < 1024 → publish() 回傳 true → 靜默失敗，訂閱端收到殘缺 JSON 卻沒有任何錯誤。
+  // 目前 317/512 還有餘裕，但 Phase 2b 要在這裡加最多 20 台 slave 的陣列，
+  // 必定會逼近上限，所以先把截斷偵測補上。
+  if (doc.overflowed()) {
+    Serial.println("⚠ [MQTT] 狀態 JSON 已超出 StaticJsonDocument<512> 容量並被截斷，"
+                   "請加大 doc 與 buf 的容量（publish 仍會回報成功，屬靜默失敗）");
+  }
+
   char buf[512];
   size_t n = serializeJson(doc, buf);
-  bool ok = mqttClient.publish(topic.c_str(), buf, true);
-  if (!ok) {
-    // Phase 2b 會在這個 JSON 裡加最多 20 台 slave 的陣列，一旦超過 buffer
-    // 會像這樣靜默失敗（publish() 只回傳 false，不會拋例外），先把長度印出來
-    // 讓「快超過了」在序列埠上就看得見，不必等到真的超過才發現。
+  if (n >= sizeof(buf) - 1) {
+    Serial.printf("⚠ [MQTT] 序列化結果已填滿 buf[%u]，內容可能被截斷\n",
+                  (unsigned)sizeof(buf));
+  }
+  bool res = mqttClient.publish(topic.c_str(), buf, true);
+  if (!res) {
+    // 超過 mqttClient buffer 時 publish() 只回傳 false、不會拋例外，
+    // 先把長度印出來讓「快超過了」在序列埠上就看得見。
     Serial.printf("[MQTT] 狀態發布失敗（長度 %u，buffer %u）\n",
                   (unsigned)n, (unsigned)mqttClient.getBufferSize());
   }
@@ -1329,6 +1584,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   } else if (message == "FIND_BEST_SERVER") {
     mqttClient.disconnect();
     espNowDelay(500);
+    // 語義是「重新挑一台最好的」，所以先把輪詢游標歸零，從自訂伺服器重新開始。
+    // 注意：smartConnect() 現在一次只試一台（見該函式註釋），若第一台連不上，
+    // 後續會由 loop() 每 10 秒推進一台，不會在這裡一口氣試完全部而卡住心跳。
+    resetMqttProbe();
     smartConnect();
   } else if (message == "HASRELAY:ON" || message == "HASRELAY:OFF") {
     hasRelay = (message == "HASRELAY:ON");
@@ -1397,6 +1656,10 @@ void setup() {
   // WiFi 連線必須排在 ESP-NOW 初始化與 peer 註冊之後：
   // 反過來會讓 esp_now_init() 在 STA 已連線的狀態下執行，peer 的 channel 跟隨行為可能不如預期。
   WiFi.onEvent(onWiFiEvent);
+  // 註：setAutoReconnect(true) 在 Arduino core 3.3.7 實際上是死碼 —— _autoReconnect
+  // 只存在於 STAClass 的建構子／setter／getter，STA_DISCONNECTED 事件處理從頭到尾
+  // 沒有讀取它。保留這行只是為了與其他 sketch 的寫法一致並向前相容，
+  // 真正負責重連的是 loop() 裡的 WiFi 管理區塊（wifiFailCount／wifiPauseUntil）。
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);      // 禁用睡眠，避免 ESP-NOW 收包延遲
 
@@ -1407,6 +1670,10 @@ void setup() {
     connectToWiFi();
   } else {
     bleConfigMode = true;
+    // 本次開機不會關聯 WiFi，channel 會停在 WIFI_STA 預設的 1。
+    // 先切回 NVS 記住的 AP channel，避免已配對的 slave 在整個配網過程中失聯關籠
+    //（詳見 restoreEspNowChannelForOfflineBoot() 的註釋）
+    restoreEspNowChannelForOfflineBoot();
     setupBLE();
     Serial.println("[BLE] 等待 App 配網");
   }
@@ -1514,8 +1781,13 @@ void loop() {
   if (!bleConfigMode && WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
       if (now - lastReconnect > 10000) {
-        lastReconnect = now;
         smartConnect();
+        // 與上方 WiFi 重連同一個理由：smartConnect() 內的 mqttClient.connect() 最壞
+        // 阻塞約 18 秒（DNS 逾時，見 smartConnect() 註釋），若沿用進入本區塊前的 now
+        // 記錄 lastReconnect，下一輪 loop() 的 now 已超前 18 秒以上，10 秒節流立刻
+        // 成立、變成背靠背重試，兩次阻塞之間只擠得出一則心跳。必須在阻塞呼叫「之後」
+        // 用新的 millis() 記錄，才能保證每兩次嘗試之間有完整 10 秒可發約 10 則心跳。
+        lastReconnect = millis();
       }
     } else {
       mqttClient.loop();
