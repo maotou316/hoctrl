@@ -84,6 +84,14 @@ SlaveEntry slaves[HO_ESPNOW_MAX_SLAVES];
 // slaveCount 會被 ESP-NOW callback（WiFi task）寫入、sendHeartbeat()（主 task）讀取，
 // 屬跨 context 存取，加 volatile 避免編譯器快取舊值
 volatile int slaveCount = 0;
+
+// slave 主動解除配對是在 WiFi task 收到的（onEspNowRecv() 的 HO_PKT_UNPAIR 分支），
+// 不能在那裡直接發 MQTT ——PubSubClient／同一顆 socket 跨 task 存取是明確的競態，
+// 理由與 slaveCount／SlaveEntry.dirty 的跨 context 存取相同。只能記下 MAC，
+// 交給 loop() 呼叫的 processPendingUnpairPublish() 補發最後一則 offline。
+uint8_t pendingOfflineMac[6];
+volatile bool hasPendingOfflinePublish = false;
+
 Preferences prefs;
 
 // ── Phase 2b review 修正：fakeslaves 容量測試工具的 NVS 安全網 ──
@@ -1082,6 +1090,12 @@ void unpairSlave(int idx) {
   char id[20];
   hoFormatDeviceId(slaves[idx].mac, id);
 
+  // 解除配對前，先補發一則 status=offline 的保留訊息。少了這步，broker 上
+  // 會永遠留著最後那則 "online" 保留訊息，App 上就多出一台永遠在線、
+  // 卻怎麼控制都沒反應的幽靈設備。必須在陣列搬移之前呼叫，此時 slaves[idx]
+  // 還指向正確的這一台。
+  publishSlaveOffline(idx);
+
   espNowSendTo(slaves[idx].mac, HO_PKT_UNPAIR, nullptr, 0);
   delay(100);   // 給對方時間收到再刪 peer
 
@@ -1309,6 +1323,12 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
   if (header.type == HO_PKT_UNPAIR) {
     int idx = findSlave(info->src_addr);
     if (idx >= 0) {
+      // slave 主動解除配對：記下 MAC，交給 loop() 補發最後一則 offline
+      // （不能在這裡直接發 MQTT，見 pendingOfflineMac 宣告處的註釋）。
+      // 必須在陣列搬移之前記錄，否則 processPendingUnpairPublish() 拿到的
+      // 會是錯誤或已不存在的 MAC。
+      memcpy(pendingOfflineMac, info->src_addr, 6);
+      hasPendingOfflinePublish = true;
       for (int i = idx; i < slaveCount - 1; i++) slaves[i] = slaves[i + 1];
       slaveCount--;
       esp_now_del_peer(info->src_addr);
@@ -1914,6 +1934,155 @@ void publishStatus() {
   publishJsonDoc(topic.c_str(), doc, true);
 }
 
+// ── 代發 slave 狀態（Phase 2b Task 3）──
+// 用 slave 的 MAC 代發它的狀態，讓它在 App 眼裡就是一台普通設備。
+//
+// wifi 區塊的內容是刻意這樣填的（規格明訂）：App 現有的
+// Device.updateFromMqttMessage()（hoctrl/lib/models/device.dart:117-142）
+// 不用改就能解析，rssi 借來顯示 ESP-NOW 訊號強度。
+// via 是新欄位，標示這台是誰代發的。
+//
+// 與規格範例的唯一刻意差異：規格把 wifi.connected 寫死成 true，
+// 這裡改成跟著 slaves[idx].online。理由是 App 可能拿 wifi.connected 判斷上下線，
+// 寫死 true 會讓離線的 slave 在 App 上永遠顯示在線 —— 那正是規格自己
+// 「Slave 失聯時 master 要代發 offline」想避免的情況。
+void publishSlaveStatus(int idx) {
+  if (!mqttClient.connected()) return;
+  if (idx < 0 || idx >= slaveCount) return;
+
+  char id[20];
+  hoFormatDeviceId(slaves[idx].mac, id);
+  char ver[16];
+  formatSlaveVersion(idx, ver, sizeof(ver));
+
+  String topic = String("hoban/") + id + "/status";
+
+  JsonDocument doc;
+  doc["device_id"] = id;
+  doc["status"] = slaves[idx].online ? "online" : "offline";
+  doc["version"] = ver;
+  doc["model"] = "hoSlave1";
+  doc["via"] = getDeviceId();
+  doc["timestamp"] = millis() / 1000;
+
+  JsonObject wifi = doc["wifi"].to<JsonObject>();
+  wifi["connected"] = slaves[idx].online;
+  wifi["ssid"] = "ESP-NOW";
+  wifi["rssi"] = slaves[idx].rssi;
+  wifi["ip"] = "N/A";
+
+  JsonObject dev = doc["device"].to<JsonObject>();
+  dev["relay"] = slaves[idx].relay ? 1 : 0;
+
+  if (publishJsonDoc(topic.c_str(), doc, true)) {
+    slaves[idx].dirty = false;
+  }
+  // dirty 只在發布成功時才清：發失敗（例如剛好斷線）就留著，下次補發。
+}
+
+// 解除配對前，先把一則 status=offline 的保留訊息壓上去。
+// 少了這步，broker 上會永遠留著最後那則 "online" 的保留訊息，
+// App 上就多出一台永遠在線、卻怎麼控制都沒反應的幽靈設備。
+// 這裡直接強制把 slaves[idx].online 設 false 再委由 publishSlaveStatus() 組 doc，
+// 因為呼叫當下 slave 可能還在名冊上（online=true），要強制發 offline，
+// 而不是照它原本的線上狀態發布。
+void publishSlaveOffline(int idx) {
+  if (!mqttClient.connected()) return;
+  if (idx < 0 || idx >= slaveCount) return;
+  slaves[idx].online = false;
+  slaves[idx].dirty = false;
+  publishSlaveStatus(idx);
+}
+
+// 代發 slave 狀態的排程器。設計原則：每次呼叫最多發一台。
+//
+// 為什麼不 20 台一次全發：mqttClient.publish() 在連線正常時很快，但 socket
+// 卡住時會拖到 setSocketTimeout(3)。21 個 topic（master 自己 + 20 台 slave）
+// 背靠背最壞 63 秒，直接撞破 slave 的 30 秒失聯門檻＝籠子被打開。錯開之後
+// 每次 loop() 只有一次 publish()，最壞單次 3 秒，兩次之間都有完整的 loop()
+// 週期可發心跳。
+//
+// 為什麼一輪是 15 秒：slave 的資料本身由 pollNextSlave() 以 15 秒一輪更新，
+// 代發比資料更新還快是純浪費頻寬。兩者對齊後每次代發都帶到剛更新過的資料。
+const unsigned long SLAVE_STATUS_CYCLE_MS = 15000;
+const unsigned long SLAVE_STATUS_MIN_GAP_MS = 250;
+
+void slaveStatusScheduler() {
+  if (slaveCount == 0) return;
+  if (!mqttClient.connected()) return;
+
+  static unsigned long lastPubAt = 0;
+  static int rotateIdx = 0;
+
+  unsigned long now = millis();
+
+  // 任何一次發布之間至少隔 SLAVE_STATUS_MIN_GAP_MS，
+  // 避免 20 台同時翻轉時連續 20 個 loop() 各發一台把頻寬吃滿
+  if (now - lastPubAt < SLAVE_STATUS_MIN_GAP_MS) return;
+
+  // 優先處理有變化的：從 rotateIdx 開始找，確保多台同時 dirty 時能公平輪到
+  for (int k = 0; k < slaveCount; k++) {
+    int i = (rotateIdx + k) % slaveCount;
+    if (slaves[i].dirty) {
+      lastPubAt = now;
+      publishSlaveStatus(i);
+      return;
+    }
+  }
+
+  // 沒有變化就走例行輪播
+  unsigned long interval = SLAVE_STATUS_CYCLE_MS / (unsigned long)slaveCount;
+  if (interval < SLAVE_STATUS_MIN_GAP_MS) interval = SLAVE_STATUS_MIN_GAP_MS;
+  if (now - lastPubAt < interval) return;
+
+  lastPubAt = now;
+  if (rotateIdx >= slaveCount) rotateIdx = 0;
+  publishSlaveStatus(rotateIdx);
+  rotateIdx = (rotateIdx + 1) % slaveCount;
+}
+
+// SLAVES 指令與剛連上 broker 時用：讓整份名冊在接下來一輪內全部重發一次，
+// 而不是當場連發 20 個 topic
+void markAllSlavesDirty() {
+  for (int i = 0; i < slaveCount; i++) slaves[i].dirty = true;
+}
+
+// 處理「slave 主動解除配對」留下的最後一則 offline 代發（見
+// pendingOfflineMac／hasPendingOfflinePublish 宣告處的註釋）。
+// 由 loop() 呼叫，此時名冊已經沒有這台（onEspNowRecv() 已搬移陣列），
+// 不能用 idx 查表，直接用暫存的 MAC 組 topic 與內容。
+void processPendingUnpairPublish() {
+  if (!hasPendingOfflinePublish) return;
+  // 先清旗標再嘗試發布：即使這次發布失敗（例如剛好沒連上 MQTT）也不重試，
+  // 避免卡在一台已經不存在的 MAC 上占用代發頻寬。這是一次性的收尾訊息，
+  // 不像 slaves[idx].dirty 有名冊條目可以在下一輪自然補發。
+  hasPendingOfflinePublish = false;
+  if (!mqttClient.connected()) return;
+
+  char id[20];
+  hoFormatDeviceId(pendingOfflineMac, id);
+  String topic = String("hoban/") + id + "/status";
+
+  JsonDocument doc;
+  doc["device_id"] = id;
+  doc["status"] = "offline";
+  doc["version"] = "0.0.0";   // 已解除配對，名冊上沒有版本資料可查
+  doc["model"] = "hoSlave1";
+  doc["via"] = getDeviceId();
+  doc["timestamp"] = millis() / 1000;
+
+  JsonObject wifi = doc["wifi"].to<JsonObject>();
+  wifi["connected"] = false;
+  wifi["ssid"] = "ESP-NOW";
+  wifi["rssi"] = 0;
+  wifi["ip"] = "N/A";
+
+  JsonObject dev = doc["device"].to<JsonObject>();
+  dev["relay"] = 0;
+
+  publishJsonDoc(topic.c_str(), doc, true);
+}
+
 // ── 容量實測測試工具（Phase 2b）──
 // 測試用：把名冊灌成 n 台假 slave，用來實測 20 台時狀態 JSON 的真實大小。
 // 刻意「不」呼叫 saveSlaves()、也不註冊 peer —— 這是純記憶體內的假資料，
@@ -2215,6 +2384,10 @@ void loop() {
 
   // ── 分散式輪詢 slave 狀態，每次 loop() 最多問一台（見 pollNextSlave()）──
   pollNextSlave();
+
+  // ── 代發 slave 狀態（每次 loop() 最多代發一台，見 slaveStatusScheduler()）──
+  processPendingUnpairPublish();
+  slaveStatusScheduler();
 
   // ── 每 15 秒檢查一次 slave 是否離線 ──
   static unsigned long lastOnlineCheck = 0;

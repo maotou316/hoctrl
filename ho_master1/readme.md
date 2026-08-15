@@ -298,10 +298,11 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 
 | Topic | 方向 | 說明 |
 |---|---|---|
-| `hoban/<deviceId>/status` | 發布 | 狀態回報，QoS1、retain，每 10 秒一次；LWT 也發到這個 topic（`status:"offline"`） |
+| `hoban/<deviceId>/status` | 發布 | master 自身狀態回報，QoS1、retain，每 10 秒一次；LWT 也發到這個 topic（`status:"offline"`） |
 | `hoban/<deviceId>/control` | 訂閱 | App／使用者送控制指令 |
+| `hoban/<slaveDeviceId>/status` | 發布（代發） | master 用每台 slave 的 MAC 代發它的狀態，retain。見下方「代發 slave 狀態」 |
 
-`<deviceId>` 格式為 `hoban-<MAC位址>`，與 BLE 裝置名稱相同。
+`<deviceId>` 格式為 `hoban-<MAC位址>`，與 BLE 裝置名稱相同；`<slaveDeviceId>` 同格式，用 slave 自己的 MAC。
 
 ### 控制指令表
 
@@ -343,8 +344,56 @@ Phase 2a **尚未支援** `ALL:*` 群組指令、`PAIR:*` / `UNPAIR:*` 針對 sl
 }
 ```
 
-Phase 2a 尚未包含 `slaves` 陣列（各 slave 的個別狀態），那是 Phase 2b 才加。
-容量瓶頸細節見文末「已知風險」第三項。
+Phase 2a 尚未包含 `slaves` 陣列（各 slave 的個別狀態）；Phase 2b Task 1/2 已補上
+（`appendSlavesArray()`），容量瓶頸細節見文末「已知風險」第三項。
+
+### 代發 slave 狀態（Phase 2b Task 3）
+
+master 除了自己的 `hoban/<deviceId>/status`，還會用**每台 slave 的 MAC** 代發一份
+`hoban/hoban-<slaveMac>/status`，讓 slave 在 App 眼裡就是一台普通設備 —— App 現有
+的設備卡片、詳情頁、「開保險→關門→關保險」三段鎖幾乎零改動就能個別控制每台 slave。
+
+**payload 格式**（由 `publishSlaveStatus()` 組出）：
+
+```json
+{
+  "device_id": "hoban-aabbccddeeff",
+  "status": "online",
+  "version": "1.0.0",
+  "model": "hoSlave1",
+  "via": "hoban-<masterMac>",
+  "timestamp": 12345,
+  "wifi": { "connected": true, "ssid": "ESP-NOW", "rssi": -72, "ip": "N/A" },
+  "device": { "relay": 0 }
+}
+```
+
+`wifi` 區塊刻意填成與一般設備相同的形狀，讓 App 既有的手動解析不用改就能吃下；
+`rssi` 借來顯示 ESP-NOW 訊號強度；`via` 是新欄位，標示這台是被哪一台 master 代發的。
+
+**排程：每次 `loop()` 最多代發一台**（`slaveStatusScheduler()`），理由是容量：
+master 自己 + 20 台 slave = 21 個 topic，若背靠背發布，`mqttClient.publish()`
+在 socket 卡住時最壞吃到 `setSocketTimeout(3)` 的 3 秒（DNS 異常時單次可達更久），
+21 個連發最壞可達 63 秒，直接撞破 slave 的 30 秒失聯門檻 ＝ 籠子被打開。
+排程器每次只發一台，兩次之間都留有完整的 `loop()` 週期發心跳，
+單次 `loop()` 因代發被拖慢的上限是一次 `publishJsonDoc()` 的耗時（最壞約 3 秒）。
+
+一輪例行輪播固定 15 秒（`SLAVE_STATUS_CYCLE_MS`），與 `pollNextSlave()`
+更新 slave 資料的節奏對齊 —— 代發比資料更新還快是純浪費頻寬。20 台滿載時，
+每台約 750ms 被輪到一次；狀態有變化（上下線翻轉、繼電器變化、版本回報）時
+會設 `dirty` 立刻插隊代發，不必等輪播輪到。
+
+**離線代發與已知限制**：slave 超過 30 秒沒回應時，`updateSlaveOnlineStatus()`
+會把它標記離線並設 `dirty`，下一輪代發就會送出 `status:"offline"`，避免 App
+一直顯示上線。解除配對時（無論是序列埠 `unpair <n>` 還是 slave 主動送
+`HO_PKT_UNPAIR`）也會補發一次 offline，否則 broker 上會留下永遠在線的幽靈設備。
+
+**但這只涵蓋「master 活著、slave 失聯」的情況** —— PubSubClient 一條連線只有
+**一個 LWT（遺囑）名額**，已經給了 master 自己（`hoban/<deviceId>/status`）。
+**master 自己斷電或失去網路時，所有 slave 會停在最後一則 `"online"` 保留訊息**，
+不會被代發成 offline（沒有 loop() 可以跑，代發機制本身也停了）。這個缺口
+由 App 端用 `via` 欄位彌補：master 若本身離線，其底下所有 slave 都應視為
+狀態不明，不能單看 slave 自己那則 retain 的 `"online"` 就判斷實際在線。
 
 ## 與 ho_relay2 的差異
 
