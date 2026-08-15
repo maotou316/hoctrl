@@ -568,7 +568,7 @@ uint8_t lastKnownChannel = 0;     // 用於偵測 channel 變化
 // 因為 loadNetConfig()／saveNetConfig() 要存取 lastApChannel。
 
 // 「WiFi 關聯進行中」旗標。關聯期間 master 可能離開 slave 鎖定的 channel
-//（限制在單一 channel 掃描仍有短暫的 off-channel 時間；升級成全頻掃描時更是整整一輪），
+//（以指定 channel 起始掃描仍有短暫的 off-channel 時間；升級成全頻掃描時更是整整一輪），
 // 此時把心跳間隔臨時加密到 HEARTBEAT_INTERVAL_ASSOC，用發送次數換命中率。
 // 由 connectToWiFi() 在 WiFi.begin() 前後設定，maintainEspNow() 讀取。
 bool wifiAssociating = false;
@@ -696,17 +696,19 @@ bool updateResetButton(unsigned long now) {
   }
 
   if (resetPhase == RESET_IDLE) {
+    // 刻意不在這裡印訊息：0~3 秒是「刻意靜默」區間（可能只是短按配對），
+    // 見本函式最上方註釋。訊息延後到真正確認為長按（滿 3 秒）才一併印出。
     resetPhase = RESET_WAITING;
     resetPressStart = now;
-    Serial.println("[重置] 偵測到按鈕按下，開始計時...");
     return false;
   }
 
   unsigned long pressDuration = now - resetPressStart;   // 無號數減法，不怕 millis() 溢位
 
   if (resetPhase == RESET_WAITING) {
-    if (pressDuration < LONG_PRESS_TIME) return false;   // 未滿 3 秒，LED 交還上層
+    if (pressDuration < LONG_PRESS_TIME) return false;   // 未滿 3 秒，LED 交還上層，全程靜默
     resetPhase = RESET_CONFIRM_BLINK;
+    Serial.println("[重置] 偵測到按鈕按下，開始計時...");
     Serial.println("[重置] 長按 3 秒達成，開始 LED 閃爍確認...");
   }
 

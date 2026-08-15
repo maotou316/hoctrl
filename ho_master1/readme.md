@@ -153,7 +153,20 @@ master 的 LED 由兩套機制分工，**刻意不合併成一個函式**：
 長亮改用 `espNowDelay()` 而非裸 `delay()`，等待期間心跳同樣照常發出。
 整個約 5.7 秒的長按流程，心跳幾乎沒有中斷——真正的空窗只發生在 `ESP.restart()`
 之後到韌體重新開機完成之間，這與其他觸發重啟的路徑（例如 BLE 配網完成）同源，
-不是本功能特有的風險。
+不是本功能特有的風險。這段空窗實測約落在 **2.2~3.0 秒**（`setup()` 內
+`delay(1000)` + `delay(50)` + `checkStuckButtons()` 的 500ms 取樣，再加上
+ESP-NOW 初始化），並非「數百毫秒」這麼短；把長按流程本身的 5.7 秒也算進去，
+總空窗約 3.3~4.0 秒，仍遠低於 slave 的 30 秒失聯門檻，安全結論不變。
+
+**已知限制（MQTT 重連可能吃掉閃爍確認的視覺回饋）**：`loop()` 既有的 MQTT
+重連（`smartConnect()`）最壞情況會阻塞約 18 秒，且這段**沒有按鈕逃生口**
+（`connectToWiFi()` 的等待迴圈有 `anyResetButtonPressed()` 可提早跳出，
+`smartConnect()` 這段沒有）。若使用者恰好在按下重置鈕的同一輪 `loop()` 觸發了
+`smartConnect()`，會先卡住 18 秒才回到 `updateResetButton()`；下一次呼叫時
+`pressDuration` 已遠超過 3+2 秒門檻，會在**同一次呼叫內**直接跳過閃爍確認、
+判定滿 2 秒並執行重置——使用者全程看不到閃爍回饋，也沒有機會在閃爍階段放開取消。
+心跳空窗仍受既有的 18 秒上限，低於 30 秒門檻，且誤觸風險有限（仍要連續按住
+超過 18 秒），因此不是缺陷，但視覺回饋會消失，列為已知限制。
 
 **已知限制（現場恢復手段）**：master 之前完全沒有現場恢復手段——長按重置
 未實作、WiFi 密碼打錯時 MQTT 依定義連不上、也沒有 AP 模式 Web UI。本項補上
@@ -369,7 +382,7 @@ master 只會用預設方式嘗試一次、失敗就等下一輪重連（見 `lo
 若之後遇到真的連不上的路由器，屆時再針對該款 AP 補特定的重試模式，
 比現在盲目加五段退避更務實。
 
-### 3. 狀態 JSON 的真正容量瓶頸是 `StaticJsonDocument<512>` 與 `char buf[512]`
+### 3. 狀態 JSON 的真正容量瓶頸是 `char buf[512]`
 
 不是 `mqttClient` 的 1024 buffer。`publishStatus()` 目前實測最壞情況約 317 bytes，
 餘裕僅約 195 bytes。真正會**截斷**輸出的邊界是 `char buf[512]`：`serializeJson()`
@@ -386,9 +399,11 @@ buffer，`publish()` 因此仍會回傳 `true`。`publishStatus()` 的 `if (!res
 配置不出來時才會回 `true`。仍保留這道檢查（配置失敗本身值得知道），但序列埠
 警告訊息已改用「記憶體配置失敗」的措辭，不再說「超出 512 容量」。
 
-Phase 2b 加入 `slaves` 陣列（每台 slave 的個別狀態）時，**必須同時放大三處**：
-`StaticJsonDocument<512>`、`char buf[512]`、以及 `mqttClient.setBufferSize(1024)`，
-三者任一沒跟著放大都會讓新加的欄位被靜默截斷或整包發布失敗。
+Phase 2b 加入 `slaves` 陣列（每台 slave 的個別狀態）時，**必須同時放大兩處**：
+`char buf[512]`、以及 `mqttClient.setBufferSize(1024)`，兩者任一沒跟著放大都會讓
+新加的欄位被靜默截斷或整包發布失敗。`StaticJsonDocument<512>` 的 `512` 在
+ArduinoJson 7.x 已無容量作用（見上段說明），要改的話純粹是為了可讀性、
+讓數字與 `buf`/`setBufferSize` 對齊，不是為了擴充容量，不改也不影響功能。
 
 ## 編譯與燒錄
 
