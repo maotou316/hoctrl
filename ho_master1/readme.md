@@ -180,8 +180,46 @@ UUID 與欄位路徑必須與 `ho_relay2` 完全一致，否則現有 Flutter Ap
 `connectToWiFi()` 與 `ho_relay2` 的差異、以及 loop() 重連策略，詳見程式碼中
 `connectToWiFi()` 與 `loop()` WiFi 管理區塊的註釋。重點：不呼叫 `WiFi.scanNetworks()`、
 不呼叫 `WiFi.mode(WIFI_OFF)`、所有等待都走 `maintainEspNow()` 讓心跳照常發出，
-最壞阻塞 15 秒。重連時若有上次成功關聯的 channel／BSSID 記錄，會直接指定跳過
-`WiFi.begin()` 內建的全頻道掃描（該掃描即使不呼叫 `scanNetworks()` 仍會發生）。
+最壞阻塞 15 秒。
+
+關聯方式是三段式，優先序由高到低：
+
+1. 有 channel ＋ BSSID（上次成功關聯的記錄）→ 直接定向關聯，完全不掃描
+2. 只有 channel（BSSID 已在前一次失敗時清掉）→ `WiFi.begin(ssid, password, ch, nullptr)`，
+   把 `WiFi.begin()` 內建的掃描限制在單一 channel（該掃描即使不呼叫 `scanNetworks()`
+   仍會發生，全頻一輪約 20 秒）
+3. 兩者都沒有 → 才退回全頻掃描
+
+失敗時**只清 BSSID、保留 channel**，連續失敗達 `WIFI_CHANNEL_LOCK_MAX_FAIL`（10）次
+才判定 AP 真的換頻、升級成一次全頻掃描並重新學習 channel。
+關聯期間 `wifiAssociating` 為 true，心跳間隔由 1000ms 臨時縮到
+`HEARTBEAT_INTERVAL_ASSOC`（200ms）。
+
+## ESP-NOW 心跳的實際保證
+
+slave 的失聯門檻是 30 秒，超過就強制關閉繼電器（動物管制設備＝籠子被打開），
+所以「心跳空窗必須 < 30 秒」是本韌體的核心安全性質。但**心跳送出 ≠ 送達** ——
+ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA channel
+與 slave 鎖定的 channel 不同時，心跳就打在錯的頻道上。因此保證分成兩個面向：
+
+| 情境 | 心跳有沒有發 | 有沒有打在對的 channel | 最壞空窗 |
+|---|---|---|---|
+| BLE 配網中 | 有（`loop()` 只跳過 WiFi/MQTT 區塊） | 有，開機時由 `restoreEspNowChannelForOfflineBoot()` 從 NVS `homaster/espch` 切回（前提：NVS 已有該鍵） | < 1 秒 |
+| WiFi 關聯中 | 有（等待迴圈走 `maintainEspNow()`） | 鎖定單一 channel；連續失敗 10 次後的那一次全頻掃描例外 | < 1 秒（間隔已加密到 200ms） |
+| MQTT 連線中 | **沒有** —— `mqttClient.connect()` 是不可中斷的阻塞呼叫 | 不影響 channel | **約 18 秒**（DNS `getaddrinfo()` 無 timeout 參數，由 lwIP `DNS_MAX_RETRIES` 決定約 15 秒＋TCP 3 秒） |
+| `espNowDelay()` 各處等待 | 有 | 不影響 channel | < 1 秒 |
+
+因此 `smartConnect()` 刻意設計成**一次呼叫只嘗試一台 broker**，由 `loop()` 的
+10 秒重連節奏推進，確保兩次 18 秒阻塞之間必定隔著約 10 秒、約 10 則心跳。
+絕對不要把它改回「一個 for 迴圈試完全部」—— 兩次背靠背就是 36 秒，直接跨過門檻。
+
+**已知殘存風險**（不宣稱零風險）：
+
+- 韌體剛燒錄／`homaster/espch` 尚未寫入時，開機進 BLE 配網模式只能停在 channel 1，
+  鎖在其他 channel 的 slave 會先失聯再輪掃回來（序列埠會印 `⚠ [channel] …` 警告）
+- 連續 10 次關聯失敗後的那一次全頻掃描，期間心跳命中率降到約 1/13
+  （已用 200ms 加密心跳把 30 秒內全數落空的機率壓到 6×10⁻⁶ 量級）
+- MQTT 阻塞的 18 秒是估算值上界，若某個 broker 的 DNS 行為更慢仍有超出的可能
 
 ## MQTT
 
@@ -202,7 +240,7 @@ UUID 與欄位路徑必須與 `ho_relay2` 完全一致，否則現有 Flutter Ap
 | `ON` | `pulseRelay(2000)` 點動 master 自己的繼電器 2 秒，並回報狀態 |
 | `OFF` | `setRelayPins(false)` 關閉 master 自己的繼電器，並回報狀態 |
 | `reset` | 清除 NVS 網路設定並重啟，回到 BLE 配網模式 |
-| `FIND_BEST_SERVER` | 主動斷開目前 MQTT 連線並重新走 `smartConnect()` 挑選伺服器 |
+| `FIND_BEST_SERVER` | 主動斷開目前 MQTT 連線，把輪詢游標歸零（`resetMqttProbe()`）後重新走 `smartConnect()`。注意：`smartConnect()` 一次只試一台，第一台連不上時會由 `loop()` 每 10 秒推進一台，不會在單次呼叫裡試完全部 |
 | `HASRELAY:ON` / `HASRELAY:OFF` | 設定「本機是否有接繼電器」並存 NVS，回報狀態 |
 
 Phase 2a **尚未支援** `ALL:*` 群組指令、`PAIR:*` / `UNPAIR:*` 針對 slave 的指令、
@@ -241,7 +279,7 @@ Phase 2a 尚未包含 `slaves` 陣列（各 slave 的個別狀態），那是 Ph
 
 | 面向 | `ho_relay2` | `ho_master1` |
 |---|---|---|
-| ESP-NOW | 無 | 全程維持，配網／WiFi 重連／MQTT 切換期間都不能失聯 |
+| ESP-NOW | 無 | 全程維持。配網／WiFi 重連／MQTT 重連期間心跳照常發出，且會盡量停在 slave 鎖定的 channel 上，把心跳空窗壓在 slave 的 30 秒失聯門檻以下（實際保證與殘存風險見下方「ESP-NOW 心跳的實際保證」） |
 | BLE 模式下的 `loop()` | 直接 `return`，其餘邏輯全部跳過 | 只跳過 WiFi／MQTT 管理區塊，按鈕、`maintainEspNow()`、LED 仍照跑 |
 | BLE `onDisconnect` | 沒有重新開始廣播，App 斷線後需重開機才能再次配對 | 補上 `BLEDevice::startAdvertising()`，斷線可直接重連 |
 | 網路設定儲存 | EEPROM 128 bytes，`mqttPassword` 與 `mqttPort` 位址重疊，MQTT 密碼實際只能 12 字元 | NVS（`Preferences`），各欄位獨立，密碼上限 64 字元 |
@@ -255,7 +293,7 @@ Phase 2a 尚未包含 `slaves` 陣列（各 slave 的個別狀態），那是 Ph
 
 ### 1. WROOM flash 用量偏緊（82.7%）
 
-實測 1,680,595 / 2,031,616 bytes（app0 分區），餘裕僅約 343KB。
+實測 1,682,707 / 2,031,616 bytes（app0 分區，82.8%），餘裕僅約 341KB。
 Phase 4 要加轉送 OTA 的程式碼前，務必先跑 `.\flash.ps1 -Model master` 確認還編得過；
 若餘裕不足，需考慮用 NimBLE 取代目前的 Bluedroid（BLE stack 是兩板差距的主因，
 C3 同一份 `partitions.csv` 下用量僅約 63.8%）。
@@ -277,9 +315,10 @@ master 只會用預設方式嘗試一次、失敗就等下一輪重連（見 `lo
 
 不是 `mqttClient` 的 1024 buffer。`publishStatus()` 目前實測最壞情況約 317 bytes，
 餘裕僅約 195 bytes。一旦超過 512 bytes，`ArduinoJson` 會**截斷**輸出而非溢位或報錯，
-且截斷後的長度仍小於 `mqttClient` 的 1024 buffer，`publish()` 因此仍會回傳 `true`——
-現有的診斷（見 `publishStatus()` 裡 `if (!ok)` 那段）完全抓不到這種情況，只會抓到
-「連 1024 都塞不下」的極端案例。
+且截斷後的長度仍小於 `mqttClient` 的 1024 buffer，`publish()` 因此仍會回傳 `true`。
+`publishStatus()` 的 `if (!res)` 診斷只抓得到「連 1024 都塞不下」的極端案例，
+所以另外補了 `doc.overflowed()` 與 `n >= sizeof(buf) - 1` 兩道截斷偵測，
+發生時會印出 `⚠ [MQTT] 狀態 JSON 已超出 …` 警告。
 
 Phase 2b 加入 `slaves` 陣列（每台 slave 的個別狀態）時，**必須同時放大三處**：
 `StaticJsonDocument<512>`、`char buf[512]`、以及 `mqttClient.setBufferSize(1024)`，

@@ -270,14 +270,17 @@ volatile uint8_t lastWifiDisconnectReason = 0;
 unsigned long wifiConnectedTime = 0;
 uint8_t lastKnownChannel = 0;     // 用於偵測 channel 變化
 
-// 記住上次成功關聯的 AP channel／BSSID，重連時可直接指定、跳過 WiFi.begin() 內建的
-// 全頻道掃描（review 發現：即使不呼叫 WiFi.scanNetworks()，WiFi.begin(ssid, password)
-// 不帶 channel/BSSID 時，ESP-IDF 底層關聯流程仍會自己全頻道掃一輪，約 1.5 秒，
-// 且 setAutoReconnect(true) 失敗後會立刻再掃，對 ESP-NOW 心跳命中率殺傷力等同
-// 顯式呼叫 scanNetworks()）。只存 RAM 不寫 NVS：開機第一次本來就要掃，沒有歷史資料可用。
-uint8_t lastApChannel = 0;
-uint8_t lastApBssid[6] = { 0 };
-bool haveLastApBssid = false;
+// lastApChannel／lastApBssid／haveLastApBssid 的宣告已上移到 netPrefs 附近
+//（loadNetConfig()／saveNetConfig() 要存取 lastApChannel，見最終審查修正）。
+// lastApChannel 寫進 NVS 的 hoban/apch；另有 slaveLockChannel 寫進 homaster/espch。
+// 兩者用途不同、命名空間刻意分開，理由見程式碼註釋與下方「最終審查修正」章節。
+
+// 「WiFi 關聯進行中」旗標。關聯期間心跳間隔臨時加密到 HEARTBEAT_INTERVAL_ASSOC(200ms)
+bool wifiAssociating = false;
+
+// 連續幾次「鎖定 channel 關聯」失敗後，才升級成一次全頻掃描
+const int WIFI_CHANNEL_LOCK_MAX_FAIL = 10;
+int wifiChannelLockFailCount = 0;
 
 // WiFi 事件回調：取得底層斷線原因碼，並在取得 IP 時通知 slave 新 channel
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -286,9 +289,12 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     Serial.printf("[WiFi] 斷線原因碼: %d\n", lastWifiDisconnectReason);
     // 常見：2=AUTH_EXPIRE 15=4WAY_HANDSHAKE_TIMEOUT 201=NO_AP_FOUND 202=AUTH_FAIL
   } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
-    // 設在事件回調而非 connectToWiFi() 的成功分支（review 修正 Important）：
-    // setAutoReconnect(true) 背景重連成功時不會經過 connectToWiFi()，若只在那裡設值，
-    // 背景重連後 wifiConnectedTime 會停留在舊值，Task 4~7 拿它算連線時長會讀到錯值。
+    // 設在事件回調而非 connectToWiFi() 的成功分支：GOT_IP 是「取得 IP」這件事的
+    // 唯一權威來源，不論由哪條路徑觸發都會進來。
+    // 註（最終審查更正）：舊版理由「setAutoReconnect(true) 背景重連不會經過
+    // connectToWiFi()」是錯的 —— core 3.3.7 的 _autoReconnect 只存在於建構子／
+    // setter／getter，斷線事件處理完全沒讀它，setAutoReconnect() 實際上是死碼。
+    // 結論（設在 GOT_IP）仍然正確且更精確。
     wifiConnectedTime = millis();
     Serial.printf("[WiFi] 取得 IP: %s\n", WiFi.localIP().toString().c_str());
   }
@@ -324,23 +330,33 @@ void connectToWiFi() {
   WiFi.disconnect(false);
   espNowDelay(100);
 
-  // WiFi.begin(ssid, password) 不指定 channel/BSSID 時，ESP-IDF 底層關聯流程仍會自己
-  // 全頻道掃描一輪（約 1.5 秒），這正是我們想擋掉的行為，只是被包在 begin() 裡面
-  // （review 修正 Critical）。若有上次成功關聯的紀錄，直接帶 channel/BSSID 跳過掃描；
-  // 沒有（開機後第一次）才退回不帶參數的一般連線。
+  // 進入關聯階段：心跳改用加密間隔（最終審查修正 Critical 3）
+  wifiAssociating = true;
+
+  // 三段式優先序（最終審查修正 Critical 3）：
+  //   1. channel＋BSSID → 定向關聯，完全不掃描
+  //   2. 只有 channel  → 仍把 WiFi.begin() 內建的掃描限制在單一 channel
+  //   3. 都沒有        → 才退回全頻掃描（一輪約 20 秒，心跳命中率剩約 1/13）
   if (haveLastApBssid) {
     Serial.printf("[WiFi] 使用已知 channel=%u 的 BSSID 直接關聯，跳過掃描\n", lastApChannel);
     WiFi.begin(ssid, password, lastApChannel, lastApBssid);
+  } else if (lastApChannel >= 1 && lastApChannel <= 13) {
+    Serial.printf("[WiFi] 不指定 BSSID，但把掃描限制在已知 channel=%u\n", lastApChannel);
+    WiFi.begin(ssid, password, lastApChannel, nullptr);
   } else {
+    Serial.println("[WiFi] 無已知 channel，退回全頻掃描關聯");
     WiFi.begin(ssid, password);
   }
 
-  // 等待最多 15 秒，期間持續發心跳
+  // 等待最多 15 秒，期間持續發心跳（關聯中自動加密到 200ms）
   const int maxWaitMs = 15000;
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < maxWaitMs) {
     maintainEspNow();
-    if (anyResetButtonPressed()) return;   // 讓長按重置仍可用
+    if (anyResetButtonPressed()) {
+      wifiAssociating = false;
+      return;   // 讓長按重置仍可用
+    }
     delay(100);
 
     // 認證失敗類的原因碼不必等滿，直接放棄本次
@@ -350,6 +366,8 @@ void connectToWiFi() {
     }
   }
 
+  wifiAssociating = false;
+
   if (WiFi.status() == WL_CONNECTED) {
     // wifiConnectedTime 改在 onWiFiEvent() 的 GOT_IP 分支設定，這裡不重複設
     Serial.printf("[WiFi] 已連線 IP=%s RSSI=%d\n",
@@ -357,15 +375,28 @@ void connectToWiFi() {
     lastApChannel = WiFi.channel();
     memcpy(lastApBssid, WiFi.BSSID(), 6);
     haveLastApBssid = true;
+    wifiChannelLockFailCount = 0;
+    saveApChannel(lastApChannel);                          // hoban/apch
+    if (slaveCount > 0) saveSlaveLockChannel(lastApChannel); // homaster/espch
     onWifiChannelMayHaveChanged();
   } else {
     Serial.printf("[WiFi] 連線失敗，狀態=%d 原因碼=%d\n",
                   WiFi.status(), lastWifiDisconnectReason);
-    // 帶 channel/BSSID 關聯失敗：AP 可能換了 BSSID 或已關機重啟，清掉記錄，
-    // 讓下一次重試（loop() 的重連邏輯會再呼叫這裡）退回不帶參數的一般連線
+    // 只清 BSSID，刻意「不」跟著清掉 lastApChannel（最終審查修正 Critical 3）：
+    // 舊版兩個一起清，導致第 2 次重試起就全部退回全頻掃描，30 秒 30 則心跳
+    // 全數落空的機率約 9%，而落空的後果是 slave 強制打開繼電器。
     if (haveLastApBssid) {
-      Serial.println("[WiFi] 已知 channel/BSSID 連線失敗，清除記錄，下次改用一般連線");
+      Serial.println("[WiFi] 指定 BSSID 關聯失敗，清除 BSSID 記錄，下次改為只鎖定 channel 掃描");
       haveLastApBssid = false;
+    }
+    if (lastApChannel != 0) {
+      wifiChannelLockFailCount++;
+      if (wifiChannelLockFailCount >= WIFI_CHANNEL_LOCK_MAX_FAIL) {
+        wifiChannelLockFailCount = 0;
+        Serial.printf("[WiFi] 已連續 %d 次在 channel %u 上關聯失敗，下次改為全頻掃描重新學習\n",
+                      WIFI_CHANNEL_LOCK_MAX_FAIL, lastApChannel);
+        lastApChannel = 0;
+      }
     }
   }
 }
@@ -462,7 +493,9 @@ WiFi 區塊之後才做點動（`pulseActive`）結束檢查，但 `connectToWiF
 void maintainEspNow() {
   static unsigned long lastBeat = 0;
   unsigned long now = millis();
-  if (now - lastBeat >= HEARTBEAT_INTERVAL) {
+  // WiFi 關聯期間改用加密間隔 200ms（最終審查修正 Critical 3）
+  unsigned long interval = wifiAssociating ? HEARTBEAT_INTERVAL_ASSOC : HEARTBEAT_INTERVAL;
+  if (now - lastBeat >= interval) {
     lastBeat = now;
     sendHeartbeat();
   }
@@ -484,11 +517,21 @@ void maintainEspNow() {
 
 ```cpp
   WiFi.onEvent(onWiFiEvent);
+  // 註（最終審查更正）：setAutoReconnect(true) 在 core 3.3.7 是死碼，_autoReconnect
+  // 只存在於建構子／setter／getter，斷線事件處理完全沒讀它。真正負責重連的是
+  // loop() 的 WiFi 管理區塊。保留這行只為與其他 sketch 寫法一致並向前相容。
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);      // 禁用睡眠，避免 ESP-NOW 收包延遲
 
   if (hasWifiConfig()) {
     connectToWiFi();
+  } else {
+    bleConfigMode = true;
+    // 最終審查修正 Critical 2：本次開機不關聯 WiFi，channel 會停在 WIFI_STA 預設的 1，
+    // 先從 NVS(homaster/espch) 切回 slave 鎖定的 channel，否則整段配網期間
+    // 已配對的 slave 全部失聯關籠
+    restoreEspNowChannelForOfflineBoot();
+    setupBLE();
   }
 ```
 
@@ -640,24 +683,62 @@ bool quickConnectToIndex(int index) {
 `quickConnectCustom()` 結構相同，差別：用 `mqttServer`/`mqttPort`，帳密 `strlen() > 0` 才傳否則 `NULL`，且**不更新** `currentServerIndex`。請照此寫出。
 
 ```cpp
-// 依序嘗試：自訂伺服器 → 從上次成功的位置輪詢預設清單
+// 最終審查修正 Critical 1：改成「每次呼叫只嘗試一台 broker」。
+// 語義不變（自訂伺服器優先 → 從上次成功的位置輪詢預設清單），但改由檔案層級的
+// 游標推進，其餘交給 loop() 既有的 10 秒重連節奏。
+//
+// 為什麼非改不可：單次 mqttClient.connect() 對不可達目標最壞約 18 秒
+//（NetworkClient::connect() 先做 getaddrinfo()，這段沒有 timeout 參數，
+// 由 lwIP 的 DNS_MAX_RETRIES 指數退避決定約 15 秒；
+// WIFI_CLIENT_DEF_CONN_TIMEOUT_MS=3000 只管 TCP、setSocketTimeout(3) 只管 CONNACK），
+// 而它是不可中斷的阻塞呼叫，期間 maintainEspNow() 完全不會被叫到。
+// 舊寫法在自訂伺服器失敗後立刻接第一台預設伺服器 = 背靠背 36 秒 > 30 秒門檻，
+// slave 必定失聯關籠。觸發條件：AP 正常但 WAN/DNS 不通（此時 WiFi 仍 WL_CONNECTED，
+// loop() 每 10 秒進來一次，每次都製造 36 秒心跳真空）。
+bool mqttCustomTried = false;
+int  mqttProbeOffset = 0;
+bool mqttLastHasCustom = false;
+
+void resetMqttProbe() {
+  mqttCustomTried = false;
+  mqttProbeOffset = 0;
+}
+
 void smartConnect() {
   if (!WiFi.isConnected()) return;
 
-  if (useCustomServer && strlen(mqttServer) > 0) {
-    if (quickConnectCustom()) return;
+  bool hasCustom = (useCustomServer && strlen(mqttServer) > 0);
+  if (hasCustom != mqttLastHasCustom) {   // 設定被改動 → 游標歸零重新開始
+    mqttLastHasCustom = hasCustom;
+    resetMqttProbe();
   }
 
-  for (int i = 0; i < DEFAULT_SERVER_COUNT; i++) {
-    int index = (currentServerIndex + i) % DEFAULT_SERVER_COUNT;
-    if (quickConnectToIndex(index)) return;
-    espNowDelay(300);   // 錯開重試，期間維持心跳
+  if (hasCustom && !mqttCustomTried) {
+    mqttCustomTried = true;
+    if (quickConnectCustom()) {
+      resetMqttProbe();
+      return;
+    }
+    return;   // 本次呼叫只嘗試這一台
   }
 
-  currentServerIndex = (currentServerIndex + 1) % DEFAULT_SERVER_COUNT;
-  Serial.println("[MQTT] 所有伺服器都連不上");
+  int index = (currentServerIndex + mqttProbeOffset) % DEFAULT_SERVER_COUNT;
+  mqttProbeOffset++;
+  if (quickConnectToIndex(index)) {
+    resetMqttProbe();   // 成功時 quickConnectToIndex() 已把 currentServerIndex 設為 index
+    return;
+  }
+
+  if (mqttProbeOffset >= DEFAULT_SERVER_COUNT) {
+    currentServerIndex = (currentServerIndex + 1) % DEFAULT_SERVER_COUNT;
+    resetMqttProbe();
+    Serial.println("[MQTT] 本輪所有伺服器都連不上，下次改從下一台開始");
+  }
 }
 ```
+
+`FIND_BEST_SERVER` 指令在呼叫 `smartConnect()` 前必須先 `resetMqttProbe()`，
+語義才是「重新挑一台最好的」而非「接著上次的位置繼續」。
 
 - [ ] **Step 3: loop() 的 MQTT 管理**
 
@@ -669,8 +750,11 @@ void smartConnect() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
       if (now - lastReconnect > 10000) {
-        lastReconnect = now;
         smartConnect();
+        // 最終審查修正：lastReconnect 必須在阻塞呼叫「之後」用新的 millis() 記錄。
+        // smartConnect() 最壞阻塞約 18 秒，若沿用進入迴圈前的 now，10 秒節流立刻
+        // 成立、變成背靠背重試，兩次阻塞之間只擠得出一則心跳。
+        lastReconnect = millis();
       }
     } else {
       mqttClient.loop();
@@ -763,10 +847,22 @@ void publishStatus() {
   dev["channel"] = currentChannel;
   dev["long_range"] = longRangeEnabled;
 
+  // 最終審查修正 6：真正的容量瓶頸是 StaticJsonDocument<512> 與 char buf[512]，
+  // 不是 mqttClient 的 1024 buffer。ArduinoJson 放不下時是「截斷」而非溢位，
+  // 截斷後長度仍 < 1024 → publish() 回 true → 靜默失敗。
+  if (doc.overflowed()) {
+    Serial.println("⚠ [MQTT] 狀態 JSON 已超出 StaticJsonDocument<512> 容量並被截斷，"
+                   "請加大 doc 與 buf 的容量（publish 仍會回報成功，屬靜默失敗）");
+  }
+
   char buf[512];
   size_t n = serializeJson(doc, buf);
-  bool ok = mqttClient.publish(topic.c_str(), buf, true);
-  if (!ok) {
+  if (n >= sizeof(buf) - 1) {
+    Serial.printf("⚠ [MQTT] 序列化結果已填滿 buf[%u]，內容可能被截斷\n",
+                  (unsigned)sizeof(buf));
+  }
+  bool res = mqttClient.publish(topic.c_str(), buf, true);   // 專案慣例用 res 不用 ok
+  if (!res) {
     Serial.printf("[MQTT] 狀態發布失敗（長度 %u，buffer %u）\n",
                   (unsigned)n, (unsigned)mqttClient.getBufferSize());
   }
@@ -1015,10 +1111,49 @@ MQTT topic 與指令表、狀態 JSON 範例、與 `ho_relay2` 的差異說明�
 
 ---
 
+## 最終審查修正紀錄（2026-08-15，Phase 2a 收尾）
+
+最終審查在已完成的實作上再抓到 3 個 Critical（都會讓 slave 判定失聯並強制關閉
+繼電器＝籠子被打開）＋ 1 個文件缺陷 ＋ 4 個建議項。上方各 Task 的程式碼區塊
+已同步更新，此處記錄修正的全貌：
+
+| # | 等級 | 問題 | 修法 |
+|---|---|---|---|
+| 1 | Critical | `smartConnect()` 在自訂伺服器失敗後立刻接第一台預設伺服器，兩次 `mqttClient.connect()` 背靠背最壞 36 秒無心跳（> 30 秒門檻）。單次 18 秒的主因是 `getaddrinfo()` DNS 解析沒有 timeout 參數 | 改成每次呼叫只嘗試一台，用檔案層級游標推進，交給 `loop()` 的 10 秒節奏；`lastReconnect` 改在阻塞呼叫之後記錄 |
+| 2 | Critical | BLE 配網模式永久停在 channel 1：`WiFi.mode(WIFI_STA)` 把 channel 歸 1，而 `onWifiChannelMayHaveChanged()` 在 BLE 模式下不會被呼叫 | 新增 `restoreEspNowChannelForOfflineBoot()`，開機時從 NVS 讀回 channel 並 `esp_wifi_set_channel()` ＋ `sendHeartbeatBurst()` |
+| 3 | Critical | `connectToWiFi()` 失敗一次就清掉 channel 記錄，第 2 次重試起全部退回全頻掃描，30 秒心跳全數落空機率約 9% | 只清 BSSID、保留 channel，重試用 `WiFi.begin(ssid, pass, ch, nullptr)`；連續失敗 10 次才升級全頻掃描；關聯期間心跳加密到 200ms |
+| 4 | 必修 | 回歸清單第 2、8、9 項的「預期結果」正好是上述三個 Critical 的觸發路徑，照舊清單測會把破口測成 PASS | 三項全部改寫，明確寫出「要觀察什麼／什麼情況算失敗」；`readme.md` 的超額宣稱改為精確敘述並新增「ESP-NOW 心跳的實際保證」章節 |
+| 5 | 建議 | `setRelayPins()` 不清 `pulseActive`，點動中途下 `allon` 會在 1 秒後被點動逾時撤銷 | `setRelayPins()` 內清 `pulseActive`（`pulseRelay()` 在其後才設 true，順序安全） |
+| 6 | 建議 | `publishStatus()` 無截斷偵測，ArduinoJson 超過 512 是截斷而非溢位，`publish()` 仍回 true | 加 `doc.overflowed()` 與 `n >= sizeof(buf)-1` 兩道警告 |
+| 7 | 建議 | `publishStatus()` 用 `bool ok`，違反專案慣例 | 改為 `res` |
+| 8 | 建議 | `setAutoReconnect` 相關註釋的論證錯誤（core 3.3.7 中它是死碼） | 更正 `onWiFiEvent()` 與 `setup()` 兩處註釋，結論不變 |
+
+### Critical 2 的修法與原始指示的差異（實作時發現的矛盾）
+
+原始指示要求把 channel 存進 `hoban` 命名空間，並說「`clearNetConfig()` 會把它一起
+清掉，這正是我們要的」。但 **Critical 2 的觸發情境正是 `reset`**，而 `reset` 呼叫的
+`clearNetConfig()` 用 `netPrefs.clear()` 清空整個 `hoban` 命名空間 —— 若 channel 只存
+在那裡，重開機時 `lastApChannel` 必然是 0，`restoreEspNowChannelForOfflineBoot()`
+什麼都做不了，等於沒修。
+
+因此實作拆成**兩個值、兩個命名空間**：
+
+- `hoban/apch` → `lastApChannel`：服務「WiFi 關聯」。`reset` 會清掉它，這是對的 ——
+  留著會害使用者配了新 AP 之後還在舊 channel 上白試 10 次（約 3 分鐘）才肯全頻掃描。
+- `homaster/espch` → `slaveLockChannel`：服務「ESP-NOW 心跳」，跟 slave 名冊同生共死。
+  `reset` 不會清掉它，這才真正修好 Critical 2。名冊清空時它自然失效
+  （`restoreEspNowChannelForOfflineBoot()` 會先檢查 `slaveCount > 0`）。
+
+`slaveLockChannel` 的三個寫入點：`connectToWiFi()` 成功分支、`addSlave()`
+（涵蓋「先連 WiFi 才配對」這個最常見順序）、`onWifiChannelMayHaveChanged()`
+（涵蓋 AP 不斷線就換頻）。序列埠的 `ch <n>` 測試指令刻意不寫 NVS。
+
 ## Phase 2a 完成後的狀態
 
 - master 能被 App 配網、連上 WiFi 與 MQTT、發布狀態、接受基本控制指令
-- **ESP-NOW 全程不中斷**，slave 在配網、WiFi 重連、MQTT 切換期間都不會失聯
+- **ESP-NOW 心跳空窗控制在 slave 的 30 秒失聯門檻以下**（不是「完全不中斷」——
+  `mqttClient.connect()` 是不可中斷的阻塞呼叫，最壞約 18 秒無心跳，
+  精確的保證與殘存風險見 `ho_master1/readme.md`「ESP-NOW 心跳的實際保證」）
 - channel 同步機制第一次面對真實情境（AP 決定 channel）
 - **尚未有**：slave 的代發代訂閱、`slaves` 陣列、`ALL:*` 群組指令、OTA —— 那是 Phase 2b
 
@@ -1027,7 +1162,7 @@ MQTT topic 與指令表、狀態 JSON 範例、與 `ho_relay2` 的差異說明�
 | 風險 | 影響 | 緩解 |
 |---|---|---|
 | BLE + WiFi + MQTT + ESP-NOW 並存的 heap 壓力 | 可能 OOM 重啟 | Task 6 Step 4 檢查 RAM 用量；BLE 僅在未配網時啟動且配網後 restart |
-| WROOM 板 flash 用量偏緊（Task 6 實作後補記，計畫當初沒預見）| 後續 Phase 加程式碼可能編不過 | 已改用 `PartitionScheme=custom`（1.94MB app0，與 C3 共用 `partitions.csv`），但目前用量已達 82.7%，餘裕約 351KB；後續加功能前先跑 `.\flash.ps1 -Model master` 確認 |
+| WROOM 板 flash 用量偏緊（Task 6 實作後補記，計畫當初沒預見）| 後續 Phase 加程式碼可能編不過 | 已改用 `PartitionScheme=custom`（1.94MB app0，與 C3 共用 `partitions.csv`），但最終審查修正後用量達 82.8%（1,682,707 / 2,031,616），餘裕約 341KB；後續加功能前先跑 `.\flash.ps1 -Model master` 確認 |
 | C3 單核跑滿四套協定的即時性 | 心跳延遲、封包遺失 | 回歸清單第 8、9 項專測此情境；必要時 master 改用 WROOM |
 | `WiFi.begin()` 不掃描直接連，對隱藏 SSID 或特殊 AP 可能失敗 | 配網後連不上 | 保留 30 秒等待與原因碼診斷；若實測有問題再考慮首次連線才掃描（此時 ESP-NOW 尚未有 peer，掃描無害） |
 | MQTT 狀態 JSON 加入 `slaves` 陣列後（2b）可能超過 1024 | publish 失敗 | 已 `setBufferSize(1024)`；2b 若 20 台會超過需再擴或分頁 |

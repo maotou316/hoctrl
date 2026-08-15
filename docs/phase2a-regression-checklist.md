@@ -25,8 +25,8 @@
 齁控 Master v1.0.0
 ================
 按鈕自檢: 正常
-[設定] SSID=(未設定) 自訂伺服器=否 繼電器=無
-[名冊] 載入 0 台 slave
+[設定] SSID=(未設定) 自訂伺服器=否 繼電器=無 上次AP channel=0
+[名冊] 載入 0 台 slave（上次心跳 channel=0）
 ESP-NOW 就緒，channel=1
 [BLE] 已啟動，名稱: hoban-a0b1c2d3e4f5
 [BLE] 等待 App 配網
@@ -39,36 +39,74 @@ LED 應呈現慢閃（1000ms 半週期），對照 `readme.md`「LED 狀態指�
 
 ## 2. 配網期間已配對的 slave 不會失聯（master 與 `ho_relay2` 最大的行為差異）
 
-這是本 Phase 最重要的驗證項目：`ho_relay2` 在 AP／BLE 配網模式下 `loop()` 直接
-`return`，`ho_master1` **不能**這樣做，否則配網期間 ESP-NOW 心跳會停止，
-已配對的 slave 會在 30 秒後判定失聯並強制關閉繼電器。
+> **本項的預期結果已於最終審查後修訂。** 舊版只寫「slave 不會失聯」，但那個寫法只
+> 涵蓋了「`loop()` 有沒有跳過 `maintainEspNow()`」這一個面向。實際上還有第二個、
+> 而且更容易踩到的破口：**心跳有發出去 ≠ slave 收得到**。ESP-NOW 的 peer 用
+> `channel = 0`（跟隨當前實體 channel），master 的 STA channel 若與 slave 鎖定的
+> channel 不同，心跳就打在錯的頻道上。照舊版清單去測，會把這個破口測成 PASS。
+
+要驗證的其實是兩件事，缺一不可：
+
+- **(A) 心跳有沒有繼續發**：`ho_relay2` 在配網模式下 `loop()` 直接 `return`，
+  `ho_master1` 只跳過 WiFi／MQTT 管理區塊，`maintainEspNow()` 照跑。
+- **(B) 心跳有沒有打在對的 channel 上**：沒有 WiFi 設定時 `setupEspNow()` 的
+  `WiFi.mode(WIFI_STA)` 會把 channel 歸 **1**，而 `onWifiChannelMayHaveChanged()`
+  在 BLE 模式下完全不會被呼叫。修正後由
+  `restoreEspNowChannelForOfflineBoot()` 在開機時從 NVS 的 `homaster/espch`
+  讀回「slave 鎖定的 channel」並 `esp_wifi_set_channel()` 切過去。
+
+**前置條件（重要，不滿足就測不出 B）**：
+master 必須在**本次測試之前**至少成功連上過一次 WiFi 且當時名冊已有 slave，
+`homaster/espch` 才會被寫入。剛燒錄的空白設備直接測，NVS 沒有這個鍵，
+master 會停在 channel 1（此時序列埠會印出 `⚠ [channel] …NVS 沒有 channel 記錄…`），
+那是**已知且已標示的行為**，不算本項失敗，但也不算通過 —— 請先完成第 3 項配網、
+確認 master 連上一個 **channel 不是 1** 的 AP 之後，再回頭做本項。
 
 **步驟**：
-1. master 已連上 WiFi、已配對至少 1 台 slave（`list` 確認在線）
-2. 對 master 送 MQTT `reset` 指令（見下方第 7 項），或直接在序列埠確認清除後的行為 ——
-   `reset` 只清 `hoban` 命名空間（網路設定），**不會**清 `homaster` 命名空間（slave 名冊）
+1. master 已連上 WiFi（**AP 的 channel 必須不是 1**，例如 6 或 11，否則測不出差異）、
+   已配對至少 1 台 slave（`list` 確認在線，slave 端曾印出 `[鎖定] … channel=6`）
+2. 對 master 送 MQTT `reset` 指令（見下方第 7 項）。
+   `reset` 只清 `hoban` 命名空間（網路設定，含 `apch`），**不會**清 `homaster`
+   命名空間（slave 名冊與 `espch`）—— `espch` 刻意分開存放就是為了撐過 `reset`
 3. master 重啟，因為沒有 WiFi 設定，重新進入 BLE 配網模式
-4. 在 BLE 配網模式停留至少 40 秒（超過 slave 端 30 秒失聯門檻），期間持續看 slave 序列埠
+4. 在 BLE 配網模式停留至少 **60 秒**（遠超 slave 端 30 秒失聯門檻），
+   期間持續看 slave 序列埠
 
 **預期序列埠輸出（master，重啟後）**：
 ```
-[設定] SSID=(未設定) 自訂伺服器=否 繼電器=無
-[名冊] 載入 1 台 slave
+[設定] SSID=(未設定) 自訂伺服器=否 繼電器=無 上次AP channel=0
+[名冊] 載入 1 台 slave（上次心跳 channel=6）
   1. hoban-xxxxxxxxxxxx
 ESP-NOW 就緒，channel=1
 [名冊] 已重新註冊 1／1 台為 ESP-NOW peer
+[channel] 本次開機不關聯 WiFi，切回 NVS 記住的 channel=6，維持 1 台已配對 slave 的心跳
+[心跳] channel 已變更，連發 4 次（間隔 200 ms）
 [BLE] 已啟動，名稱: hoban-a0b1c2d3e4f5
 [BLE] 等待 App 配網
 ```
-之後每約 10 秒應仍看到一行心跳 log（`[心跳] channel=1 配對模式=否 slave=1`），
-代表 BLE 配網模式下 `maintainEspNow()` 仍在跑。
+注意 `上次AP channel=0`（`apch` 被 `reset` 清掉了，這是正確的）與
+`上次心跳 channel=6`（`espch` 沒被清掉，這也是正確的）**必須同時成立**。
 
-**預期序列埠輸出（slave，全程）**：**不應**出現 `[失聯] 超過 30 秒沒收到心跳`，
-`list`（在 slave 若有對應指令）或觀察 slave 的繼電器/LED 應維持配對前的在線狀態，
-不應被強制關閉。
+之後每約 10 秒應仍看到一行心跳 log，且 **channel 欄位必須是 6 而不是 1**：
+```
+[心跳] channel=6 配對模式=否 slave=1
+```
 
-**失敗判定**：只要 slave 端印出失聯或 30~40 秒內繼電器被強制關閉，即代表
-BLE 模式下的 `loop()` 意外跳過了 `maintainEspNow()`，是本 Phase 的核心回歸破口。
+**要觀察什麼**：
+1. master 是否印出 `[channel] 本次開機不關聯 WiFi，切回 NVS 記住的 channel=6`
+2. 之後的 `[心跳]` log 的 `channel=` 是否維持 6（**不是 1**）
+3. slave 端全程是否沒有出現 `[失聯]`、也沒有出現重新輪掃／重新鎖定的訊息
+4. slave 若原本繼電器是 ON，是否全程保持 ON
+
+**什麼情況算失敗**：
+- master 印出 `[心跳] channel=1 …` 而 NVS 明明有 channel=6 → `restoreEspNowChannelForOfflineBoot()`
+  沒生效或被呼叫在 `setupEspNow()` 之前（`esp_wifi_set_channel()` 需 WiFi 已初始化）
+- 序列埠完全沒有心跳 log → BLE 模式下 `loop()` 意外跳過了 `maintainEspNow()`（舊破口）
+- slave 印出 `[失聯] 超過 30 秒沒收到心跳`，或繼電器被強制關閉，或重新輪掃鎖定到
+  channel 1 → 上述任一條路徑有回歸
+- master 重啟後 `[名冊] 載入 … 上次心跳 channel=0`，但測試前確實有成功連過 WiFi
+  → `saveSlaveLockChannel()` 的三個寫入點（`connectToWiFi()` 成功、`addSlave()`、
+  `onWifiChannelMayHaveChanged()`）沒被正確觸發
 
 ---
 
@@ -98,12 +136,16 @@ BLE 模式下的 `loop()` 意外跳過了 `maintainEspNow()`，是本 Phase 的�
 
 2 秒後重啟，接著：
 ```
-[設定] SSID=你的WiFi名稱 自訂伺服器=是 繼電器=無
+[設定] SSID=你的WiFi名稱 自訂伺服器=是 繼電器=無 上次AP channel=0
 ESP-NOW 就緒，channel=1
 [WiFi] 連線到 你的WiFi名稱 …
+[WiFi] 無已知 channel，退回全頻掃描關聯
 [WiFi] 取得 IP: 192.168.x.x
 [WiFi] 已連線 IP=192.168.x.x RSSI=-XX
+[設定] 已記住 AP channel=6（供下次開機在 BLE 配網模式維持心跳用）
 ```
+（`上次AP channel=0` 與「退回全頻掃描」在**第一次**配網後是正常的：`reset` 已把
+`hoban` 命名空間清空，包含 `apch`。連上之後才會寫入，下次重連就會改走鎖定 channel。）
 
 ---
 
@@ -194,49 +236,138 @@ status 訊息的變化。
 
 ---
 
-## 8. WiFi 拔線 60 秒，確認 slave 全程不失聯（驗證 `maintainEspNow()`）
+## 8. WiFi 拔線 60 秒，確認 slave 全程不失聯
+
+> **本項的預期結果已於最終審查後修訂。** 舊版只寫「心跳有沒有繼續發」，
+> 但 WiFi 重連真正的風險不是心跳停發，而是**心跳被發到錯的 channel**：
+> `WiFi.begin()` 不帶 channel 時，ESP-IDF 底層仍會全頻掃描（一輪約 20 秒），
+> master 會跑遍 channel 1~13，停在舊 channel 的 slave 每則心跳命中率只剩約 1/13。
+> 修正前，`connectToWiFi()` 失敗一次就把 channel 記錄清掉，**第 2 次重試起就
+> 全部退回全頻掃描**，30 秒 30 則心跳全數落空的機率約 9%。照舊版清單去測，
+> 只看「心跳 log 有沒有繼續印」會把這個 9% 的破口測成 PASS。
+
+修正後的行為有兩層：
+- **鎖 channel**：失敗時只清 BSSID、保留 `lastApChannel`，重試改用
+  `WiFi.begin(ssid, password, lastApChannel, nullptr)`，掃描被限制在單一 channel。
+  連續失敗達 `WIFI_CHANNEL_LOCK_MAX_FAIL`（10）次才升級成一次全頻掃描。
+- **加密心跳**：關聯期間 `wifiAssociating` 為 true，心跳間隔由 1000ms 縮到
+  `HEARTBEAT_INTERVAL_ASSOC`（200ms），30 秒內 150 則。
 
 **步驟**：
-1. master 已連上 WiFi、已配對至少 1 台 slave
+1. master 已連上 WiFi（記下 AP 的 channel，例如 6）、已配對至少 1 台 slave，
+   slave 端已印出 `[鎖定] … channel=6`
 2. 直接拔掉 WiFi 路由器電源，或讓路由器離線，持續至少 60 秒
 3. 全程監看 master 與 slave 兩邊序列埠
-4. 60 秒後恢復路由器供電
+4. 60 秒後恢復路由器供電，繼續觀察到 master 重新連上為止
 
 **預期序列埠輸出（master）**：
 ```
 [WiFi] 斷線原因碼: XX
 [WiFi] 重連嘗試 #1
+[WiFi] 連線到 你的WiFi名稱 …
+[WiFi] 使用已知 channel=6 的 BSSID 直接關聯，跳過掃描
+[WiFi] 連線失敗，狀態=X 原因碼=XX
+[WiFi] 指定 BSSID 關聯失敗，清除 BSSID 記錄，下次改為只鎖定 channel 掃描
+[WiFi] 重連嘗試 #2
+[WiFi] 連線到 你的WiFi名稱 …
+[WiFi] 不指定 BSSID，但把掃描限制在已知 channel=6
 [WiFi] 連線失敗，狀態=X 原因碼=XX
 ```
-（`wifiFailCount` 遞增期間會反覆嘗試，重試邏輯與間隔見 `loop()` 的 WiFi 管理區塊）
-心跳 log 應**持續**每約 10 秒一行，不因 WiFi 斷線而停止或延遲超過預期。
+第 2 次起每一次都必須是 `[WiFi] 不指定 BSSID，但把掃描限制在已知 channel=6`。
 
-**預期序列埠輸出（slave，全程 60 秒）**：**不應**出現 `[失聯] 超過 30 秒沒收到心跳`，
-在線狀態應全程維持，繼電器（如原本是 ON）不應被強制關閉。
+**要觀察什麼**：
+1. **第 2 次以後的每一次重連，是否都印出「把掃描限制在已知 channel=6」**。
+   這是本項的核心，60 秒內大約會看到 3~4 次重連嘗試。
+2. 心跳 log 是否持續。注意關聯期間心跳加密到 200ms，log 每 10 次印一行，
+   所以關聯中會看到**約每 2 秒一行**、非關聯期間回到約每 10 秒一行 ——
+   兩種節奏交替出現是正常的，不是異常。
+3. 心跳 log 的 `channel=` 欄位是否**全程維持 6**。
+4. slave 端全程是否沒有 `[失聯]`、沒有重新輪掃、繼電器（原本是 ON 的話）沒被關閉。
 
-**失敗判定**：只要 slave 在這 60 秒內判定失聯，代表 WiFi 斷線後的重連流程中
-有某段等待沒有正確呼叫到 `maintainEspNow()`。
+**什麼情況算失敗**：
+- 出現 `[WiFi] 無已知 channel，退回全頻掃描關聯`，而重連次數還沒到 10 次
+  → 保留 `lastApChannel` 的修正有回歸
+- 心跳 log 的 `channel=` 在 60 秒內跳動（6 → 3 → 11 …）→ master 正在全頻掃描，
+  單 channel 限制沒生效
+- 心跳 log 出現超過 **30 秒**的空窗 → 某段等待沒有走 `maintainEspNow()`
+- slave 印出 `[失聯] 超過 30 秒沒收到心跳`，或繼電器被強制關閉
+
+> **注意這一項有機率性**：修正前的失敗機率約 9%，代表**單次測試通過不足以證明
+> 修正有效**。請以「第 2 次以後的重連是否印出鎖定 channel 的那一行」作為主要判準
+> （這是決定性的、非機率性的證據），slave 沒失聯只是必要條件而非充分條件。
 
 ---
 
-## 9. MQTT broker 切換（`FIND_BEST_SERVER`）期間 slave 不失聯
+## 9. MQTT 伺服器切換與重連期間 slave 不失聯
 
-**步驟**：
-1. master 已連上某個 MQTT broker（例如 `mqttgo.io`）、已配對至少 1 台 slave
-2. 對 `hoban/<masterId>/control` 送 `FIND_BEST_SERVER`
-3. 觀察 master 序列埠切換過程，同時監看 slave 是否維持在線
+> **本項的預期結果已於最終審查後修訂。** 舊版寫「`mqttClient.disconnect()` 與
+> `espNowDelay(500)` 都會維持心跳，所以不會失聯」—— 那個推論漏掉了真正的阻塞來源：
+> **`mqttClient.connect()` 本身是不可中斷的阻塞呼叫，期間 `maintainEspNow()`
+> 完全不會被呼叫**。單次呼叫對不可達目標最壞約 18 秒（`NetworkClient::connect()`
+> 會先做 `getaddrinfo()` DNS 解析，這段沒有 timeout 參數，由 lwIP 的
+> `DNS_MAX_RETRIES` 指數退避決定，約 15 秒；`WIFI_CLIENT_DEF_CONN_TIMEOUT_MS=3000`
+> 只管 TCP、`setSocketTimeout(3)` 只管 CONNACK）。
+> 修正前 `smartConnect()` 在自訂伺服器失敗後**立刻**接第一台預設伺服器，
+> 背靠背兩次 = **36 秒 > 30 秒門檻**，slave 必定失聯關籠。
+> 照舊版清單只在 broker 一切正常的情況下測，永遠測不到這條路徑。
+
+修正後 `smartConnect()` **每次呼叫只嘗試一台 broker**，用檔案層級的游標
+（`mqttCustomTried` / `mqttProbeOffset`）推進，其餘交給 `loop()` 既有的 10 秒
+重連節奏，且 `lastReconnect` 改在 `smartConnect()` **之後**用新的 `millis()` 記錄。
+
+### 9a. 正常情況：broker 可連（快速驗證）
+
+**步驟**：master 已連上某個 MQTT broker、已配對至少 1 台 slave，
+對 `hoban/<masterId>/control` 送 `FIND_BEST_SERVER`。
 
 **預期序列埠輸出（master）**：
 ```
 [MQTT] 收到指令: FIND_BEST_SERVER
-[MQTT] 嘗試 mqttgo.io …
-[MQTT] 已連線 mqttgo.io，訂閱 hoban/hoban-a0b1c2d3e4f5/control
+[MQTT] 嘗試自訂伺服器 mqttgo.io …
+[MQTT] 已連線自訂伺服器 mqttgo.io，訂閱 hoban/hoban-a0b1c2d3e4f5/control
 ```
-（`smartConnect()` 會依序嘗試，若原本連線的伺服器仍是最快回應者，可能又連回同一台，
-這是正常行為，不是失敗）
+（可能又連回同一台，這是正常行為，不是失敗）
 
-**預期序列埠輸出（slave，全程）**：不應出現失聯訊息，因為切換過程中的
-`mqttClient.disconnect()` 與 `espNowDelay(500)` 都會維持心跳。
+### 9b. 真正要測的情況：broker 不可達（本項的重點）
+
+**步驟**：
+1. master 已連上 WiFi、已配對至少 1 台 slave（`list` 確認在線）
+2. **讓 DNS 解析不通但 WiFi 仍連著** —— 這是最寫實的觸發條件。做法擇一：
+   - 拔掉路由器的 WAN 線（或關掉上網），保持 WiFi AP 正常運作
+   - 或在路由器上把 DNS 指向一個不回應的位址
+   - 或先透過 BLE 把自訂伺服器設成一個不存在的網域（例如 `no-such-broker.invalid`）
+3. 此時 master 的 `WiFi.status()` 仍是 `WL_CONNECTED`，`loop()` 會每 10 秒
+   進一次 `smartConnect()`
+4. 持續觀察至少 **3 分鐘**，同時監看 slave 序列埠
+
+**預期序列埠輸出（master）**：每一輪只會有**一行**「嘗試」，行與行之間隔約
+10 秒＋阻塞時間，中間夾著心跳 log：
+```
+[MQTT] 嘗試自訂伺服器 no-such-broker.invalid …
+[心跳] channel=6 配對模式=否 slave=1
+[MQTT] 自訂伺服器 no-such-broker.invalid 失敗，state=-2
+（約 10 秒，期間約 10 則心跳）
+[MQTT] 嘗試 mqttgo.io …
+[MQTT] mqttgo.io 失敗，state=-2
+…（走完 5 台預設伺服器後）
+[MQTT] 本輪所有伺服器都連不上，下次改從下一台開始
+```
+
+**要觀察什麼**：
+1. **兩行「嘗試」之間是否一定隔著心跳 log**。這是本項的決定性判準。
+2. 心跳 log 的時間戳（或以碼錶計）空窗最長多久。修正後單次阻塞最壞約 18 秒，
+   **空窗約 18 秒是預期內的正常現象，不是失敗**。
+3. slave 端全程是否沒有 `[失聯]`、繼電器沒被強制關閉。
+4. 每一輪 5 台走完後，是否出現「本輪所有伺服器都連不上，下次改從下一台開始」，
+   且下一輪的起點確實往後推了一台。
+
+**什麼情況算失敗**：
+- 序列埠出現**連續兩行以上的「嘗試」中間沒有任何心跳 log** → 一次呼叫試了多台，
+  一次一台的修正有回歸，這是最嚴重的失敗
+- 心跳空窗超過 **30 秒** → slave 必然失聯，修正無效
+- slave 印出 `[失聯] 超過 30 秒沒收到心跳` 或繼電器被強制關閉
+- `FIND_BEST_SERVER` 之後第一行「嘗試」不是自訂伺服器（有設定自訂伺服器時）
+  → `resetMqttProbe()` 沒被呼叫，游標沒歸零
 
 ---
 
@@ -302,10 +433,34 @@ broker 端帳密設定無誤，代表密碼在某處被截斷，NVS 欄位長度
 
 ---
 
+## 12. 點動進行中再下持續性指令，不會被點動逾時撤銷（最終審查新增）
+
+`setRelayPins()` 原本沒有清除 `pulseActive`，導致「點動中途改下持續性指令」時，
+先前的點動計時仍在跑，時間到就把繼電器關掉，把剛下的指令無聲撤銷。
+對籠門機構就是「命令保持開啟，1 秒後自己關上」。
+
+**步驟**：
+1. 對 `hoban/<masterId>/control` 送 `ON`（`pulseRelay(2000)`，點動 2 秒）
+2. **在 1 秒內**從序列埠輸入 `allon`
+3. 觀察 master 自己的繼電器（或 status 訊息的 `device.relay`）在接下來 5 秒內的變化
+
+**預期結果**：繼電器在 `allon` 之後**持續保持 ON**，不會在原本的 2 秒點動到期時關閉。
+
+**什麼情況算失敗**：繼電器在 `allon` 之後約 1 秒（即原點動的第 2 秒）自己關閉
+→ `setRelayPins()` 沒有清除 `pulseActive`，回歸。
+
+**反向確認（順序不能寫反）**：單獨送 `ON`（不下 `allon`），繼電器仍必須在 2 秒後
+自動關閉。若也不關了，代表 `pulseRelay()` 裡 `setRelayPins(true)` 與
+`pulseActive = true` 的先後順序被寫反。
+
+---
+
 ## 疑慮與待確認事項
 
-- 全部 11 項截至目前皆**未在實體硬體驗證**，上述輸出全為程式碼推導，實測時
+- 全部 12 項截至目前皆**未在實體硬體驗證**，上述輸出全為程式碼推導，實測時
   請對照實際輸出並記錄差異
+- 第 2、8、9 項的「預期結果」已於最終審查後改寫。改寫前的版本會把三個 Critical
+  缺陷測成 PASS，若手上有舊版列印稿請丟棄
 - 第 10 項的按鈕長按重置目前在 `ho_master1` 尚未實作，只能測 MQTT `reset` 路徑，
   已在該項標註
 - 第 4 項「46 秒內重新鎖定」的門檻依賴 slave 端掃描週期（`SCAN_DWELL_MS=1200ms`
