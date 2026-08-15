@@ -168,13 +168,19 @@ const int HEARTBEAT_LOG_EVERY = 10;
 // ── 開機按鈕自檢（移植自 ho_relay2.ino）──
 // 按鈕接法是 GPIO ──[按鈕]── GND，靠 INPUT_PULLUP 拉高；某支腳一旦短路或走線接地
 // 就恆為 LOW，會被按鈕狀態機誤判成「使用者一直按著」。
-// master 目前只有短按進配對（風險低），但重置功能的位置已預留在 loop()，
-// Phase 2 一補上就會繼承 hoRelay2 那個「開機即清設定 → 重啟 → 再清除」的無限迴圈缺陷，
-// 所以現在先把防呆一併備妥。
+// master 除了短按進配對（風險低），現已補上長按重置（見 updateResetButton()），
+// 同樣會繼承 hoRelay2 那個「開機即清設定 → 重啟 → 再清除」的無限迴圈缺陷，
+// 這裡的防呆正是為它而設。
 const unsigned long BTN_SELFTEST_DURATION = 500;  // 自檢取樣總長度 (毫秒)
 const unsigned long BTN_SELFTEST_INTERVAL = 50;   // 取樣間隔 (毫秒)
 bool bootButtonUsable = true;                     // BOOT 按鈕是否可用
 bool secondButtonUsable = true;                   // 第二按鈕是否可用
+
+// ── 長按重置參數（移植自 ho_relay2.ino，數值完全一致）──
+const unsigned long LONG_PRESS_TIME = 3000;    // 長按 3 秒進入閃爍確認階段
+const unsigned long BLINK_CONFIRM_TIME = 2000; // 閃爍確認階段再按住 2 秒才清除設定
+const unsigned long BLINK_INTERVAL = 250;      // 確認階段 LED 閃爍週期 (毫秒，亮/滅各半)
+const unsigned long CONFIRM_SOLID_TIME = 700;  // 快閃結束後長亮 0.7 秒表示確認重置
 
 // ── LED（WROOM 只有板載 LED 一顆；C3 另有面板 LED，兩顆須同步驅動）──
 // 用 ledPins[]／ledPinCount 迴圈寫，而非寫死單一顆，理由與繼電器的 relayPins[] 一致：
@@ -637,11 +643,95 @@ void checkStuckButtons() {
 }
 
 // 是否有「可用的」按鈕正被按下；自檢判定卡住的腳一律視為未按下。
-// 目前只有 BOOT 用於短按配對，這支保留給 Phase 2 的長按重置流程，屆時一律走這裡判斷。
+// BOOT 用於短按配對（見 loop() 短按判斷區塊，只認 BOOT 單一支腳）；
+// 長按重置（見 updateResetButton()）認兩支腳中任一支，一律走這裡判斷。
 bool anyResetButtonPressed() {
   if (bootButtonUsable && digitalRead(bootButton) == LOW) return true;
   if (secondButtonUsable && digitalRead(secondButton) == LOW) return true;
   return false;
+}
+
+// ── 長按重置：非阻塞狀態機（Task 8）──
+// 移植自 ho_relay2.ino 的 waitForResetConfirm()，但那是阻塞版（while 迴圈裡用
+// delay()），不能直接搬過來：master 每 1 秒要發 ESP-NOW 心跳，slave 超過 30 秒
+// 沒收到即判定失聯、開始輪掃、強制關閉繼電器（動物管制設備＝開籠），阻塞版整段
+// 流程約 5.7 秒（3 秒計時＋2 秒閃爍確認＋0.7 秒長亮）會吃掉將近 6 秒心跳，太危險。
+// 改用 millis() 推進的狀態機，每次由 loop() 呼叫一次，推進一小步就返回，
+// loop() 每輪仍會呼叫 maintainEspNow()；唯一真的需要等待的一段（長亮 0.7 秒）
+// 改用 espNowDelay() 而非裸 delay()，等待期間心跳照常發出。
+//
+// 與短按配對的區分（見 loop() 短按判斷區塊）：短按只認 BOOT 一支腳，放開時
+// pressDuration 落在 [50, 1000)ms 才觸發配對；這裡認 anyResetButtonPressed()
+// 涵蓋的任一支腳，需持續按滿 3 秒（LONG_PRESS_TIME）才進入確認階段。兩者互不
+// 打架：同一次按壓若在 3 秒內放開，這裡的階段還停在 RESET_WAITING、不會有任何
+// 重置動作；若按壓時間落在 1~3 秒之間，長度已超出短按配對的 1000ms 上限，
+// 短按判斷式本身就不會觸發配對——「長按中途放開兩者都不觸發」在兩段判斷式各自
+// 的條件下自然成立，不需要額外的互斥旗標。
+//
+// LED 優先權（master 的 LED 共有三種用途，優先權由高到低）：
+//   1. 本狀態機的確認階段（RESET_CONFIRM_BLINK）：閃爍／長亮，優先權最高——
+//      使用者正在操作重置，必須立即看到回饋。做法是直接呼叫 setLeds()，並回傳
+//      true，loop() 收到 true 時會跳過 updateBlink()/updateStatusLed()，兩者
+//      本輪完全不會被呼叫、不會覆蓋這裡畫的燈號。
+//   2. updateBlink()：一次性請求式閃爍（配對接受／拒絕），播完交還。
+//   3. updateStatusLed()：持續式狀態指示（BLE 配網／配對中／WiFi/MQTT 狀態）。
+// 三者刻意分成三個獨立機制而非合併：合併會讓「使用者正在長按重置」與「配對結果
+// 閃 3 下」或「WiFi 未連快閃」互相覆蓋，行為難以預測。
+enum ResetPhase { RESET_IDLE, RESET_WAITING, RESET_CONFIRM_BLINK };
+ResetPhase resetPhase = RESET_IDLE;
+unsigned long resetPressStart = 0;
+
+// 回傳 true 代表本輪已接管 LED（確認階段），loop() 應跳過 updateBlink()/updateStatusLed()
+bool updateResetButton(unsigned long now) {
+  bool pressed = anyResetButtonPressed();
+
+  if (!pressed) {
+    // 只在已進入閃爍確認階段才印「取消」訊息：3 秒內放開很可能只是短按配對的
+    // 正常操作，若也印出「取消重置」字樣會讓使用者誤以為自己觸發了重置流程。
+    if (resetPhase == RESET_CONFIRM_BLINK) {
+      Serial.println("[重置] 按鈕放開，取消重置");
+    }
+    resetPhase = RESET_IDLE;
+    return false;
+  }
+
+  if (resetPhase == RESET_IDLE) {
+    resetPhase = RESET_WAITING;
+    resetPressStart = now;
+    Serial.println("[重置] 偵測到按鈕按下，開始計時...");
+    return false;
+  }
+
+  unsigned long pressDuration = now - resetPressStart;   // 無號數減法，不怕 millis() 溢位
+
+  if (resetPhase == RESET_WAITING) {
+    if (pressDuration < LONG_PRESS_TIME) return false;   // 未滿 3 秒，LED 交還上層
+    resetPhase = RESET_CONFIRM_BLINK;
+    Serial.println("[重置] 長按 3 秒達成，開始 LED 閃爍確認...");
+  }
+
+  // RESET_CONFIRM_BLINK：閃爍確認階段，再按住 BLINK_CONFIRM_TIME(2 秒) 才會執行重置
+  unsigned long blinkDuration = pressDuration - LONG_PRESS_TIME;
+  if (blinkDuration < BLINK_CONFIRM_TIME) {
+    bool ledOn = (blinkDuration % BLINK_INTERVAL) < (BLINK_INTERVAL / 2);
+    setLeds(ledOn);
+    return true;
+  }
+
+  // 閃爍滿 2 秒且按鈕仍按著：確認執行重置。長亮 0.7 秒用 espNowDelay() 而非
+  // delay()，等待期間心跳照常發出（見本函式最上方註釋）。
+  Serial.println("[重置] 確認重置，LED 長亮 0.7 秒後清除網路設定...");
+  setLeds(true);
+  espNowDelay(CONFIRM_SOLID_TIME);
+  setLeds(false);
+
+  // 只清 hoban（WiFi/MQTT 網路設定），homaster（slave 名冊）刻意保留——
+  // 重新配網不該讓所有已配對的籠子全部解除配對。這是刻意行為，不是漏清。
+  clearNetConfig();
+  Serial.println("[重置] 長按重置只清除網路設定（WiFi/MQTT），"
+                 "slave 配對記錄（homaster 名冊）保留，不會解除任何已配對的籠子");
+  ESP.restart();
+  return true;   // 理論上不會執行到這裡（ESP.restart() 不返回），保留使函式簽名完整
 }
 
 // ── 名冊管理 ──
@@ -1705,7 +1795,9 @@ void loop() {
   unsigned long now = millis();
 
   // ── 短按 BOOT 進入配對模式 ──
-  // 長按 3 秒以上不觸發，保留給之後的重置功能（屆時請一律走 anyResetButtonPressed()）
+  // 長按 3 秒以上不觸發，交給下面的 updateResetButton() 判斷長按重置
+  // （只認 BOOT 單一支腳，與 updateResetButton() 認 anyResetButtonPressed()
+  // 涵蓋的任一支腳刻意不同，兩者互不打架的理由詳見 updateResetButton() 上方註釋）
   // 自檢判定卡在 LOW 的腳一律視為未按下，避免壞按鈕不斷觸發按鈕流程
   static bool lastButtonState = HIGH;
   static unsigned long buttonDownTime = 0;
@@ -1722,6 +1814,9 @@ void loop() {
   }
   lastButtonState = buttonState;
 
+  // ── 長按重置（Task 8）：非阻塞狀態機，詳見 updateResetButton() 上方註釋 ──
+  bool resetButtonActive = updateResetButton(now);
+
   // ── 配對模式逾時 ──
   if (pairingMode && now - pairingStartTime >= PAIRING_TIMEOUT) {
     Serial.println("[配對] 逾時");
@@ -1729,11 +1824,15 @@ void loop() {
   }
 
   // ── LED 狀態指示（Task 7）──
-  // 先推進一次性閃爍請求（配對接受／拒絕），播完的同一輪就會被 updateStatusLed()
-  // 接手判斷持續式狀態（BLE 配網／配對模式／WiFi／MQTT／正常），兩者分工與
-  // 優先權詳見各自函式上方註釋
-  updateBlink(now);
-  updateStatusLed(now);
+  // 長按重置的確認階段優先權最高，接管 LED 期間（resetButtonActive == true）
+  // 跳過以下兩者，避免被覆蓋（優先權分工詳見 updateResetButton() 上方註釋）。
+  // 未接管時：先推進一次性閃爍請求（配對接受／拒絕），播完的同一輪就會被
+  // updateStatusLed() 接手判斷持續式狀態（BLE 配網／配對模式／WiFi／MQTT／正常），
+  // 兩者分工與優先權詳見各自函式上方註釋
+  if (!resetButtonActive) {
+    updateBlink(now);
+    updateStatusLed(now);
+  }
 
   // 心跳固定 1 秒一次（HEARTBEAT_INTERVAL），計時併入 maintainEspNow()，
   // 避免與 Phase 2a 阻塞流程內的維持機制形成兩套計時器、重複發送
