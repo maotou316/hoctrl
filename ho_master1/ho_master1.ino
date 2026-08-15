@@ -78,6 +78,15 @@ struct SlaveEntry {
   uint8_t fwPatch;
   // 有變化就代發，不必等輪播輪到它（見 Task 3 的排程器）
   bool dirty;
+  // ── Task 3 review 修正：dirty 連續發布失敗要退避 ──
+  // 少了這兩個欄位，一台持續發布失敗的 slave（例如剛好 mqttClient.publish()
+  // 真的失敗，不是名額禮讓）會讓 slaveStatusScheduler() 每次都優先發現它
+  // dirty、每次都重試同一台，rotateIdx 永遠推進不到其他台，等於把其他
+  // slave 的代發餓死。連續失敗滿 SLAVE_DIRTY_MAX_FAIL 次後，在
+  // dirtyBackoffUntil 之前先跳過這台、讓其他台優先，見 publishSlaveStatus()
+  // 與 slaveStatusScheduler() 的實作。
+  uint8_t dirtyFailCount;
+  unsigned long dirtyBackoffUntil;
 };
 
 SlaveEntry slaves[HO_ESPNOW_MAX_SLAVES];
@@ -91,6 +100,18 @@ volatile int slaveCount = 0;
 // 交給 loop() 呼叫的 processPendingUnpairPublish() 補發最後一則 offline。
 uint8_t pendingOfflineMac[6];
 volatile bool hasPendingOfflinePublish = false;
+
+// ── Task 3 review 修正（Critical）：每輪 loop() 只允許一次會阻塞的 MQTT publish ──
+// mqttClient.publish() 內部的 NetworkClient::write() 卡住時最壞吃 10 秒（不是
+// PubSubClient::setSocketTimeout(3) 的 3 秒——那個值只用在等待 CONNACK 與
+// readByte()，publish 完全不經過它，詳見 publishJsonDoc() 上方的完整說明）。
+// 若同一輪 loop() 疊了兩、三次阻塞 publish（例如 publishStatus() 接
+// slaveStatusScheduler() 接 processPendingUnpairPublish()），心跳空窗會累加成
+// 20~30 秒，直接撞上 slave 的 30 秒失聯門檻。這個旗標由 loop() 每輪開頭重置，
+// publishJsonDoc() 真正要送出封包前會佔用它；本輪已經用掉的話，其餘想發布的
+// 呼叫方（見 slaveStatusScheduler()／processPendingUnpairPublish() 開頭的檢查）
+// 一律讓位給下一輪——下一輪開頭就是 maintainEspNow() 補心跳。
+bool mqttPublishBudgetUsed = false;
 
 Preferences prefs;
 
@@ -913,6 +934,8 @@ void loadSlaves() {
         slaves[i].relay = 0;
         slaves[i].fwMajor = slaves[i].fwMinor = slaves[i].fwPatch = 0;
         slaves[i].dirty = false;
+        slaves[i].dirtyFailCount = 0;
+        slaves[i].dirtyBackoffUntil = 0;
       }
     }
   }
@@ -975,6 +998,8 @@ bool addSlave(const uint8_t mac[6]) {
   slaves[slaveCount].relay = 0;
   slaves[slaveCount].fwMajor = slaves[slaveCount].fwMinor = slaves[slaveCount].fwPatch = 0;
   slaves[slaveCount].dirty = true;   // 新加入的直接代發一次，不必等輪播輪到它
+  slaves[slaveCount].dirtyFailCount = 0;
+  slaves[slaveCount].dirtyBackoffUntil = 0;
   slaveCount++;
 
   registerPeer(mac);
@@ -1044,13 +1069,18 @@ void requestSlaveState(int idx) {
 // 400ms，若與 master 自身點動的關閉時機重疊，會讓點動時間被拖長超過設定
 // 值，故改為此設計，見 Task 6 review 修正 2）
 void pollNextSlave() {
-  if (slaveCount == 0) return;
+  // review 修正（M1，除零競態）：slaveCount 是 volatile，若在本函式往下讀取
+  // 之間被 WiFi task 的 HO_PKT_UNPAIR 分支減到 0，下面的除法／取模會整數除零
+  // 導致 panic 重開機。一開頭就快照成區域變數 n，函式全程只用 n，不再重新
+  // 讀取 slaveCount（與 slaveStatusScheduler() 同一模式的修正）。
+  int n = slaveCount;
+  if (n <= 0) return;
 
   static unsigned long lastPollAt = 0;
   static int pollIdx = 0;
 
   // 下限 20ms：台數很多時避免間隔過短、無線封包擠在一起碰撞
-  unsigned long interval = 15000UL / (unsigned long)slaveCount;
+  unsigned long interval = 15000UL / (unsigned long)n;
   if (interval < 20) interval = 20;
 
   unsigned long now = millis();
@@ -1059,9 +1089,9 @@ void pollNextSlave() {
 
   // slaveCount 可能因配對／解除配對中途變動，索引越界就重頭開始，
   // 不特別處理「跳過某台」，反正下一輪就會輪到
-  if (pollIdx >= slaveCount) pollIdx = 0;
+  if (pollIdx >= n) pollIdx = 0;
   requestSlaveState(pollIdx);
-  pollIdx = (pollIdx + 1) % slaveCount;
+  pollIdx = (pollIdx + 1) % n;
 }
 
 void updateSlaveOnlineStatus() {
@@ -1087,20 +1117,36 @@ void unpairSlave(int idx) {
     Serial.println("[配對] 編號超出範圍");
     return;
   }
+  // review 修正（M4）：先把 MAC 複製到區域變數，不要繼續依賴 idx。
+  // publishSlaveOffline() 內部最壞會阻塞 10 秒（見 publishJsonDoc() 的更正
+  // 說明），這段期間 WiFi task 若收到另一台 slave 主動送來的 HO_PKT_UNPAIR，
+  // onEspNowRecv() 會並行搬移 slaves[] 陣列（loop() 與 WiFi task 是不同 task，
+  // 會真的並行執行，不是誤會），讓這裡原本記住的 idx 失效。之後所有動作
+  // 一律用這份 MAC，陣列搬移完成後再用 MAC 重新查一次 idx。
+  uint8_t mac[6];
+  memcpy(mac, slaves[idx].mac, 6);
   char id[20];
-  hoFormatDeviceId(slaves[idx].mac, id);
+  hoFormatDeviceId(mac, id);
 
   // 解除配對前，先補發一則 status=offline 的保留訊息。少了這步，broker 上
   // 會永遠留著最後那則 "online" 保留訊息，App 上就多出一台永遠在線、
-  // 卻怎麼控制都沒反應的幽靈設備。必須在陣列搬移之前呼叫，此時 slaves[idx]
+  // 卻怎麼控制都沒反應的幽靈設備。必須在陣列搬移之前呼叫，此時 idx
   // 還指向正確的這一台。
   publishSlaveOffline(idx);
 
-  espNowSendTo(slaves[idx].mac, HO_PKT_UNPAIR, nullptr, 0);
+  espNowSendTo(mac, HO_PKT_UNPAIR, nullptr, 0);
   delay(100);   // 給對方時間收到再刪 peer
 
-  esp_now_del_peer(slaves[idx].mac);
-  for (int i = idx; i < slaveCount - 1; i++) slaves[i] = slaves[i + 1];
+  esp_now_del_peer(mac);
+
+  // 用 MAC 重新查一次：上面 publishSlaveOffline() 阻塞期間，slaves[] 可能已經
+  // 因為別台的並行解除配對而搬移過，不能再信任進入本函式時的 idx。
+  int freshIdx = findSlave(mac);
+  if (freshIdx < 0) {
+    Serial.printf("[配對] %s 在等待期間已不在名冊上，視為已移除\n", id);
+    return;
+  }
+  for (int i = freshIdx; i < slaveCount - 1; i++) slaves[i] = slaves[i + 1];
   slaveCount--;
   saveSlaves();
   Serial.printf("[配對] 已移除 %s，剩 %d 台\n", id, slaveCount);
@@ -1853,10 +1899,33 @@ void smartConnect() {
   }
 }
 
+// ── Task 3 review 修正（Critical）：publish() 真正的阻塞上界是 10 秒，不是 3 秒 ──
+// 原本誤以為 mqttClient.setSocketTimeout(3) 對 publish() 有效，逐層查了實際安裝的
+// PubSubClient／NetworkClient 原始碼後推翻：
+//   - PubSubClient.cpp 的 setSocketTimeout() 只寫入自己的成員變數，從未呼叫
+//     _client->setTimeout()；這個值只用在 connect() 等 CONNACK、readByte()
+//     （收包路徑），publish() 完全不經過它。
+//   - publish() → PubSubClient::write() → _client->write(buf, len)。
+//     NetworkClient.cpp 的 write() 是 retry = WIFI_CLIENT_MAX_WRITE_RETRY(10) 迴圈，
+//     每輪 select() 的 tv_usec = WIFI_CLIENT_SELECT_TIMEOUT_US 硬編碼 1 秒；
+//     send() 帶 MSG_DONTWAIT，所以 setSocketTimeout() 設的 SO_SNDTIMEO 對它無效。
+//   - 結論：單次 mqttClient.publish() 最壞卡 10 秒（10 次重試 × 1 秒），不是 3 秒。
+// 觸發情境：AP 正常但 WAN 斷線——NetworkClient::connected() 仍回 true（本地 socket
+// 還在 ESTABLISHED），代發照發，lwIP 的 TCP_SND_BUF（約 5.7KB）被幾十則 payload
+// 塞滿後，之後每次 write() 都吃滿 10 秒。
+//
 // 全專案唯一的 MQTT JSON 發布出口。Task 2~6 新增的每一種發布都必須走這裡，
 // 不得自己另外開 char buf 呼叫 serializeJson()。
 bool publishJsonDoc(const char* topic, JsonDocument& doc, bool retain) {
   if (!mqttClient.connected()) return false;
+
+  // 每輪 loop() 只允許一次會阻塞的 publish（見 mqttPublishBudgetUsed 宣告處的
+  // 註釋）。名額已用掉就直接讓位給下一輪，而不是把多個 10 秒黑箱疊加在同一輪
+  // loop() 裡、吃光心跳空窗。
+  if (mqttPublishBudgetUsed) {
+    Serial.printf("[MQTT] %s 讓位給下一輪（本輪 publish 名額已用掉）\n", topic);
+    return false;
+  }
 
   // 防線 1：發布前先量。放不下就整包放棄，絕不送出被截斷的半截 JSON。
   size_t needed = measureJson(doc);
@@ -1884,7 +1953,16 @@ bool publishJsonDoc(const char* topic, JsonDocument& doc, bool retain) {
     return false;
   }
 
+  // 佔用本輪唯一的 publish 名額，即使接下來真的卡住，其他呼叫方也會提前讓位，
+  // 而不是跟著一起卡。
+  mqttPublishBudgetUsed = true;
+
+  // 阻塞呼叫前後各補一次心跳：把即將發生的最壞 10 秒黑箱前後各釘住一次心跳，
+  // 需要時能將原本可能連續的空窗切成兩段各自不超過 10 秒的視窗。
+  maintainEspNow();
   bool res = mqttClient.publish(topic, (const uint8_t*)statusBuf, n, retain);
+  maintainEspNow();
+
   if (!res) {
     Serial.printf("[MQTT] 發布失敗 %s（長度 %u，buffer %u）\n",
                   topic, (unsigned)n, (unsigned)mqttClient.getBufferSize());
@@ -1937,15 +2015,51 @@ void publishStatus() {
 // ── 代發 slave 狀態（Phase 2b Task 3）──
 // 用 slave 的 MAC 代發它的狀態，讓它在 App 眼裡就是一台普通設備。
 //
-// wifi 區塊的內容是刻意這樣填的（規格明訂）：App 現有的
-// Device.updateFromMqttMessage()（hoctrl/lib/models/device.dart:117-142）
-// 不用改就能解析，rssi 借來顯示 ESP-NOW 訊號強度。
-// via 是新欄位，標示這台是誰代發的。
+// wifi 區塊的內容是刻意這樣填的（規格明訂）：App 兩個頁面（設備卡片／詳情頁）
+// 各自的 `_handleMqttMessage` 手動解析都吃這個形狀，不用改就能解析同一份
+// payload；rssi 借來顯示 ESP-NOW 訊號強度。via 是新欄位，標示這台是誰代發的。
+// （原本這裡引用 `Device.updateFromMqttMessage()`，review 指出規格已明文撤回
+// 這個引用——那支函式在 `lib/` 沒有生產呼叫點，實際解析路徑是上述兩個頁面
+// 各自的手動解析，已更正。）
 //
 // 與規格範例的唯一刻意差異：規格把 wifi.connected 寫死成 true，
 // 這裡改成跟著 slaves[idx].online。理由是 App 可能拿 wifi.connected 判斷上下線，
 // 寫死 true 會讓離線的 slave 在 App 上永遠顯示在線 —— 那正是規格自己
 // 「Slave 失聯時 master 要代發 offline」想避免的情況。
+//
+// 排程常數集中放在這裡（供 slaveStatusScheduler() 使用，但 publishSlaveStatus()
+// 的失敗退避也要用到，故聲明提前到函式群組最前面）：
+//
+// 為什麼不 20 台一次全發：mqttClient.publish() 卡住時最壞吃 10 秒
+// （見 publishJsonDoc() 上方對 setSocketTimeout() 的更正說明——不是原先誤判的
+// 3 秒）。master 自己 + 20 台 slave = 21 個 topic，背靠背最壞可達 210 秒，
+// 遠遠撞破 slave 的 30 秒失聯門檻＝籠子被打開。錯開之後每次 loop() 最多一次
+// publish()，且全域 mqttPublishBudgetUsed 名額守衛保證同一輪 loop() 不會疊加
+// 第二次阻塞 publish，兩次之間都有完整的 loop() 週期可發心跳（publishJsonDoc()
+// 內部也會在阻塞呼叫前後各補一次心跳，見該函式）。
+//
+// 為什麼一輪「大約」是 15 秒：slave 的資料本身由 pollNextSlave() 以 15 秒一輪
+// 更新，代發比資料更新還快是純浪費頻寬。但這只是兩個各自獨立、各自用 millis()
+// 起算的 static 計時器，沒有同步機制保證相位對齊，代發帶到的資料最舊可能落後
+// 一整輪（約 15 秒），不是精確同步——先前的註釋宣稱「兩者對齊」是過度陳述，
+// 已更正。
+const unsigned long SLAVE_STATUS_CYCLE_MS = 15000;
+
+// review 修正（I1）：這個下限**對心跳空窗完全沒有保護力**，只在網路正常、
+// publish 幾乎瞬間完成時，防止 20 台同時翻轉 dirty 時被壓縮到極短間隔內連發
+// （且 mqttPublishBudgetUsed 名額守衛本來就會擋掉同一輪 loop() 內的第二次，
+// 這裡防的只是跨多輪、但 loop() 本身跑很快的情境）。publish() 真的卡住時，
+// lastPubAt 是在耗時的呼叫「之前」設定，10 秒的阻塞遠大於這 250ms，下一次
+// `now - lastPubAt` 必定早已超過門檻，不會被這裡攔住。真正的心跳保護是
+// mqttPublishBudgetUsed 名額守衛，加上 publishJsonDoc() 內部的 maintainEspNow()。
+const unsigned long SLAVE_STATUS_MIN_GAP_MS = 250;
+
+// dirty 連續發布失敗的退避參數（review 修正）：避免一台持續失敗的 slave
+// 讓 slaveStatusScheduler() 每次都優先重試同一台，餓死其他台的代發
+// （見 SlaveEntry.dirtyFailCount／dirtyBackoffUntil 宣告處的註釋）。
+const uint8_t SLAVE_DIRTY_MAX_FAIL = 3;
+const unsigned long SLAVE_DIRTY_BACKOFF_MS = 30000;
+
 void publishSlaveStatus(int idx) {
   if (!mqttClient.connected()) return;
   if (idx < 0 || idx >= slaveCount) return;
@@ -1976,8 +2090,22 @@ void publishSlaveStatus(int idx) {
 
   if (publishJsonDoc(topic.c_str(), doc, true)) {
     slaves[idx].dirty = false;
+    slaves[idx].dirtyFailCount = 0;
+    slaves[idx].dirtyBackoffUntil = 0;
+    return;
   }
-  // dirty 只在發布成功時才清：發失敗（例如剛好斷線）就留著，下次補發。
+
+  // dirty 保持 true：發失敗就留著，下次補發。
+  // 失敗計數只在這裡真正呼叫過 mqttClient.publish() 卻沒成功時累加——
+  // slaveStatusScheduler() 已經在呼叫本函式之前用 mqttPublishBudgetUsed
+  // 擋掉「本輪名額已用掉」的情況，不會走到這裡，因此這裡的失敗都是
+  // 真正的網路／buffer 問題，計入退避是合理的。
+  slaves[idx].dirtyFailCount++;
+  if (slaves[idx].dirtyFailCount >= SLAVE_DIRTY_MAX_FAIL) {
+    slaves[idx].dirtyBackoffUntil = millis() + SLAVE_DIRTY_BACKOFF_MS;
+    Serial.printf("⚠ [MQTT] %s 連續 %u 次代發失敗，暫停 %lu 秒後再試，避免餓死其他台\n",
+                  id, (unsigned)slaves[idx].dirtyFailCount, SLAVE_DIRTY_BACKOFF_MS / 1000);
+  }
 }
 
 // 解除配對前，先把一則 status=offline 的保留訊息壓上去。
@@ -1995,50 +2123,52 @@ void publishSlaveOffline(int idx) {
 }
 
 // 代發 slave 狀態的排程器。設計原則：每次呼叫最多發一台。
-//
-// 為什麼不 20 台一次全發：mqttClient.publish() 在連線正常時很快，但 socket
-// 卡住時會拖到 setSocketTimeout(3)。21 個 topic（master 自己 + 20 台 slave）
-// 背靠背最壞 63 秒，直接撞破 slave 的 30 秒失聯門檻＝籠子被打開。錯開之後
-// 每次 loop() 只有一次 publish()，最壞單次 3 秒，兩次之間都有完整的 loop()
-// 週期可發心跳。
-//
-// 為什麼一輪是 15 秒：slave 的資料本身由 pollNextSlave() 以 15 秒一輪更新，
-// 代發比資料更新還快是純浪費頻寬。兩者對齊後每次代發都帶到剛更新過的資料。
-const unsigned long SLAVE_STATUS_CYCLE_MS = 15000;
-const unsigned long SLAVE_STATUS_MIN_GAP_MS = 250;
-
+// 排程間隔、心跳安全性設計見上方 SLAVE_STATUS_CYCLE_MS／SLAVE_STATUS_MIN_GAP_MS
+// 宣告處的完整說明。
 void slaveStatusScheduler() {
-  if (slaveCount == 0) return;
+  // review 修正（M1，除零競態）：slaveCount 是 volatile，若在本函式往下讀取
+  // 之間被 WiFi task 的 HO_PKT_UNPAIR 分支減到 0，後面的除法／取模會整數除零
+  // 導致 panic 重開機。因此一開頭就快照成區域變數 n，函式全程只用 n，
+  // 不再重新讀取 slaveCount。pollNextSlave() 是同一模式，已一併修正。
+  int n = slaveCount;
+  if (n <= 0) return;
   if (!mqttClient.connected()) return;
+  // 本輪已經有別的 publish 用掉名額：整個排程器讓位給下一輪，不嘗試也不動
+  // lastPubAt／rotateIdx，避免虛耗一次輪播時間片（見 mqttPublishBudgetUsed
+  // 宣告處的註釋）。
+  if (mqttPublishBudgetUsed) return;
 
   static unsigned long lastPubAt = 0;
   static int rotateIdx = 0;
 
   unsigned long now = millis();
 
-  // 任何一次發布之間至少隔 SLAVE_STATUS_MIN_GAP_MS，
-  // 避免 20 台同時翻轉時連續 20 個 loop() 各發一台把頻寬吃滿
+  // 任何一次發布之間至少隔 SLAVE_STATUS_MIN_GAP_MS（僅在網路正常時有意義，
+  // 見該常數宣告處的更正說明，這裡不重複保護心跳空窗）
   if (now - lastPubAt < SLAVE_STATUS_MIN_GAP_MS) return;
 
-  // 優先處理有變化的：從 rotateIdx 開始找，確保多台同時 dirty 時能公平輪到
-  for (int k = 0; k < slaveCount; k++) {
-    int i = (rotateIdx + k) % slaveCount;
-    if (slaves[i].dirty) {
-      lastPubAt = now;
-      publishSlaveStatus(i);
-      return;
+  // 優先處理有變化的：從 rotateIdx 開始找，確保多台同時 dirty 時能公平輪到。
+  // 連續失敗仍在退避時間內的台先跳過，讓其他台優先（見 SLAVE_DIRTY_MAX_FAIL）。
+  for (int k = 0; k < n; k++) {
+    int i = (rotateIdx + k) % n;
+    if (!slaves[i].dirty) continue;
+    if (slaves[i].dirtyBackoffUntil != 0 && (long)(now - slaves[i].dirtyBackoffUntil) < 0) {
+      continue;   // 還在退避中，跳過讓其他台優先
     }
+    lastPubAt = now;
+    publishSlaveStatus(i);
+    return;
   }
 
-  // 沒有變化就走例行輪播
-  unsigned long interval = SLAVE_STATUS_CYCLE_MS / (unsigned long)slaveCount;
+  // 沒有（可發布的）變化就走例行輪播
+  unsigned long interval = SLAVE_STATUS_CYCLE_MS / (unsigned long)n;
   if (interval < SLAVE_STATUS_MIN_GAP_MS) interval = SLAVE_STATUS_MIN_GAP_MS;
   if (now - lastPubAt < interval) return;
 
   lastPubAt = now;
-  if (rotateIdx >= slaveCount) rotateIdx = 0;
+  if (rotateIdx >= n) rotateIdx = 0;
   publishSlaveStatus(rotateIdx);
-  rotateIdx = (rotateIdx + 1) % slaveCount;
+  rotateIdx = (rotateIdx + 1) % n;
 }
 
 // SLAVES 指令與剛連上 broker 時用：讓整份名冊在接下來一輪內全部重發一次，
@@ -2053,6 +2183,9 @@ void markAllSlavesDirty() {
 // 不能用 idx 查表，直接用暫存的 MAC 組 topic 與內容。
 void processPendingUnpairPublish() {
   if (!hasPendingOfflinePublish) return;
+  // 本輪已經有別的 publish 用掉名額：讓位給下一輪，旗標保留、下一輪重試
+  // （見 mqttPublishBudgetUsed 宣告處的註釋）。
+  if (mqttPublishBudgetUsed) return;
   // 先清旗標再嘗試發布：即使這次發布失敗（例如剛好沒連上 MQTT）也不重試，
   // 避免卡在一台已經不存在的 MAC 上占用代發頻寬。這是一次性的收尾訊息，
   // 不像 slaves[idx].dirty 有名冊條目可以在下一輪自然補發。
@@ -2106,6 +2239,8 @@ void fakeSlavesForCapacityTest(int n) {
     slaves[i].relay = 1;
     slaves[i].fwMajor = 255; slaves[i].fwMinor = 255; slaves[i].fwPatch = 255;
     slaves[i].dirty = false;
+    slaves[i].dirtyFailCount = 0;
+    slaves[i].dirtyBackoffUntil = 0;
   }
   slaveCount = n;
   fakeSlavesActive = true;   // 鎖住 saveSlaves()，直到重開機為止（見該旗標宣告處的說明）
@@ -2261,6 +2396,11 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  // review 修正（Critical）：每輪 loop() 開頭重置本輪的「阻塞 publish 名額」，
+  // 保證本輪最多只發生一次會阻塞的 mqttClient.publish()（見 mqttPublishBudgetUsed
+  // 宣告處與 publishJsonDoc() 的完整說明）。
+  mqttPublishBudgetUsed = false;
 
   // ── 短按 BOOT 進入配對模式 ──
   // 長按 3 秒以上不觸發，交給下面的 updateResetButton() 判斷長按重置

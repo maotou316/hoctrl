@@ -278,6 +278,7 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 | BLE 配網中 | 有（`loop()` 只跳過 WiFi/MQTT 區塊） | 有，開機時由 `restoreEspNowChannelForOfflineBoot()` 從 NVS `homaster/espch` 切回（前提：NVS 已有該鍵） | < 1 秒 |
 | WiFi 關聯中 | 有（等待迴圈走 `maintainEspNow()`） | 以已知 channel 起始掃描（AP 在該 channel 時一擊命中，不在時可能續掃，見上節）；連續失敗 10 次後的那一次全頻掃描例外 | < 1 秒（間隔已加密到 200ms） |
 | MQTT 連線中 | **沒有** —— `mqttClient.connect()` 是不可中斷的阻塞呼叫 | 不影響 channel | **約 18 秒**（DNS `getaddrinfo()` 無 timeout 參數，由 lwIP `DNS_MAX_RETRIES` 決定約 15 秒＋TCP 3 秒） |
+| MQTT 已連線但 socket 寫入卡住（Task 3 review 發現） | 有——`publishJsonDoc()` 在阻塞呼叫前後各補一次 `maintainEspNow()` | 不影響 channel | **約 10 秒**／每輪 loop()。`PubSubClient::setSocketTimeout(3)` 只管等 CONNACK 與 `readByte()`，對 `publish()` 完全無效；`publish()` 實際走 `NetworkClient::write()` 的 10 次重試 × 1 秒 `select()`，卡住時最壞吃滿 10 秒。典型觸發：AP 正常但 WAN 斷線，本地 socket 仍是 `ESTABLISHED`、`mqttClient.connected()` 仍回 true，代發照發，直到 TCP 送出緩衝塞滿。已用 `mqttPublishBudgetUsed` 名額守衛把每輪 loop() 限制在最多一次這種阻塞，見「代發 slave 狀態」一節 |
 | `espNowDelay()` 各處等待 | 有 | 不影響 channel | < 1 秒 |
 
 因此 `smartConnect()` 刻意設計成**一次呼叫只嘗試一台 broker**，由 `loop()` 的
@@ -291,6 +292,9 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 - 連續 10 次關聯失敗後的那一次全頻掃描，期間心跳命中率降到約 1/13
   （已用 200ms 加密心跳把 30 秒內全數落空的機率壓到 6×10⁻⁶ 量級）
 - MQTT 阻塞的 18 秒是估算值上界，若某個 broker 的 DNS 行為更慢仍有超出的可能
+- MQTT 已連線但 socket 寫入卡住的 10 秒同樣是估算值上界（`NetworkClient::write()`
+  的重試次數與 `select()` 逾時皆為函式庫寫死的常數，實測若函式庫版本更新導致
+  這兩個數字改變，需要重新推算）
 
 ## MQTT
 
@@ -368,25 +372,63 @@ master 除了自己的 `hoban/<deviceId>/status`，還會用**每台 slave 的 M
 }
 ```
 
-`wifi` 區塊刻意填成與一般設備相同的形狀，讓 App 既有的手動解析不用改就能吃下；
-`rssi` 借來顯示 ESP-NOW 訊號強度；`via` 是新欄位，標示這台是被哪一台 master 代發的。
+`wifi` 區塊刻意填成與一般設備相同的形狀，讓 App **兩個頁面（設備卡片／詳情頁）
+各自的 `_handleMqttMessage` 手動解析**不用改就能吃下同一份 payload；`rssi` 借來
+顯示 ESP-NOW 訊號強度；`via` 是新欄位，標示這台是被哪一台 master 代發的。
 
-**排程：每次 `loop()` 最多代發一台**（`slaveStatusScheduler()`），理由是容量：
-master 自己 + 20 台 slave = 21 個 topic，若背靠背發布，`mqttClient.publish()`
-在 socket 卡住時最壞吃到 `setSocketTimeout(3)` 的 3 秒（DNS 異常時單次可達更久），
-21 個連發最壞可達 63 秒，直接撞破 slave 的 30 秒失聯門檻 ＝ 籠子被打開。
-排程器每次只發一台，兩次之間都留有完整的 `loop()` 週期發心跳，
-單次 `loop()` 因代發被拖慢的上限是一次 `publishJsonDoc()` 的耗時（最壞約 3 秒）。
+**review 更正**：這裡原本引用 `Device.updateFromMqttMessage()`，但那支函式在
+`lib/` 沒有生產呼叫點，實際解析路徑是上述兩個頁面各自的手動解析，已更正。
 
-一輪例行輪播固定 15 秒（`SLAVE_STATUS_CYCLE_MS`），與 `pollNextSlave()`
-更新 slave 資料的節奏對齊 —— 代發比資料更新還快是純浪費頻寬。20 台滿載時，
-每台約 750ms 被輪到一次；狀態有變化（上下線翻轉、繼電器變化、版本回報）時
-會設 `dirty` 立刻插隊代發，不必等輪播輪到。
+**排程：每次 `loop()` 最多代發一台**（`slaveStatusScheduler()`）。
+
+**review 更正（Critical）**：原本以為 `mqttClient.publish()` 卡住時的上界是
+`setSocketTimeout(3)` 的 3 秒，逐層查了實際安裝的 `PubSubClient`／`NetworkClient`
+原始碼後推翻——`setSocketTimeout()` 只寫入自己的成員變數，從未呼叫
+`_client->setTimeout()`，這個值只用在 `connect()` 等 CONNACK 與 `readByte()`
+（收包路徑），`publish()` 完全不經過它。`publish()` 實際走
+`PubSubClient::write()` → `_client->write(buf, len)`，`NetworkClient::write()`
+內部是 `retry = WIFI_CLIENT_MAX_WRITE_RETRY(10)` 迴圈，每輪 `select()` 的
+`tv_usec` 硬編碼 1 秒；`send()` 帶 `MSG_DONTWAIT`，`setSocketTimeout()` 設的
+`SO_SNDTIMEO` 對它無效。**單次 `mqttClient.publish()` 最壞卡 10 秒，不是 3 秒**
+（見上方「ESP-NOW 心跳的實際保證」表格新增的一列）。觸發情境：AP 正常但 WAN
+斷線，`NetworkClient::connected()` 仍回 true（本地 socket 還在 `ESTABLISHED`），
+代發照發，直到 lwIP 的 `TCP_SND_BUF`（約 5.7KB）被塞滿後每次 write 都吃滿 10 秒。
+
+master 自己 + 20 台 slave = 21 個 topic，若背靠背發布，21 個連發最壞可達
+**210 秒**，遠遠撞破 slave 的 30 秒失聯門檻 ＝ 籠子被打開。因此排下三層防護：
+
+1. **`slaveStatusScheduler()` 每次呼叫最多發一台**，不會一次全發。
+2. **`mqttPublishBudgetUsed` 名額守衛**：`loop()` 每輪開頭重置，`publishJsonDoc()`
+   真正呼叫 `mqttClient.publish()` 前會佔用這個旗標；本輪已用掉的話，
+   `publishStatus()`／`slaveStatusScheduler()`／`processPendingUnpairPublish()`
+   之中排在後面的呼叫方一律讓位給下一輪，**保證每輪 loop() 最多只發生一次
+   會阻塞的 publish**，把原本可能疊加成 20~30 秒的空窗壓回單次最壞 10 秒。
+3. **`publishJsonDoc()` 內部在阻塞呼叫前後各補一次 `maintainEspNow()`**，
+   成本近乎零，確保進入 10 秒黑箱前剛發過心跳、出來立刻再發一次。
+
+一輪例行輪播「大約」15 秒（`SLAVE_STATUS_CYCLE_MS`），與 `pollNextSlave()`
+更新 slave 資料的節奏對齊 —— 代發比資料更新還快是純浪費頻寬。**review 更正**：
+這只是兩個各自獨立、各自用 `millis()` 起算的 static 計時器，沒有同步機制保證
+相位對齊，代發帶到的資料最舊可能落後一整輪（約 15 秒），不是精確同步。
+20 台滿載時，輪播間隔是 `15000 / slaveCount ≈ 750ms`，即**每 750ms 輪到一台**
+（不是「每台 750ms 被輪到一次」——每台實際仍是約 15 秒才會輪到自己一次）；
+狀態有變化（上下線翻轉、繼電器變化、版本回報）時會設 `dirty` 立刻插隊代發，
+不必等輪播輪到。
+
+**dirty 連續失敗退避**：一台持續發布失敗的 slave（區別於「名額被讓位」——
+`slaveStatusScheduler()` 一發現本輪名額已用掉就整個跳過，不會計入失敗）
+若不處理會讓排程器每次都優先重試同一台，其他台的 `rotateIdx` 永遠推進不到、
+被餓死。連續失敗滿 `SLAVE_DIRTY_MAX_FAIL`（3）次後，暫停該台
+`SLAVE_DIRTY_BACKOFF_MS`（30 秒），讓其他台優先，見 `SlaveEntry.dirtyFailCount`
+／`dirtyBackoffUntil`。
 
 **離線代發與已知限制**：slave 超過 30 秒沒回應時，`updateSlaveOnlineStatus()`
 會把它標記離線並設 `dirty`，下一輪代發就會送出 `status:"offline"`，避免 App
 一直顯示上線。解除配對時（無論是序列埠 `unpair <n>` 還是 slave 主動送
 `HO_PKT_UNPAIR`）也會補發一次 offline，否則 broker 上會留下永遠在線的幽靈設備。
+序列埠 `unpair <n>` 這條路徑上，`publishSlaveOffline()` 可能阻塞最壞 10 秒，
+期間若另一台 slave 經 ESP-NOW 主動解除配對造成陣列搬移，`unpairSlave()`
+會在阻塞呼叫後改用先前存好的 MAC 重新 `findSlave()`，不會用過期的索引刪錯人。
 
 **但這只涵蓋「master 活著、slave 失聯」的情況** —— PubSubClient 一條連線只有
 **一個 LWT（遺囑）名額**，已經給了 master 自己（`hoban/<deviceId>/status`）。
