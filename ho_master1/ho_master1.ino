@@ -13,6 +13,15 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
+// ── ArduinoJson 版本注意事項 ──
+// 本專案安裝的是 ArduinoJson 7.4.3。這個版本的 StaticJsonDocument<N> 只是
+// compatibility.hpp 提供的相容殼（class StaticJsonDocument : public JsonDocument），
+// 模板參數 N 完全被忽略、底層一律動態配置，且已標記 ARDUINOJSON_DEPRECATED。
+// 也就是說「把 N 從 512 改成 2048」對容量沒有任何作用 ——
+// 真正會截斷的地方一直是 serializeJson(doc, buf) 的那個固定大小 char buf。
+// 因此全檔改用 JsonDocument，容量控制一律交給 publishJsonDoc() 的 measureJson() 實測。
+// CLAUDE.md 記載的「用 StaticJsonDocument 避免記憶體碎片」在 7.x 已不成立。
+
 const char* firmwareVersion = "1.0.0";
 const char* deviceModel = "hoMaster1";
 
@@ -132,8 +141,75 @@ const MqttServerConfig DEFAULT_SERVERS[] = {
 const int DEFAULT_SERVER_COUNT = sizeof(DEFAULT_SERVERS) / sizeof(DEFAULT_SERVERS[0]);
 int currentServerIndex = 0;
 
+// 目前連上的是自訂伺服器還是 DEFAULT_SERVERS[currentServerIndex]。
+// currentServerIndex 刻意不追蹤自訂伺服器（見 quickConnectCustom() 註釋），
+// 所以要另外一個旗標才知道 server 欄位該填哪個名字。
+bool usingCustomServer = false;
+
+const char* currentServerName() {
+  if (usingCustomServer) return mqttServer;
+  if (currentServerIndex >= 0 && currentServerIndex < DEFAULT_SERVER_COUNT) {
+    return DEFAULT_SERVERS[currentServerIndex].server;
+  }
+  return "";
+}
+
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
+
+// ── 狀態 JSON 的容量預算 ──
+// 血淚背景（Phase 2a 最終審查的結論）：
+//   serializeJson(doc, buf) 寫進固定大小的 char buf 時會「靜默截斷」——
+//   截斷後的長度仍然小於 mqttClient 的 buffer，publish() 照樣回傳 true，
+//   於是 broker 收到語法殘缺的 JSON、App 解析失敗，而序列埠上什麼異常都看不到。
+//   Phase 2a 的 master 狀態最壞 317 bytes，對 char buf[512] 只剩約 195 bytes 餘裕，
+//   而 Phase 2b 要加的 20 台 slaves 陣列需要 1900+ bytes，必定超過。
+//
+// 所以本階段的容量控制是三層，且第一層在編譯期：
+//   1. static_assert：statusBuf 扣掉基礎欄位上界後，必須放得下 20 台的陣列。
+//      有人把 STATUS_BUF_SIZE 改小 → 編譯失敗，而不是上線後靜默截斷。
+//   2. 執行期 maxEntries 上限 + slaves_truncated 標記（照現在的數值永遠走不到，
+//      存在的意義是「萬一走到，App 與序列埠都看得見」）。
+//   3. publishJsonDoc() 發布前 measureJson()，放不下就整包不發並印出實際需求。
+//      寧可不發，也絕不發半截 JSON。
+
+// 單筆 slave 條目的位元組上界。最壞情況實算：
+//   {"id":"hoban-aabbccddeeff","relay":1,"online":false,"rssi":-100,"version":"255.255.255"},
+//   = 89 bytes（含尾端逗號）。取 96 留餘裕，並讓除法算式是整數。
+const size_t SLAVE_ENTRY_MAX_BYTES = 96;
+
+// slaves 陣列以外所有欄位的位元組上界。實算：
+//   Phase 2a 的既有欄位最壞 317
+//   + "server":"<最長 63 字元的自訂伺服器>",  = 75
+//   + "free_heap":123456,                     = 19
+//   + "slaves_truncated":true,"slaves_shown":20, = 42
+//   + "long_range_pending":true,               = 27（Task 6 加）
+//   ≈ 480，取 512。
+const size_t STATUS_BASE_MAX_BYTES = 512;
+
+// "slaves":[] 這個 key 與中括號本身
+const size_t SLAVES_KEY_OVERHEAD = 11;
+
+const size_t STATUS_BUF_SIZE = 3072;
+
+// PubSubClient 的 buffer 要放得下「固定標頭(最多 5) + topic 長度欄位(2) + topic + payload」。
+// topic 最長是 "hoban/hoban-a0b1c2d3e4f5/status" = 32 bytes。
+// 3072 + 5 + 2 + 32 = 3111，取 3328 留餘裕。
+const size_t MQTT_BUFFER_SIZE = 3328;
+
+// 編譯期保證：statusBuf 一定放得下 HO_ESPNOW_MAX_SLAVES 台的完整陣列。
+static_assert(
+    (STATUS_BUF_SIZE - 1 - STATUS_BASE_MAX_BYTES - SLAVES_KEY_OVERHEAD)
+        / SLAVE_ENTRY_MAX_BYTES >= HO_ESPNOW_MAX_SLAVES,
+    "STATUS_BUF_SIZE 放不下 HO_ESPNOW_MAX_SLAVES 台 slave 的陣列，"
+    "請放大 STATUS_BUF_SIZE 或縮減 STATUS_BASE_MAX_BYTES");
+
+// 序列化用的共用緩衝區。刻意放在檔案層級（.bss）而非函式內的區域變數：
+// loopTask 的堆疊只有 8192 bytes，在裡面開 3072 bytes 的區域陣列，
+// 加上 PubSubClient 與 lwIP 的呼叫深度，堆疊溢位風險太高。
+// 只在 loop() context（含 mqttClient.loop() 內被呼叫的 mqttCallback）使用，
+// 單一 task、不重入，共用一份是安全的。
+static char statusBuf[STATUS_BUF_SIZE];
 
 // 配對模式
 unsigned long pairingStartTime = 0;
@@ -341,7 +417,7 @@ class MyCallbacks : public BLECharacteristicCallbacks {
     // 記憶體釋放只能有一條路徑：ho_relay2 的 onWrite 在成功分支呼叫 free(buffer) 後
     // 又在函式結尾再呼叫一次，靠 ESP.restart() 沒真的執行到才沒炸。這裡改成
     // 所有分支共用同一個結尾，只在函式唯一的出口 free 一次。
-    StaticJsonDocument<512> doc;
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, buffer);
 
     if (err || !doc.containsKey("wifi")) {
@@ -1466,22 +1542,30 @@ bool quickConnectToIndex(int index) {
   mqttClient.setServer(cfg.server, cfg.port);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setKeepAlive(30);
-  // ho_relay2 沒設這兩個，導致：
-  // - buffer 預設 256，帶 server 欄位的狀態 JSON 必定超過而 publish 靜默失敗
-  // - socket timeout 預設 15 秒，5 台輪一輪最壞阻塞 77 秒
-  mqttClient.setBufferSize(1024);
+  // Phase 2b：buffer 由 1024 擴到 MQTT_BUFFER_SIZE，才放得下 20 台的 slaves 陣列。
+  // setBufferSize() 內部是 realloc，heap 不足會回 false 而 buffer 停在舊大小，
+  // 之後每一次大狀態發布都會靜默失敗，所以一定要檢查。
+  if (!mqttClient.setBufferSize(MQTT_BUFFER_SIZE)) {
+    Serial.printf("⚠ [MQTT] setBufferSize(%u) 失敗，buffer 仍為 %u，"
+                  "帶 slaves 陣列的狀態將無法發布\n",
+                  (unsigned)MQTT_BUFFER_SIZE, (unsigned)mqttClient.getBufferSize());
+  }
   mqttClient.setSocketTimeout(3);
 
   const char* deviceId = getDeviceId();
   String statusTopic = String("hoban/") + deviceId + "/status";
 
-  StaticJsonDocument<160> willDoc;
+  JsonDocument willDoc;
   willDoc["device_id"] = deviceId;
   willDoc["status"] = "offline";
   willDoc["server"] = cfg.server;
   willDoc["timestamp"] = millis() / 1000;
-  char willBuf[160];
-  serializeJson(willDoc, willBuf);
+  char willBuf[192];
+  size_t willLen = serializeJson(willDoc, willBuf, sizeof(willBuf));
+  if (willLen >= sizeof(willBuf) - 1) {
+    Serial.println("⚠ [MQTT] LWT JSON 被截斷，改用最小 will");
+    snprintf(willBuf, sizeof(willBuf), "{\"device_id\":\"%s\",\"status\":\"offline\"}", deviceId);
+  }
 
   Serial.printf("[MQTT] 嘗試 %s …\n", cfg.server);
   bool res = mqttClient.connect(deviceId, cfg.username, cfg.password,
@@ -1494,6 +1578,7 @@ bool quickConnectToIndex(int index) {
   String controlTopic = String("hoban/") + deviceId + "/control";
   mqttClient.subscribe(controlTopic.c_str());
   currentServerIndex = index;
+  usingCustomServer = false;
   Serial.printf("[MQTT] 已連線 %s，訂閱 %s\n", cfg.server, controlTopic.c_str());
   publishStatus();
   return true;
@@ -1507,19 +1592,30 @@ bool quickConnectCustom() {
   mqttClient.setServer(mqttServer, mqttPort);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setKeepAlive(30);
-  mqttClient.setBufferSize(1024);
+  // Phase 2b：buffer 由 1024 擴到 MQTT_BUFFER_SIZE，才放得下 20 台的 slaves 陣列。
+  // setBufferSize() 內部是 realloc，heap 不足會回 false 而 buffer 停在舊大小，
+  // 之後每一次大狀態發布都會靜默失敗，所以一定要檢查。
+  if (!mqttClient.setBufferSize(MQTT_BUFFER_SIZE)) {
+    Serial.printf("⚠ [MQTT] setBufferSize(%u) 失敗，buffer 仍為 %u，"
+                  "帶 slaves 陣列的狀態將無法發布\n",
+                  (unsigned)MQTT_BUFFER_SIZE, (unsigned)mqttClient.getBufferSize());
+  }
   mqttClient.setSocketTimeout(3);
 
   const char* deviceId = getDeviceId();
   String statusTopic = String("hoban/") + deviceId + "/status";
 
-  StaticJsonDocument<160> willDoc;
+  JsonDocument willDoc;
   willDoc["device_id"] = deviceId;
   willDoc["status"] = "offline";
   willDoc["server"] = mqttServer;
   willDoc["timestamp"] = millis() / 1000;
-  char willBuf[160];
-  serializeJson(willDoc, willBuf);
+  char willBuf[192];
+  size_t willLen = serializeJson(willDoc, willBuf, sizeof(willBuf));
+  if (willLen >= sizeof(willBuf) - 1) {
+    Serial.println("⚠ [MQTT] LWT JSON 被截斷，改用最小 will");
+    snprintf(willBuf, sizeof(willBuf), "{\"device_id\":\"%s\",\"status\":\"offline\"}", deviceId);
+  }
 
   const char* user = (strlen(mqttUsername) > 0) ? mqttUsername : NULL;
   const char* pass = (strlen(mqttPassword) > 0) ? mqttPassword : NULL;
@@ -1534,6 +1630,7 @@ bool quickConnectCustom() {
 
   String controlTopic = String("hoban/") + deviceId + "/control";
   mqttClient.subscribe(controlTopic.c_str());
+  usingCustomServer = true;
   Serial.printf("[MQTT] 已連線自訂伺服器 %s，訂閱 %s\n", mqttServer, controlTopic.c_str());
   publishStatus();
   return true;
@@ -1559,6 +1656,12 @@ bool mqttCustomTried = false;   // 本輪是否已試過自訂伺服器
 int  mqttProbeOffset = 0;       // 本輪已試過幾台預設伺服器
 bool mqttLastHasCustom = false; // 上次看到的「是否有自訂伺服器」，用於偵測設定變更
 
+// 由 loop() 與 mqttCallback() 的 FIND_BEST_SERVER 共用。
+// 原本是 loop() 內的 static，callback 無法更新它，導致 FIND_BEST_SERVER 觸發的
+// smartConnect()（最壞 18 秒阻塞）之後，loop() 仍以為距離上次重連已滿 10 秒，
+// 立刻再阻塞一次 —— 兩次背靠背 36 秒 > 30 秒門檻。
+unsigned long lastMqttReconnectAt = 0;
+
 // 把游標歸零，讓下一次 smartConnect() 重新從自訂伺服器開始。
 // FIND_BEST_SERVER 的語義是「重新挑一台最好的」，必須從頭挑，不能接著上次的位置。
 void resetMqttProbe() {
@@ -1568,6 +1671,14 @@ void resetMqttProbe() {
 
 void smartConnect() {
   if (!WiFi.isConnected()) return;
+
+  // 按鈕正被按住時不要開始一次最壞 18 秒的不可中斷連線。
+  // connectToWiFi() 的等待迴圈有同樣的逃生口，這裡補上讓兩條路徑對稱。
+  // 這只縮小視窗、不能完全消除：已經進到 connect() 裡面就叫不回來了。
+  if (anyResetButtonPressed()) {
+    Serial.println("[MQTT] 偵測到按鈕按住，本輪跳過連線嘗試");
+    return;
+  }
 
   bool hasCustom = (useCustomServer && strlen(mqttServer) > 0);
   if (hasCustom != mqttLastHasCustom) {
@@ -1603,62 +1714,76 @@ void smartConnect() {
   }
 }
 
-// 發布完整狀態（Phase 2a 先不含 slaves 陣列，那是 Phase 2b 才加）
+// 全專案唯一的 MQTT JSON 發布出口。Task 2~6 新增的每一種發布都必須走這裡，
+// 不得自己另外開 char buf 呼叫 serializeJson()。
+bool publishJsonDoc(const char* topic, JsonDocument& doc, bool retain) {
+  if (!mqttClient.connected()) return false;
+
+  // 防線 1：發布前先量。放不下就整包放棄，絕不送出被截斷的半截 JSON。
+  size_t needed = measureJson(doc);
+  if (needed + 1 > sizeof(statusBuf)) {
+    Serial.printf("⚠ [MQTT] 放棄發布 %s：JSON 需要 %u bytes，statusBuf 只有 %u\n",
+                  topic, (unsigned)needed, (unsigned)sizeof(statusBuf));
+    return false;
+  }
+
+  // 防線 2：mqttClient 的 buffer 要放得下整個 PUBLISH 封包
+  size_t frameNeeded = 5 + 2 + strlen(topic) + needed;
+  if (frameNeeded > mqttClient.getBufferSize()) {
+    Serial.printf("⚠ [MQTT] 放棄發布 %s：整包需要 %u bytes，mqtt buffer 只有 %u\n",
+                  topic, (unsigned)frameNeeded, (unsigned)mqttClient.getBufferSize());
+    return false;
+  }
+
+  size_t n = serializeJson(doc, statusBuf, sizeof(statusBuf));
+
+  // 防線 3：Phase 2a 就有的截斷偵測，保留當最後一道保險。
+  // 理論上防線 1 已經擋掉，但這道成本是零，而它擋的是「靜默送出壞資料」。
+  if (n >= sizeof(statusBuf) - 1) {
+    Serial.printf("⚠ [MQTT] 序列化填滿 statusBuf[%u]，放棄發布 %s\n",
+                  (unsigned)sizeof(statusBuf), topic);
+    return false;
+  }
+
+  bool res = mqttClient.publish(topic, (const uint8_t*)statusBuf, n, retain);
+  if (!res) {
+    Serial.printf("[MQTT] 發布失敗 %s（長度 %u，buffer %u）\n",
+                  topic, (unsigned)n, (unsigned)mqttClient.getBufferSize());
+  }
+  return res;
+}
+
+// 發布 master 自身狀態。Task 2 會在這裡加上 slaves 陣列。
 void publishStatus() {
   if (!mqttClient.connected()) return;
 
   const char* deviceId = getDeviceId();
   String topic = String("hoban/") + deviceId + "/status";
 
-  StaticJsonDocument<512> doc;
+  JsonDocument doc;
   doc["device_id"] = deviceId;
   doc["status"] = "online";
   doc["version"] = firmwareVersion;
   doc["model"] = deviceModel;
+  doc["server"] = currentServerName();     // Phase 2a 漏掉，規格範例有這個欄位
   doc["timestamp"] = millis() / 1000;
 
-  JsonObject wifi = doc.createNestedObject("wifi");
+  JsonObject wifi = doc["wifi"].to<JsonObject>();
   wifi["connected"] = WiFi.isConnected();
   wifi["ssid"] = ssid;
   wifi["rssi"] = WiFi.RSSI();
   wifi["ip"] = WiFi.localIP().toString();
 
-  JsonObject dev = doc.createNestedObject("device");
+  JsonObject dev = doc["device"].to<JsonObject>();
   dev["relay"] = relayState ? 1 : 0;
   dev["has_relay"] = hasRelay;
   dev["pairing"] = pairingMode;
   dev["slave_count"] = (int)slaveCount;
   dev["channel"] = currentChannel;
   dev["long_range"] = longRangeEnabled;
+  dev["free_heap"] = (uint32_t)ESP.getFreeHeap();
 
-  // 真正的截斷邊界是下方 char buf[512]：serializeJson() 寫入固定大小 buffer 時
-  // 真的會截斷，不是 mqttClient 的 1024 buffer。
-  // 本專案安裝的 ArduinoJson 是 7.4.3，這個版本的 StaticJsonDocument<512> 只是
-  // compatibility.hpp 提供的相容殼（class StaticJsonDocument : public JsonDocument），
-  // N 完全被忽略、底層一律動態配置。因此 doc.overflowed() 在這裡量的是「記憶體配置
-  // 失敗」，不是「內容超過 512 bytes」——正常情況下不會因為容量觸發，只有在 heap
-  // 真的配置不出來時才會回 true。仍保留這道檢查（配置失敗本身值得知道），但訊息不能
-  // 再說「超出 StaticJsonDocument<512> 容量」。目前內容約 317 bytes，對 char buf[512]
-  // 還有餘裕，但 Phase 2b 加 slaves 陣列時會逼近上限，真正有效的截斷偵測是下面
-  // n >= sizeof(buf) - 1 那道。
-  if (doc.overflowed()) {
-    Serial.println("⚠ [MQTT] 狀態 JSON 序列化時記憶體配置失敗（ArduinoJson 7 的"
-                   "doc.overflowed() 語意，非容量超限；heap 壓力大時可能發生）");
-  }
-
-  char buf[512];
-  size_t n = serializeJson(doc, buf);
-  if (n >= sizeof(buf) - 1) {
-    Serial.printf("⚠ [MQTT] 序列化結果已填滿 buf[%u]，內容可能被截斷\n",
-                  (unsigned)sizeof(buf));
-  }
-  bool res = mqttClient.publish(topic.c_str(), buf, true);
-  if (!res) {
-    // 超過 mqttClient buffer 時 publish() 只回傳 false、不會拋例外，
-    // 先把長度印出來讓「快超過了」在序列埠上就看得見。
-    Serial.printf("[MQTT] 狀態發布失敗（長度 %u，buffer %u）\n",
-                  (unsigned)n, (unsigned)mqttClient.getBufferSize());
-  }
+  publishJsonDoc(topic.c_str(), doc, true);
 }
 
 // 指令分派。Phase 2a 只處理 master 自己的指令；ALL:*、PAIR:*、UNPAIR:* 等
@@ -1699,6 +1824,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     // 後續會由 loop() 每 10 秒推進一台，不會在這裡一口氣試完全部而卡住心跳。
     resetMqttProbe();
     smartConnect();
+    // FIND_BEST_SERVER 未被 10 秒節流覆蓋的修正：這裡也要更新，否則 loop() 誤以為
+    // 距離上次重連已滿 10 秒，緊接著又觸發一次最壞 18 秒的阻塞連線。
+    lastMqttReconnectAt = millis();
   } else if (message == "HASRELAY:ON" || message == "HASRELAY:OFF") {
     hasRelay = (message == "HASRELAY:ON");
     saveNetConfig();
@@ -1894,19 +2022,18 @@ void loop() {
   // ── MQTT 連線管理 ──
   // BLE 配網模式下同樣跳過：沒有 WiFi 連線，WiFi.status() 本就不會是 WL_CONNECTED，
   // 這裡明講 !bleConfigMode 是為了讓「配網期間不碰 MQTT」的意圖在程式碼上明確可見。
-  static unsigned long lastReconnect = 0;
   static unsigned long lastStatusPub = 0;
 
   if (!bleConfigMode && WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
-      if (now - lastReconnect > 10000) {
+      if (now - lastMqttReconnectAt > 10000) {
         smartConnect();
         // 與上方 WiFi 重連同一個理由：smartConnect() 內的 mqttClient.connect() 最壞
         // 阻塞約 18 秒（DNS 逾時，見 smartConnect() 註釋），若沿用進入本區塊前的 now
-        // 記錄 lastReconnect，下一輪 loop() 的 now 已超前 18 秒以上，10 秒節流立刻
-        // 成立、變成背靠背重試，兩次阻塞之間只擠得出一則心跳。必須在阻塞呼叫「之後」
-        // 用新的 millis() 記錄，才能保證每兩次嘗試之間有完整 10 秒可發約 10 則心跳。
-        lastReconnect = millis();
+        // 記錄 lastMqttReconnectAt，下一輪 loop() 的 now 已超前 18 秒以上，10 秒節流
+        // 立刻成立、變成背靠背重試，兩次阻塞之間只擠得出一則心跳。必須在阻塞呼叫
+        // 「之後」用新的 millis() 記錄，才能保證每兩次嘗試之間有完整 10 秒可發約 10 則心跳。
+        lastMqttReconnectAt = millis();
       }
     } else {
       mqttClient.loop();
