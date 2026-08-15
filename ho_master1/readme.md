@@ -185,10 +185,21 @@ UUID 與欄位路徑必須與 `ho_relay2` 完全一致，否則現有 Flutter Ap
 關聯方式是三段式，優先序由高到低：
 
 1. 有 channel ＋ BSSID（上次成功關聯的記錄）→ 直接定向關聯，完全不掃描
-2. 只有 channel（BSSID 已在前一次失敗時清掉）→ `WiFi.begin(ssid, password, ch, nullptr)`，
-   把 `WiFi.begin()` 內建的掃描限制在單一 channel（該掃描即使不呼叫 `scanNetworks()`
-   仍會發生，全頻一輪約 20 秒）
-3. 兩者都沒有 → 才退回全頻掃描
+2. 只有 channel（BSSID 已在前一次失敗時清掉）→ `WiFi.begin(ssid, password, ch, nullptr)`。
+   依 ESP-IDF 文件（`wifi_sta_config_t.channel` 註解：「Set to 1~13 to scan
+   **starting from** the specified channel before connecting to AP」），這是
+   「以指定 channel **起始**掃描」，並非「鎖定在該 channel」。配合 Arduino core
+   預設的 `WIFI_FAST_SCAN`（找到 SSID 即停）：AP **剛好在**該 channel 時會一擊命中、
+   完全跳過後續掃描；但 AP **不在**該 channel 時，依文件字面意思仍可能從該 channel
+   續掃其餘頻道 —— **這個機制細節只有文件推導、未經實機驗證，待確認**。
+3. 兩者都沒有 → 才退回全頻掃描（該掃描即使不呼叫 `scanNetworks()` 仍會發生，
+   全頻一輪約 20 秒）
+
+即使情境 2 的「續掃」真的發生，也不代表 30 秒心跳空窗會出現：關聯窗口本身有
+`HEARTBEAT_INTERVAL_ASSOC`（200ms）的加密心跳（15 秒約 75 則，全數落空機率約
+0.25%），加上兩次關聯嘗試之間 `connectToWiFi()` 失敗分支會把射頻主動 park 回
+`slaveLockChannel`（`esp_wifi_set_channel()` 為即時呼叫，必中），兩層疊加下
+30 秒空窗理論上不會發生。
 
 失敗時**只清 BSSID、保留 channel**，連續失敗達 `WIFI_CHANNEL_LOCK_MAX_FAIL`（10）次
 才判定 AP 真的換頻、升級成一次全頻掃描並重新學習 channel。
@@ -205,7 +216,7 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 | 情境 | 心跳有沒有發 | 有沒有打在對的 channel | 最壞空窗 |
 |---|---|---|---|
 | BLE 配網中 | 有（`loop()` 只跳過 WiFi/MQTT 區塊） | 有，開機時由 `restoreEspNowChannelForOfflineBoot()` 從 NVS `homaster/espch` 切回（前提：NVS 已有該鍵） | < 1 秒 |
-| WiFi 關聯中 | 有（等待迴圈走 `maintainEspNow()`） | 鎖定單一 channel；連續失敗 10 次後的那一次全頻掃描例外 | < 1 秒（間隔已加密到 200ms） |
+| WiFi 關聯中 | 有（等待迴圈走 `maintainEspNow()`） | 以已知 channel 起始掃描（AP 在該 channel 時一擊命中，不在時可能續掃，見上節）；連續失敗 10 次後的那一次全頻掃描例外 | < 1 秒（間隔已加密到 200ms） |
 | MQTT 連線中 | **沒有** —— `mqttClient.connect()` 是不可中斷的阻塞呼叫 | 不影響 channel | **約 18 秒**（DNS `getaddrinfo()` 無 timeout 參數，由 lwIP `DNS_MAX_RETRIES` 決定約 15 秒＋TCP 3 秒） |
 | `espNowDelay()` 各處等待 | 有 | 不影響 channel | < 1 秒 |
 
@@ -314,11 +325,19 @@ master 只會用預設方式嘗試一次、失敗就等下一輪重連（見 `lo
 ### 3. 狀態 JSON 的真正容量瓶頸是 `StaticJsonDocument<512>` 與 `char buf[512]`
 
 不是 `mqttClient` 的 1024 buffer。`publishStatus()` 目前實測最壞情況約 317 bytes，
-餘裕僅約 195 bytes。一旦超過 512 bytes，`ArduinoJson` 會**截斷**輸出而非溢位或報錯，
-且截斷後的長度仍小於 `mqttClient` 的 1024 buffer，`publish()` 因此仍會回傳 `true`。
-`publishStatus()` 的 `if (!res)` 診斷只抓得到「連 1024 都塞不下」的極端案例，
-所以另外補了 `doc.overflowed()` 與 `n >= sizeof(buf) - 1` 兩道截斷偵測，
-發生時會印出 `⚠ [MQTT] 狀態 JSON 已超出 …` 警告。
+餘裕僅約 195 bytes。真正會**截斷**輸出的邊界是 `char buf[512]`：`serializeJson()`
+寫入固定大小 buffer 時確實會截斷，且截斷後的長度仍小於 `mqttClient` 的 1024
+buffer，`publish()` 因此仍會回傳 `true`。`publishStatus()` 的 `if (!res)` 診斷
+只抓得到「連 1024 都塞不下」的極端案例，所以另外補了 `n >= sizeof(buf) - 1`
+這道有效的截斷偵測。
+
+**`doc.overflowed()` 在本專案的 ArduinoJson 7.4.3 抓不到「超過 512 bytes」**：
+這個版本的 `StaticJsonDocument<512>` 只是 `compatibility.hpp` 提供的相容殼
+（`class StaticJsonDocument : public JsonDocument`），`512` 這個 N 完全被忽略、
+底層一律動態配置記憶體。所以 `doc.overflowed()` 量的是「記憶體配置失敗」，
+不是「內容超過容量」——正常情況下不會因為 JSON 內容大小觸發，只有 heap 真的
+配置不出來時才會回 `true`。仍保留這道檢查（配置失敗本身值得知道），但序列埠
+警告訊息已改用「記憶體配置失敗」的措辭，不再說「超出 512 容量」。
 
 Phase 2b 加入 `slaves` 陣列（每台 slave 的個別狀態）時，**必須同時放大三處**：
 `StaticJsonDocument<512>`、`char buf[512]`、以及 `mqttClient.setBufferSize(1024)`，

@@ -969,6 +969,10 @@ void handleSerialCommand(const String& line) {
     if (arg >= 1 && arg <= 13) {
       esp_wifi_set_channel((uint8_t)arg, WIFI_SECOND_CHAN_NONE);
       currentChannel = (uint8_t)arg;
+      // 同步 lastKnownChannel，避免 WiFi 仍是 WL_CONNECTED 時，下一次 loop()
+      // 呼叫 onWifiChannelMayHaveChanged() 偵測到 primary != lastKnownChannel
+      // 而誤判「AP 換頻」、意外把這個測試用的 channel 寫入 NVS（saveSlaveLockChannel()）。
+      lastKnownChannel = (uint8_t)arg;
       Serial.printf("[channel] master 切換到 %d\n", arg);
       sendHeartbeatBurst();   // 立刻連發數次，讓正在輪掃的 slave 早點命中
     } else {
@@ -1189,7 +1193,9 @@ void onWifiChannelMayHaveChanged() {
     // AP 不斷線就換頻（例如 DFS 或自動選台）也要更新 NVS 記錄，
     // 否則下次開機進 BLE 配網模式會切回一個已經過時的 channel。
     // 本函式只由 connectToWiFi() 成功分支與 loop() 的「WiFi 已連線」分支呼叫，
-    // 兩處都保證 WiFi 已連線；序列埠的 ch <n> 測試指令走另一條路，不會誤寫 NVS。
+    // 兩處都保證 WiFi 已連線；序列埠的 ch <n> 測試指令走另一條路，但也會同步
+    // lastKnownChannel（見 handleSerialCommand()），所以下一輪 loop() 不會因為
+    // primary != lastKnownChannel 而誤判、意外把測試用的 channel 寫入 NVS。
     if (slaveCount > 0) saveSlaveLockChannel(primary);
     sendHeartbeatBurst();
   }
@@ -1259,8 +1265,15 @@ void connectToWiFi() {
   // 全頻道掃描一輪（約 1.5 秒、一輪約 20 秒），這正是我們想擋掉的行為，只是被包在
   // begin() 裡面。三段式優先序：
   //   1. 有 channel＋BSSID → 直接定向關聯，完全不掃描（最快、對 ESP-NOW 最友善）
-  //   2. 只有 channel（BSSID 已在前次失敗時清掉）→ 仍把掃描限制在單一 channel，
-  //      master 不會跑遍 1~13，停在舊 channel 的 slave 心跳命中率幾乎不受影響
+  //   2. 只有 channel（BSSID 已在前次失敗時清掉）→ WiFi.begin(ssid, pass, ch, nullptr)。
+  //      依 ESP-IDF 文件（wifi_sta_config_t.channel 註解：「Set to 1~13 to scan
+  //      starting from the specified channel before connecting to AP」），這是
+  //      「以指定 channel 起始掃描」，不是「鎖定在該 channel」。配合 Arduino core
+  //      預設的 WIFI_FAST_SCAN（找到 SSID 即停）：AP 剛好在該 channel 時會一擊命中、
+  //      完全跳過後續掃描；但 AP 不在該 channel 時，依文件字面意思仍可能從該 channel
+  //      續掃其餘頻道 —— 這個機制細節只有文件推導、未經實機驗證，待確認。真正的安全網
+  //      是本函式失敗分支的 channel 復位（必中）＋關聯期 200ms 加密心跳，兩層疊加下
+  //      即使續掃真的發生，理論上也不會出現 30 秒空窗。
   //   3. 兩者都沒有（開機第一次，或連續失敗到判定 AP 真的換頻了）→ 才退回全頻掃描
   if (haveLastApBssid) {
     Serial.printf("[WiFi] 使用已知 channel=%u 的 BSSID 直接關聯，跳過掃描\n", lastApChannel);
@@ -1526,14 +1539,19 @@ void publishStatus() {
   dev["channel"] = currentChannel;
   dev["long_range"] = longRangeEnabled;
 
-  // 真正的容量瓶頸是 StaticJsonDocument<512> 與下方 char buf[512]，不是 mqttClient
-  // 的 1024 buffer。ArduinoJson 在文件放不下時是「截斷」而非溢位，截斷後的長度仍然
-  // < 1024 → publish() 回傳 true → 靜默失敗，訂閱端收到殘缺 JSON 卻沒有任何錯誤。
-  // 目前 317/512 還有餘裕，但 Phase 2b 要在這裡加最多 20 台 slave 的陣列，
-  // 必定會逼近上限，所以先把截斷偵測補上。
+  // 真正的截斷邊界是下方 char buf[512]：serializeJson() 寫入固定大小 buffer 時
+  // 真的會截斷，不是 mqttClient 的 1024 buffer。
+  // 本專案安裝的 ArduinoJson 是 7.4.3，這個版本的 StaticJsonDocument<512> 只是
+  // compatibility.hpp 提供的相容殼（class StaticJsonDocument : public JsonDocument），
+  // N 完全被忽略、底層一律動態配置。因此 doc.overflowed() 在這裡量的是「記憶體配置
+  // 失敗」，不是「內容超過 512 bytes」——正常情況下不會因為容量觸發，只有在 heap
+  // 真的配置不出來時才會回 true。仍保留這道檢查（配置失敗本身值得知道），但訊息不能
+  // 再說「超出 StaticJsonDocument<512> 容量」。目前內容約 317 bytes，對 char buf[512]
+  // 還有餘裕，但 Phase 2b 加 slaves 陣列時會逼近上限，真正有效的截斷偵測是下面
+  // n >= sizeof(buf) - 1 那道。
   if (doc.overflowed()) {
-    Serial.println("⚠ [MQTT] 狀態 JSON 已超出 StaticJsonDocument<512> 容量並被截斷，"
-                   "請加大 doc 與 buf 的容量（publish 仍會回報成功，屬靜默失敗）");
+    Serial.println("⚠ [MQTT] 狀態 JSON 序列化時記憶體配置失敗（ArduinoJson 7 的"
+                   "doc.overflowed() 語意，非容量超限；heap 壓力大時可能發生）");
   }
 
   char buf[512];

@@ -247,11 +247,21 @@ status 訊息的變化。
 > 只看「心跳 log 有沒有繼續印」會把這個 9% 的破口測成 PASS。
 
 修正後的行為有兩層：
-- **鎖 channel**：失敗時只清 BSSID、保留 `lastApChannel`，重試改用
-  `WiFi.begin(ssid, password, lastApChannel, nullptr)`，掃描被限制在單一 channel。
-  連續失敗達 `WIFI_CHANNEL_LOCK_MAX_FAIL`（10）次才升級成一次全頻掃描。
+- **channel 提示**：失敗時只清 BSSID、保留 `lastApChannel`，重試改用
+  `WiFi.begin(ssid, password, lastApChannel, nullptr)`。依 ESP-IDF 文件
+  （`wifi_sta_config_t.channel` 註解：「Set to 1~13 to scan **starting from**
+  the specified channel before connecting to AP」），這是「以指定 channel
+  **起始**掃描」，並非「鎖定在該 channel」。配合 Arduino core 預設的
+  `WIFI_FAST_SCAN`（找到 SSID 即停）：AP **剛好在**該 channel 時會一擊命中、
+  完全跳過後續掃描；但 AP **不在**該 channel 時（本項路由器斷電情境正好符合），
+  依文件字面意思仍可能從該 channel 續掃其餘頻道 —— **這個機制細節只有文件
+  推導、未經實機驗證**，是本項要實測確認的重點之一。連續失敗達
+  `WIFI_CHANNEL_LOCK_MAX_FAIL`（10）次才升級成一次全頻掃描。
 - **加密心跳**：關聯期間 `wifiAssociating` 為 true，心跳間隔由 1000ms 縮到
-  `HEARTBEAT_INTERVAL_ASSOC`（200ms），30 秒內 150 則。
+  `HEARTBEAT_INTERVAL_ASSOC`（200ms），30 秒內約 150 則。加上兩次關聯嘗試之間
+  `connectToWiFi()` 失敗分支會把射頻主動 park 回 `slaveLockChannel`
+  （`esp_wifi_set_channel()` 為即時呼叫，必中），兩層疊加下，即使續掃真的
+  發生，30 秒空窗理論上也不會出現。
 
 **步驟**：
 1. master 已連上 WiFi（記下 AP 的 channel，例如 6）、已配對至少 1 台 slave，
@@ -281,16 +291,27 @@ status 訊息的變化。
 2. 心跳 log 是否持續。注意關聯期間心跳加密到 200ms，log 每 10 次印一行，
    所以關聯中會看到**約每 2 秒一行**、非關聯期間回到約每 10 秒一行 ——
    兩種節奏交替出現是正常的，不是異常。
-3. 心跳 log 的 `channel=` 欄位是否**全程維持 6**。
+3. 心跳 log 的 `channel=` 欄位變化模式（全程維持 6，或短暫跳動後回穩）——
+   這是機制待確認的觀察項，不是失敗判定，理由見下方「待確認的觀察項」。
 4. slave 端全程是否沒有 `[失聯]`、沒有重新輪掃、繼電器（原本是 ON 的話）沒被關閉。
 
 **什麼情況算失敗**：
 - 出現 `[WiFi] 無已知 channel，退回全頻掃描關聯`，而重連次數還沒到 10 次
   → 保留 `lastApChannel` 的修正有回歸
-- 心跳 log 的 `channel=` 在 60 秒內跳動（6 → 3 → 11 …）→ master 正在全頻掃描，
-  單 channel 限制沒生效
 - 心跳 log 出現超過 **30 秒**的空窗 → 某段等待沒有走 `maintainEspNow()`
 - slave 印出 `[失聯] 超過 30 秒沒收到心跳`，或繼電器被強制關閉
+
+**待確認的觀察項（不是失敗判定）**：
+- 心跳 log 的 `channel=` 欄位在 60 秒內是否跳動（例如 6 → 3 → 11 …）。
+  **這不是失敗判定** —— `WiFi.begin(ssid, pass, ch, nullptr)` 依 ESP-IDF 文件
+  是「以該 channel 起始掃描」，AP 不在該 channel 時，文件字面意思上仍可能從
+  該 channel 續掃其餘頻道，因此看到跳動未必代表修正失效；完全不跳也不能單靠
+  這一項就證明機制如預期運作，兩種結果都值得記錄。**請記錄實際觀察到的
+  channel 變化模式**（完全不跳／跳動但很快回到 6／持續跳動），作為機制驗證
+  的第一手資料，用來校正上方「channel 提示」的敘述，而不要單憑跳動與否
+  判斷本項 PASS/FAIL。真正保護 slave 不失聯的是「200ms 加密心跳＋兩次嘗試
+  之間的 channel 復位」這兩層機制，只要沒出現 30 秒空窗與 slave 失聯，
+  這一項本身跳不跳都不影響本項「修正有效」的結論。
 
 > **注意這一項有機率性**：修正前的失敗機率約 9%，代表**單次測試通過不足以證明
 > 修正有效**。請以「第 2 次以後的重連是否印出鎖定 channel 的那一行」作為主要判準
@@ -340,13 +361,14 @@ status 訊息的變化。
    進一次 `smartConnect()`
 4. 持續觀察至少 **3 分鐘**，同時監看 slave 序列埠
 
-**預期序列埠輸出（master）**：每一輪只會有**一行**「嘗試」，行與行之間隔約
-10 秒＋阻塞時間，中間夾著心跳 log：
+**預期序列埠輸出（master）**：每一輪只會有**一行**「嘗試」，「嘗試」與緊接著的
+「失敗」之間是 `mqttClient.connect()` 的阻塞區間，**不可能**印出心跳 log；
+心跳 log 只會出現在**這一輪的「失敗」與下一輪的「嘗試」之間**（`loop()` 的
+10 秒重連節奏，`maintainEspNow()` 在這段區間正常運作）：
 ```
 [MQTT] 嘗試自訂伺服器 no-such-broker.invalid …
-[心跳] channel=6 配對模式=否 slave=1
 [MQTT] 自訂伺服器 no-such-broker.invalid 失敗，state=-2
-（約 10 秒，期間約 10 則心跳）
+（約 10 秒，期間約 10 則心跳，例如 [心跳] channel=6 配對模式=否 slave=1 × 10）
 [MQTT] 嘗試 mqttgo.io …
 [MQTT] mqttgo.io 失敗，state=-2
 …（走完 5 台預設伺服器後）

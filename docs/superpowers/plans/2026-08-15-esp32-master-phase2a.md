@@ -335,7 +335,11 @@ void connectToWiFi() {
 
   // 三段式優先序（最終審查修正 Critical 3）：
   //   1. channel＋BSSID → 定向關聯，完全不掃描
-  //   2. 只有 channel  → 仍把 WiFi.begin() 內建的掃描限制在單一 channel
+  //   2. 只有 channel  → WiFi.begin(ssid, pass, ch, nullptr)。依 ESP-IDF 文件
+  //      是「以該 channel 起始掃描」而非「鎖定在該 channel」：AP 在該 channel 時
+  //      一擊命中、完全跳過掃描；AP 不在時依文件字面意思仍可能續掃其餘頻道
+  //      （機制未經實機驗證，待確認）。安全網是失敗分支的 channel 復位（必中）
+  //      ＋關聯期 200ms 加密心跳，兩層疊加下 30 秒空窗理論上不會發生
   //   3. 都沒有        → 才退回全頻掃描（一輪約 20 秒，心跳命中率剩約 1/13）
   if (haveLastApBssid) {
     Serial.printf("[WiFi] 使用已知 channel=%u 的 BSSID 直接關聯，跳過掃描\n", lastApChannel);
@@ -847,12 +851,14 @@ void publishStatus() {
   dev["channel"] = currentChannel;
   dev["long_range"] = longRangeEnabled;
 
-  // 最終審查修正 6：真正的容量瓶頸是 StaticJsonDocument<512> 與 char buf[512]，
-  // 不是 mqttClient 的 1024 buffer。ArduinoJson 放不下時是「截斷」而非溢位，
-  // 截斷後長度仍 < 1024 → publish() 回 true → 靜默失敗。
+  // 最終審查修正 6：真正的截斷邊界是 char buf[512]，不是 mqttClient 的 1024 buffer。
+  // 附加修正（final-fix-report.md）：本專案的 ArduinoJson 7.4.3 中
+  // StaticJsonDocument<512> 只是相容殼、N 被忽略、底層動態配置，doc.overflowed()
+  // 量的是「記憶體配置失敗」不是「超過 512 bytes」，訊息已改措辭，真正有效的
+  // 截斷偵測是下面的 n >= sizeof(buf) - 1。
   if (doc.overflowed()) {
-    Serial.println("⚠ [MQTT] 狀態 JSON 已超出 StaticJsonDocument<512> 容量並被截斷，"
-                   "請加大 doc 與 buf 的容量（publish 仍會回報成功，屬靜默失敗）");
+    Serial.println("⚠ [MQTT] 狀態 JSON 序列化時記憶體配置失敗（ArduinoJson 7 的"
+                   "doc.overflowed() 語意，非容量超限；heap 壓力大時可能發生）");
   }
 
   char buf[512];
@@ -1146,7 +1152,11 @@ MQTT topic 與指令表、狀態 JSON 範例、與 `ho_relay2` 的差異說明�
 
 `slaveLockChannel` 的三個寫入點：`connectToWiFi()` 成功分支、`addSlave()`
 （涵蓋「先連 WiFi 才配對」這個最常見順序）、`onWifiChannelMayHaveChanged()`
-（涵蓋 AP 不斷線就換頻）。序列埠的 `ch <n>` 測試指令刻意不寫 NVS。
+（涵蓋 AP 不斷線就換頻）。序列埠的 `ch <n>` 測試指令走另一條路，不經過
+`onWifiChannelMayHaveChanged()`；但它只設 `currentChannel`、沒同步
+`lastKnownChannel`，若當時 WiFi 仍是 `WL_CONNECTED`，下一次 `loop()` 呼叫
+`onWifiChannelMayHaveChanged()` 仍會誤判成「AP 換頻」而寫入 NVS。
+附加修正（見 final-fix-report.md）已補上 `lastKnownChannel` 的同步。
 
 ## Phase 2a 完成後的狀態
 
