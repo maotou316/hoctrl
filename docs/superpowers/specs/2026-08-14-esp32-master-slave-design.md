@@ -200,11 +200,24 @@ struct __attribute__((packed)) EspNowHeader {
 }
 ```
 
-`wifi` 欄位刻意填成這樣，讓 App 現有的 `Device.updateFromMqttMessage()`
-（`hoctrl/lib/models/device.dart:117-142`）不用改就能解析，
-`rssi` 借來顯示 ESP-NOW 訊號強度。`via` 是新欄位，標示這台是誰代發的。
+`wifi` 欄位刻意填成與一般設備相同的形狀，讓 App 兩個頁面既有的手動解析
+（`devices_page.dart` 與 `device_detail_page.dart` 各自的 `_handleMqttMessage`）
+不用改就能吃下 slave 的狀態，`rssi` 借來顯示 ESP-NOW 訊號強度。
+`via` 是新欄位，標示這台是誰代發的。
+
+**修正（2026-08-16）**：本節原先寫「讓 `Device.updateFromMqttMessage()` 不用改就能解析」，
+該宣稱不成立——那支函式在 `lib/` 底下**沒有任何生產呼叫點**（只有
+`test/models/device_test.dart:209-295` 的 12 個測試在測它），兩個頁面都是各自手寫
+`copyWith` 解析。設計意圖（slave payload 與一般設備同形狀）仍然成立，只是受益的
+是兩個頁面的手動解析而非那支函式。
 
 Slave 失聯時 master 要代發 `"status": "offline"`，否則 App 會一直顯示上線。
+
+**架構限制（2026-08-16 於 Phase 2b 規劃時發現）**：PubSubClient 一條連線只有
+**一個 LWT（遺囑）名額**，已經給了 master 自己。所以上面這條「代發 offline」只涵蓋
+「master 活著但 slave 失聯」的情況；**master 自己斷電時，所有 slave 會停在最後一則
+`online`**。App 端必須用 `via` 欄位反查代發者：master 顯示離線時，其底下所有 slave
+一律視為狀態不明，不可信任它們最後一則 `online`。
 
 ### Master 新增的控制指令
 
@@ -286,7 +299,7 @@ Slave 的 control topic 由 master 代訂閱，收到 `ON` / `OFF` / `status`
 | Device 模型加 `parentId` | `lib/models/device.dart` | 新欄位（slave 填 master 的 Firestore id，根設備為 null），`fromJson`/`toJson` 同步；`isSlave` 為 `parentId != null` 的 getter |
 | 樹狀分組邏輯 | `lib/services/device_service.dart` | 新增 `getDeviceTreeGrouped()`：根設備做上下線分組，每個根節點掛上 `children` |
 | 列表改樹狀 | `lib/pages/devices_page.dart:1004-1081` | 改用上述分組；新增 `_buildDeviceTreeNode()`，有子設備時包 `ExpansionTile` |
-| Slave 卡片樣式 | `lib/widgets/device_card.dart` | 加 `isChild` 參數控制縮排、連接線、緊湊版面 |
+| Slave 卡片樣式 | `lib/pages/devices_page.dart` 的 `_buildDeviceCard()` | 加 `isChild` 參數控制縮排、連接線、緊湊版面 |
 | 解析 `slaves` 陣列與 `via` 欄位 | `lib/pages/device_detail_page.dart:2705` | 現有解析區塊擴充 |
 | Master 詳情頁：slave 清單 | `lib/pages/device_detail_page.dart` | 新區塊，顯示每台 slave 狀態＋個別控制入口 |
 | 群組控制按鈕 | 同上 | 「全部關門」按鈕，送 `ALL:ON` |
