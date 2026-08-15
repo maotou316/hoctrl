@@ -86,6 +86,16 @@ SlaveEntry slaves[HO_ESPNOW_MAX_SLAVES];
 volatile int slaveCount = 0;
 Preferences prefs;
 
+// ── Phase 2b review 修正：fakeslaves 容量測試工具的 NVS 安全網 ──
+// fakeSlavesForCapacityTest() 本身只寫記憶體，但灌入假資料後若在同一次開機期間
+// 執行真正的配對（onEspNowRecv() 的 HO_PKT_PAIR_REQ → addSlave()）或解除配對
+// （unpairSlave()），兩者都會呼叫 saveSlaves()，殘留的假 MAC 會被一併寫進
+// NVS，汙染真實名冊。這個旗標在 fakeSlavesForCapacityTest() 設為 true 後，
+// saveSlaves() 開頭就會擋下所有寫入，不必逐一修改 addSlave()／unpairSlave()。
+// 只能靠重開機清除（與假名冊本身「重開機即消失」的語義一致），故意不提供
+// 序列埠指令解除，避免使用者忘記假資料還在就手動解鎖。
+bool fakeSlavesActive = false;
+
 // ── slave 目前鎖定的 channel（存 homaster 命名空間，與名冊同生共死）──
 // 與下方 lastApChannel 是兩個不同用途的值，刻意分開存在兩個命名空間：
 // - lastApChannel（hoban／apch）服務「WiFi 關聯」：下次要用哪個 channel 關聯 AP。
@@ -187,6 +197,17 @@ PubSubClient mqttClient(espClient);
 // 單筆 slave 條目的位元組上界。最壞情況實算：
 //   {"id":"hoban-aabbccddeeff","relay":1,"online":false,"rssi":-100,"version":"255.255.255"},
 //   = 89 bytes（含尾端逗號）。取 96 留餘裕，並讓除法算式是整數。
+//
+// review 補充（實測數字比對）：實機用 fakeslaves 20 量到的「餘裕 971 bytes」是樂觀值——
+// 那台測試板 SSID 短、沒設自訂 MQTT 伺服器，基礎欄位只吃了 310 bytes，遠低於
+// STATUS_BASE_MAX_BYTES=512 的預算。static_assert 真正依賴、且必須成立的是用這個
+// 常數乘上 HO_ESPNOW_MAX_SLAVES 算出的悲觀上界：26 台＝512+11+26×96=3019，
+// 對 statusBuf[3072] 只剩 52 bytes 餘裕；27 台（3115）就會超出。
+// **日後若在 SlaveEntry／appendSlavesArray() 新增欄位，務必重新實算這個上界並
+// 更新這個常數**——static_assert 比較的只是這個常數本身，常數沒跟著新欄位變大，
+// 編譯期完全檢查不出「單筆條目其實已經超過 96 bytes」，那 52 bytes 的邊際
+// 會在不知不覺間被吃光，直到現場真的湊到 27 台才會發布時被 publishJsonDoc()
+// 的防線 1 擋下（不是編譯期，是執行期靜默放棄發布）。
 const size_t SLAVE_ENTRY_MAX_BYTES = 96;
 
 // slaves 陣列以外所有欄位的位元組上界。實算：
@@ -832,6 +853,14 @@ int findSlave(const uint8_t mac[6]) {
 }
 
 void saveSlaves() {
+  // 安全網：名冊含 fakeslaves 灌入的測試假資料時拒絕寫入，避免 unpairSlave()／
+  // addSlave() 把假 MAC 一併存進 NVS 汙染真實名冊。理由與解法見 fakeSlavesActive
+  // 宣告處的註釋；恢復方式只有重開機（假資料本身也是重開機即消失，兩者一致）。
+  if (fakeSlavesActive) {
+    Serial.println("⚠ [名冊] 目前名冊含 fakeslaves 測試假資料，拒絕寫入 NVS："
+                   "真實名冊未被更動。請重新開機清除假資料後，再執行配對／解除配對。");
+    return;
+  }
   prefs.begin("homaster", false);
   prefs.putInt("count", slaveCount);
   // 只存 MAC，online/rssi/lastSeen 是執行期狀態不需持久化
@@ -1141,7 +1170,8 @@ void printHelp() {
   Serial.println("  state <n>     要求第 n 台回報狀態");
   Serial.println("  unpair <n>    解除第 n 台配對");
   Serial.println("  ch <n>        測試用：切換 master 的 channel（1~13）");
-  Serial.println("  fakeslaves <n> 測試用：把名冊灌成 n 台假 slave，實測容量（不寫 NVS）");
+  Serial.println("  fakeslaves <n> 測試用：把名冊灌成 n 台假 slave，實測容量（不寫 NVS；");
+  Serial.println("                 灌入後到重開機前，pair／unpair 會被擋下，避免假 MAC 寫進 NVS）");
   Serial.println("  jsonsize      測試用：印出目前狀態 JSON 的實際大小");
   Serial.println("  help          顯示這份說明");
 }
@@ -1889,6 +1919,12 @@ void publishStatus() {
 // 刻意「不」呼叫 saveSlaves()、也不註冊 peer —— 這是純記憶體內的假資料，
 // 重開機即消失，不會污染 NVS 名冊、也不會對不存在的 MAC 送出封包。
 // 只開放序列埠，不接到 MQTT：這是開發驗證工具，不是產品功能。
+//
+// review 補強：本函式本身確實不寫 NVS，但灌入後名冊裡混著假 MAC，若在同一次
+// 開機期間接著做真正的 pair／unpair，addSlave()／unpairSlave() 一樣會呼叫
+// saveSlaves()，把假 MAC 一併存進 NVS 汙染真實名冊。因此這裡另外設
+// fakeSlavesActive，由 saveSlaves() 統一擋下（見該旗標宣告處與 saveSlaves()
+// 的註釋），並在序列埠明講「重開機前不要 pair／unpair」。
 void fakeSlavesForCapacityTest(int n) {
   if (n < 0) n = 0;
   if (n > HO_ESPNOW_MAX_SLAVES) n = HO_ESPNOW_MAX_SLAVES;
@@ -1903,7 +1939,10 @@ void fakeSlavesForCapacityTest(int n) {
     slaves[i].dirty = false;
   }
   slaveCount = n;
+  fakeSlavesActive = true;   // 鎖住 saveSlaves()，直到重開機為止（見該旗標宣告處的說明）
   Serial.printf("[測試] 名冊已灌成 %d 台假 slave（未寫入 NVS，重開機即消失）\n", n);
+  Serial.println("⚠ [測試] 重開機前請勿執行 pair／unpair："
+                 "名冊混有假 MAC，一旦觸發存檔就會寫進 NVS 汙染真實名冊（已由 saveSlaves() 擋下）");
 }
 
 // 印出目前狀態 JSON 的實際大小，與各層預算比對
