@@ -339,6 +339,23 @@ master 離線時整棵樹一起移到離線區塊；slave 單獨離線時仍留�
 刪掉 master 後 slave 降級成根節點不會消失；群組按鈕能一次觸發多台。
 
 ### Phase 4：ESP-NOW 轉送 OTA
+
+**flash 預算已實測（2026-08-16 探針編譯，結論：WROOM 放得下 HTTPS，不需改架構）**
+
+| 情境 | WROOM | 對 app0 (2,031,616) | C3 |
+|---|---|---|---|
+| 基準（Phase 2a 完成時） | 1,683,311 | 82.86% | 1,299,877（63.98%） |
+| 加 `Update.h` + `HTTPClient.h` | 1,809,603 | 89.07% | 1,438,627（70.81%） |
+| 再加 `WiFiClientSecure.h`（HTTPS） | 1,809,111 | **89.05%，剩 217 KB** | 1,437,463（70.75%） |
+
+**兩個推翻先前假設的結論**：
+
+1. **HTTPS 的實際成本只有約 126 KB**，不是原先估的 170~250 KB。WROOM 剩 217 KB 餘裕，寫完完整的重試／進度回報邏輯（多是邏輯碼、幾百到一兩千 bytes 等級）仍吃得下
+2. **走 HTTP 幾乎省不到 flash**（只差 492 bytes，雜訊範圍內）。原因：`ho_master1.ino` 無條件 include BLE 標頭，**BLE 的安全機制已把 mbedTLS 整包連結進去**，TLS 是沉沒成本。真正的大頭是 `Update.h` + `HTTPClient.h`
+
+**所以：Phase 4 沒有理由為了省 flash 而犧牲 HTTPS**。原先列的三條備案（走 HTTP／換 NimBLE／master 只支援 C3）實測後都不需要。
+
+
 分包、ACK 視窗、重傳、MD5 校驗、進度回報到 MQTT。
 驗收：從 App 對 slave 發起 OTA，成功升版且失敗時不會變磚。
 
