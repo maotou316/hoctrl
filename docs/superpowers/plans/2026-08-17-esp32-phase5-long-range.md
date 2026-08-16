@@ -174,6 +174,112 @@ Phase 2a 已因此踩過一次（`WiFi.begin()` 帶 channel 的掃描語義被�
 這句話對 **STA↔AP 關聯**大致成立，對 **ESP-NOW** 沒有依據。
 Task 6 的 readme 與回歸清單在 Task 1 填出結果之前**不得引用它**。
 
+#### 補充查證（2026-08-16 第二輪，由獨立研究代理完成）—— A 已被文件判定，並新增兩個致命危害
+
+**宣稱 A 已不再是「未驗證」，而是「文件明說會發生」。** ESP-IDF Wi-Fi 驅動指南
+（`station-scenarios.rst`，station 情境的「Wi-Fi Configuration Phase」）逐字：
+
+> However, if the configuration does not need to change after the Wi-Fi connection is set up,
+> you should configure the Wi-Fi driver at this stage, because the configuration APIs
+> (such as `esp_wifi_set_protocol()`) **will cause the Wi-Fi to reconnect**,
+> which may not be desirable.
+
+也就是說：**在已關聯 AP 的狀態下切換 LR，一定會斷線重連。**
+Task 1 的測項 A 因此**從「測會不會斷」改成「測斷多久、MQTT 多久恢復」**——
+要量的是 `WiFi.status()` 從 `WL_CONNECTED` 離開到回來的毫秒數，以及
+`mqttClient.connected()` 恢復的毫秒數。這個數字決定「決定 3」的 10 秒驗證窗夠不夠。
+
+**追加：必須在 `esp_wifi_start()` 之後呼叫。** 這一點**不在標頭註釋裡**，是 Espressif
+維護者在 esp-idf#9933 明講的（"`esp_wifi_set_protocol` … need to be called after
+`esp_wifi_start()`, will update the doc"）。開機路徑的 `applyLongRange()` 位置要照這個排。
+
+##### 危害 D：STA 與 SoftAP **共用同一個 LR 位元** —— 會讓配網模式的 AP 手機看不到
+
+esp-idf#9978，維護者逐字：
+
+> Currently, the STA and the softAP use the same LR bit, so when you set the LR mode,
+> **both STA and softAP will take effect.**
+
+而 Wi-Fi 驅動指南同時說：
+
+> For LR-enabled **AP** of ESP32, it is **incompatible with traditional 802.11 mode**,
+> because the **beacon is sent in LR mode**.
+
+**合起來就是一條完整的變磚路徑**：使用者開了 LR → 之後 WiFi 換路由器需要重新配網 →
+master 進 AP 模式 → **beacon 用 LR 送出，手機完全掃不到這個 AP** → 配網模式等於不存在。
+
+**本階段必須新增的硬性設計約束（寫進 Task 4，並在 Task 2 的 `applyLongRange()` 就留好介面）**：
+
+> **進入配網模式（SoftAP／`startConfigPortal()` 之類）之前，必須無條件先把 protocol
+> 還原成 `WIFI_PROTOCOL_11B|11G|11N`（不含 LR），且不因為 NVS 裡存的是 LR 而跳過。**
+> 配網結束離開 AP 模式後，再依儲存值重新套用。
+
+這條與「決定 5：現場沒有 App 時的回滾」是同一個目的的兩條路徑，但**不能互相取代**：
+決定 5 是使用者主動要求回滾，這一條是系統為了不失去最後的救援管道而強制執行。
+
+##### 危害 E：LR 位元**存在 NVS，重燒韌體與 erase 都清不掉**
+
+同一位維護者（esp-idf#9933）：
+
+> because **the LR state has been saved in NVS**, when wifi start,
+> the phy and HW register will be updated.
+
+espressif/esp-now#37 的標題就是使用者的慘叫：
+"ESP long range mode persists on flash, erase, and reset!!!"
+
+**後果**：一台被切成 LR 的板子，就算整個重燒 Phase 1 的舊韌體（完全沒有 LR 程式碼），
+它**還是 LR**——因為舊韌體從不呼叫 `esp_wifi_set_protocol()`，NVS 裡的值就繼續生效。
+現場「重燒回舊版救援」這條所有人都會直覺去用的路，**是無效的**。
+
+**本階段必須新增的硬性設計約束**：
+
+> **開機路徑必須無條件呼叫一次 `esp_wifi_set_protocol()`，把 protocol 明確設成
+> 目前應有的值——而不是「NVS 說要 LR 才呼叫、否則不呼叫」。**
+> 「不呼叫」不等於「沒有 LR」，它等於「沿用上一次殘留的狀態」。
+
+這條同時是 Task 2 `applyLongRange()` 的正確性條件：它的 else 分支**不可以是空的**，
+必須實際送出不含 LR 的 bitmap。
+
+##### 追加：**沒有 `soc_caps.h` 巨集可以判斷 LR 支援**
+
+研究代理實際 grep 了 v5.5 的 `components/soc/{esp32,esp32c3,esp32s3,esp32c6,esp32c2}/include/soc/soc_caps.h`：
+**任何晶片都沒有** `SOC_WIFI_LR_SUPPORT` 這類巨集。
+所以 **不得寫 `#ifdef SOC_WIFI_LR_SUPPORT`**（會永遠不成立，等於整段 LR 程式碼被靜默編譯掉，
+而且編譯會通過——這是最惡劣的失敗型態）。要條件編譯只能沿用既有的
+`CONFIG_IDF_TARGET_ESP32C3` / `_ESP32`。
+
+##### 追加：`esp_now_set_peer_rate_config()` 的呼叫順序是硬性的
+
+- 標頭（IDF v5.1~v5.5 一致）：`@attention 1. This API should be called after
+  esp_wifi_start() and esp_now_init().`
+- 文件補充：「Make sure that the peer is added before configuring the rate.」
+- bitmap 沒有 LR 位元就設 LR 速率 → `W (719) wifi: invalid rate, need change phy mode to LR`（esp-idf#11595）
+- 在 `esp_now_init()` 之前設速率會 assert 崩潰（esp-idf#11751，已由 commit `554e6880` 修）
+
+**唯一正確順序**：
+`esp_wifi_start()` → `esp_wifi_set_protocol(…|LR)` → `esp_now_init()` → `esp_now_add_peer()` → `esp_now_set_peer_rate_config()`
+
+**踩雷點**：`esp_now_rate_config_t` 的第一個欄位 `phymode`，其列舉 `WIFI_PHY_MODE_LR`
+的值是 **0**。所以 `memset(&rc, 0, sizeof(rc))` 想「取預設值」**會靜默選到 LR**。
+
+Arduino core 3.3.7 對應 IDF v5.5.x，該版把 `esp_now_rate_config_t` 改成
+`wifi_tx_rate_config_t` 的 typedef 別名，**欄位逐一相同**，不影響寫法。
+
+##### 追加：官方實測的距離數字（給 Task 6 的實測程序當對照基準）
+
+Espressif 開發者入口自己做的 ESP-NOW 戶外實測（**ESP32-C6-DevKitM-1，板載 PCB 天線**）：
+
+| 條件 | 一般 ESP-NOW | ESP-NOW + LR |
+|---|---|---|
+| 空曠、接近 100% 成功 | 約 150 m | **約 450 m** |
+| 空曠、劣化區 | 300 m 時 60% | 900 m 時 40% |
+| 樹林 | 125 m 已低於 50% | 約 400 m 才掉到 50%，可用約 600 m |
+
+**規劃用的現實數字是「約 2~3 倍」，不是官方行銷的「1 公里」。**
+Task 6 的實測程序若把 1 公里寫成期望值，會讓實測者把正常結果判成失敗。
+另有多筆現場回報（esp-now#144 的 C6、esp32.com 的 S3）**完全量不到增益**，
+所以 Task 1 的探針量出「沒有增益」時，**那是已知可能結果，不是探針寫錯**。
+
 ### 容量與資源
 
 - **Flash 紅線**：WROOM 任一 Task 結束時若超過 **1,930,035 bytes（對 app0 的 95%）**，
