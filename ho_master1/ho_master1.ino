@@ -121,6 +121,14 @@ volatile bool pendingSubscribeRefresh = false;
 // socket 理論上可以把單次 write 拖得更久。10 秒是典型上界，不是保證。
 // 若同一輪 loop() 疊了兩、三次阻塞 publish（例如 publishStatus() 接
 // slaveStatusScheduler() 接 processPendingUnpairPublish()），心跳空窗會累加成
+//
+// **Task 4 review（M1）擴大語義**：這個名額不再只管 publish，而是管「本輪
+// loop() 的**阻塞式 socket 寫入**」，涵蓋 mqttClient.publish()／subscribe()／
+// unsubscribe() 三者 —— 它們走的都是同一條 NetworkClient::write()，都是同一個
+// 10 秒級黑箱。旗標名稱維持 Task 3 取的 mqttPublishBudgetUsed，避免跨文件
+// （progress.md、歷次 review）的指涉斷裂。取用點：publishJsonDoc()、
+// controlSubscribeScheduler()、unsubscribeSlaveControlTopic()。
+//
 // 20~30 秒，直接撞上 slave 的 30 秒失聯門檻。這個旗標由 loop() 每輪開頭重置，
 // publishJsonDoc() 真正要送出封包前會佔用它；本輪已經用掉的話，其餘想發布的
 // 呼叫方（見 slaveStatusScheduler()／processPendingUnpairPublish() 開頭的檢查）
@@ -1063,6 +1071,31 @@ void sendCmdToSlave(int idx, HoRelayCmd cmd, uint16_t pulseMs) {
   espNowSendTo(slaves[idx].mac, HO_PKT_CMD, &payload, sizeof(payload));
 }
 
+// 用 MAC 直接送，不經過名冊索引（Task 4 review M2 修正）。
+// 給「索引隨時可能失效」的呼叫路徑用 —— 目前是 MQTT 代理指令：
+// topic 解析出 MAC 之後，中間可能隔著阻塞的 publish，而 WiFi task 的
+// HO_PKT_UNPAIR 會前移 slaves[]，任何先前取得的索引都可能改指到別台。
+// 對捕捉籠而言那不是「更新到舊資料」，是**開錯門**。
+//
+// 這個寫法是無鎖且真正安全的：findSlave() 只用來確認「這個 MAC 目前確實在
+// 名冊上」（純值比較），實際送出時用的是呼叫方自己那份 MAC 副本，不是
+// slaves[idx].mac。即使檢查與送出之間陣列剛好搬移，送出的目標仍然是被驗證
+// 過的那一台；最壞情況只是對一台剛剛解除配對的設備多送一則指令，而它的
+// peer 已被 esp_now_del_peer() 移除，esp_now_send() 會直接失敗，無副作用。
+void sendCmdToSlaveMac(const uint8_t mac[6], HoRelayCmd cmd, uint16_t pulseMs) {
+  char id[20];
+  hoFormatDeviceId(mac, id);
+  if (findSlave(mac) < 0) {
+    Serial.printf("[控制] %s 已不在名冊上，放棄送出指令 %u\n", id, (uint8_t)cmd);
+    return;
+  }
+  HoCmdPayload payload;
+  payload.cmd = (uint8_t)cmd;
+  payload.pulseMs = pulseMs;
+  Serial.printf("[控制] 送指令 %u 給 %s\n", (uint8_t)cmd, id);
+  espNowSendTo(mac, HO_PKT_CMD, &payload, sizeof(payload));
+}
+
 void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
   Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, slaveCount);
   for (int i = 0; i < slaveCount; i++) {
@@ -1175,6 +1208,9 @@ void unpairSlave(int idx) {
   }
   for (int i = freshIdx; i < slaveCount - 1; i++) slaves[i] = slaves[i + 1];
   slaveCount--;
+  // review 修正（M3）：與 onEspNowRecv() 的 HO_PKT_UNPAIR 分支同一個理由 ——
+  // 陣列前移會讓正在推進的訂閱對齊游標漏掉某一台，插旗讓 loop() 重跑一次。
+  pendingSubscribeRefresh = true;
   saveSlaves();
   Serial.printf("[配對] 已移除 %s，剩 %d 台\n", id, slaveCount);
 }
@@ -1402,6 +1438,12 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
       // 會是錯誤或已不存在的 MAC。
       memcpy(pendingOfflineMac, info->src_addr, 6);
       hasPendingOfflinePublish = true;
+      // review 修正（M3）：陣列前移會讓「正在跑的訂閱對齊」漏掉某一台
+      //（被移到已經走過的游標位置）。這裡順手插旗，讓 loop() 對齊完後
+      // 再全量重跑一次。因為對齊已改成每輪一格的游標式（見
+      // controlSubscribeScheduler()），重跑的成本只是多幾輪 loop()，
+      // 不再是 21 次背靠背的阻塞寫入。
+      pendingSubscribeRefresh = true;
       for (int i = idx; i < slaveCount - 1; i++) slaves[i] = slaves[i + 1];
       slaveCount--;
       esp_now_del_peer(info->src_addr);
@@ -1777,9 +1819,27 @@ bool parseControlTopic(const char* topic, uint8_t outMac[6]) {
 // hoban/+/control 會收到全世界所有 hoban 設備的控制訊息 —— 我們雖然會過濾掉，
 // 但流量與被動接收他人指令的風險完全不必要。
 //
-// subscribe()／unsubscribe() 與 publish() 走同一條 NetworkClient::write()，
-// 卡住時同樣會吃到秒級的阻塞（見 publishJsonDoc() 上方的完整說明），所以
-// 這裡也把呼叫前後夾住 maintainEspNow()，理由與 publishJsonDoc() 相同。
+// ── review 修正（M1）：訂閱同樣受「每輪 loop() 只做一次阻塞 socket 寫入」管轄 ──
+// 第一版把 21 條 topic 在單次呼叫裡一口氣訂完。subscribe() 與 publish() 走的是
+// 同一條 NetworkClient::write()，卡住時是同一個 10 秒級黑箱，21 次背靠背 ＝
+// 單輪 loop() 最壞凍結約 210 秒。心跳因為有 maintainEspNow() 括號所以不會斷
+//（籠門不會被誤開），但這 210 秒內 master **收不到也發不出任何 MQTT 指令** ——
+// 本系統的核心需求是「一次要全部關」，關不了就是動物逃脫。
+//
+// 因此 mqttPublishBudgetUsed 的語義自本次起**擴大為「本輪 loop() 的阻塞式
+// socket 寫入名額」**，涵蓋 publish／subscribe／unsubscribe 三者（旗標名稱維持
+// Task 3 取的名字，避免跨文件的指涉斷裂）。訂閱改成游標式，由 loop() 的
+// controlSubscribeScheduler() 每輪推進一格，與代發狀態共用同一個名額。
+// 健康的網路下每輪 loop() 是毫秒級，21 格在數十毫秒內走完，與一口氣訂完
+// 沒有可感知的差別；病態 socket 下則自動退化成「每輪一次」，不再凍結整輪。
+
+// 訂閱對齊游標：-1 ＝ 沒有待辦；0 ＝ 下一格要訂 master 自己；
+// 1..N ＝ 下一格要訂名冊第 (cursor-1) 台。只在 loop() context 讀寫，不需 volatile。
+int subscribeCursor = -1;
+
+// 呼叫前後夾 maintainEspNow()，理由與 publishJsonDoc() 相同：
+// 進入 10 秒級黑箱前剛發過心跳、出來立刻再發一次。
+// 名額由呼叫方（controlSubscribeScheduler()）負責取得，本函式不重複檢查。
 void subscribeSlaveControlTopic(int idx) {
   if (idx < 0 || idx >= slaveCount) return;
   char id[20];
@@ -1795,31 +1855,94 @@ void subscribeSlaveControlTopic(int idx) {
   }
 }
 
+// 取消訂閱是**盡力而為**：本輪的 socket 名額已被 publish 用掉時就放棄，
+// 不硬擠第二次阻塞寫入（review M1 的同一個不變式）。放棄是安全的，因為
+//   (a) handleSlaveCommand() 進來前 mqttCallback() 會用 findSlave() 擋掉
+//       已不在名冊上的目標，殘留訂閱收到的訊息不會造成任何動作；
+//   (b) 下次重連時 mqttClient.connect(...) 的 cleanSession 傳 true，
+//       broker 不保留舊 session 的訂閱清單，殘留自然消失。
+// 仍在序列埠留一行，讓現場除錯看得出「這次沒退成」。
 void unsubscribeSlaveControlTopic(const uint8_t mac[6]) {
   if (!mqttClient.connected()) return;
   char id[20];
   hoFormatDeviceId(mac, id);
   String t = String("hoban/") + id + "/control";
+
+  if (mqttPublishBudgetUsed) {
+    Serial.printf("[代理] 本輪 socket 名額已用掉，略過取消訂閱 %s\n", t.c_str());
+    return;
+  }
+  mqttPublishBudgetUsed = true;
+
   maintainEspNow();
   mqttClient.unsubscribe(t.c_str());
   maintainEspNow();
   Serial.printf("[代理] 已取消訂閱 %s\n", t.c_str());
 }
 
-// 剛連上 broker 時把 master 自己與名冊上每一台的 control topic 一次訂完。
-// 20 台等於 21 次 subscribe，每次只是一小段 TCP 寫入；為保險起見迴圈內
-// 仍呼叫 maintainEspNow()，讓 socket 萬一變慢時心跳照常發出。
+// 請求「把 master 自己與名冊上每一台的 control topic 重新對齊一次」。
+// **本函式不會當場送出任何 subscribe**，只是把游標歸零排隊，實際動作由
+// loop() 的 controlSubscribeScheduler() 每輪做一格（理由見上方 M1 的說明）。
+// 重複訂閱同一個 topic 對 broker 是冪等的，所以「全量重訂」是安全的對齊方式，
+// 不必記錄是哪一台變動。
 void subscribeAllControlTopics() {
-  String own = String("hoban/") + getDeviceId() + "/control";
-  maintainEspNow();
-  mqttClient.subscribe(own.c_str());
-  maintainEspNow();
-  Serial.printf("[MQTT] 已訂閱 %s\n", own.c_str());
+  subscribeCursor = 0;
+}
 
-  for (int i = 0; i < slaveCount; i++) {
-    subscribeSlaveControlTopic(i);
-    maintainEspNow();
+// 訂閱對齊排程器：每輪 loop() 最多做一次 subscribe，佔用與 publish 相同的名額。
+//
+// 關於「在 mqttClient.loop() 的 callback 裡呼叫 subscribe() 是否會踩壞
+// PubSubClient 的收包 buffer」（Task 4 review 已查證，結論是**不會**，
+// 記在這裡免得未來又有人重新擔心一次）：
+//   - FIND_BEST_SERVER 這條路徑會在 mqttCallback() 內一路走到 quickConnect*()，
+//     而 topic／payload 指標是直接指進 PubSubClient 的 this->buffer 的。
+//   - 但 PubSubClient::subscribe(topic) 預設 QoS 0（PubSubClient.cpp:605-607），
+//     所以 PubSubClient::loop() 裡的 PUBACK 分支（:402-413）根本走不到；
+//   - 就算走到，msgId 是在 :403、**呼叫 callback 之前**就存進區域變數的，
+//     callback 返回後那段是**寫入** buffer[0..3] 組 PUBACK，不是讀取，
+//     不依賴 callback 期間 buffer 的內容。
+//   - 另外 mqttCallback() 本身在做任何呼叫之前就已把 payload 複製進 message、
+//     也已解析完 topic，之後不再碰那兩個指標。
+void controlSubscribeScheduler() {
+  if (subscribeCursor < 0) return;
+  if (!mqttClient.connected()) {
+    // 斷線就放棄整輪對齊：重連是 cleanSession，會由 quickConnect*() 重新排隊。
+    subscribeCursor = -1;
+    return;
   }
+  if (mqttPublishBudgetUsed) return;   // 讓位給下一輪
+
+  // 與 slaveStatusScheduler()／pollNextSlave() 同一個 M1 快照模式：slaveCount 是
+  // volatile，函式執行中途可能被 WiFi task 減少，全程只用這份快照。
+  int n = slaveCount;
+
+  if (subscribeCursor == 0) {
+    String own = String("hoban/") + getDeviceId() + "/control";
+    mqttPublishBudgetUsed = true;
+    maintainEspNow();
+    bool res = mqttClient.subscribe(own.c_str());
+    maintainEspNow();
+    // review 修正（M4）：以前這裡丟掉回傳值、無條件印「已訂閱」。而這一行正是
+    // 回歸清單第 5／9a／11 項的通過判準 —— 訂閱失敗時實測者會把破口判成 PASS。
+    // 失敗一律印 ⚠ 並且**不印**「已訂閱」。
+    if (res) {
+      Serial.printf("[MQTT] 已訂閱 %s\n", own.c_str());
+    } else {
+      Serial.printf("⚠ [MQTT] 訂閱失敗 %s（master 自己的 control topic，"
+                    "此時 App 的指令收不到）\n", own.c_str());
+    }
+    subscribeCursor = 1;
+    return;
+  }
+
+  int idx = subscribeCursor - 1;
+  if (idx >= n) {
+    subscribeCursor = -1;   // 全部走完
+    return;
+  }
+  mqttPublishBudgetUsed = true;
+  subscribeSlaveControlTopic(idx);
+  subscribeCursor++;
 }
 
 // ── MQTT 連線 ──
@@ -2397,20 +2520,36 @@ void printStatusJsonSize() {
 // ON 分支也是 pulseRelay(2000)。slave 要在 App 眼裡是一台普通設備，
 // 語義就必須完全一致，否則「開保險 → 關門 → 關保險」三段鎖流程對 slave
 // 的行為會與其他設備不同。持續開啟只保留給序列埠的 on <n> 指令（現場除錯用）。
-void handleSlaveCommand(int idx, const String& message) {
+//
+// ── review 修正（M2，門控安全）：參數收 MAC，不收索引 ──
+// 第一版沿用 mqttCallback() 查出來的 idx。但 slaves[] 會被 WiFi task 的
+// HO_PKT_UNPAIR 分支前移（onEspNowRecv()），索引在任何一個可能被打斷的點上
+// 都會失效 —— 而本函式的 status 分支中間夾著 publishSlaveStatus()，那是一次
+// 最壞 10 秒級的阻塞 publish，窗口大到不能忽略。索引指錯台 ＝ **開錯門**，
+// 對動物捕捉設備而言是最嚴重的失敗型態。
+// 這正是 Task 3 review 的 M4 缺陷（unpairSlave() 阻塞後沿用舊 idx），
+// 第一版在新路徑上原封不動地重新引入了一次。
+//
+// 修法與 M4 相同：全程持有 MAC，每一個真正要動作的點都用 findSlave() 重查，
+// 送指令則走 sendCmdToSlaveMac()（連重查與送出之間的窗口都不存在）。
+void handleSlaveCommand(const uint8_t mac[6], const String& message) {
   char id[20];
-  hoFormatDeviceId(slaves[idx].mac, id);
+  hoFormatDeviceId(mac, id);
   Serial.printf("[代理] %s 收到指令: %s\n", id, message.c_str());
 
   if (message == "ON") {
-    sendCmdToSlave(idx, HO_CMD_PULSE, 2000);
+    sendCmdToSlaveMac(mac, HO_CMD_PULSE, 2000);
   } else if (message == "OFF") {
-    sendCmdToSlave(idx, HO_CMD_OFF, 0);
+    sendCmdToSlaveMac(mac, HO_CMD_OFF, 0);
   } else if (message == "status") {
     // 先用目前已知的狀態立刻回一則，App 不必空等；
     // 同時向 slave 要一次最新狀態，回來時 dirty 會觸發第二則代發。
-    publishSlaveStatus(idx);
-    requestSlaveState(idx);
+    // 兩次動作各自重查索引：中間的 publishSlaveStatus() 可能阻塞 10 秒級，
+    // 沿用同一個 idx 會讓 requestSlaveState() 問到別台去。
+    int idx = findSlave(mac);
+    if (idx >= 0) publishSlaveStatus(idx);
+    idx = findSlave(mac);
+    if (idx >= 0) requestSlaveState(idx);
   } else {
     Serial.printf("[代理] %s 不支援的指令: %s\n", id, message.c_str());
   }
@@ -2484,13 +2623,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  int idx = findSlave(mac);
-  if (idx < 0) {
+  if (findSlave(mac) < 0) {
     // 解除配對後 broker 上可能還有殘留訊息，或訂閱尚未完全取消
     Serial.printf("[MQTT] 指令的目標不在名冊上，忽略: %s\n", topic);
     return;
   }
-  handleSlaveCommand(idx, message);
+  // 這裡刻意只傳 MAC 不傳剛查到的索引：索引在下一個瞬間就可能因為 WiFi task
+  // 的 HO_PKT_UNPAIR 前移 slaves[] 而指到別台（review M2）。上面的 findSlave()
+  // 只是「不在名冊上就別吵」的早期過濾，不是給 handleSlaveCommand() 用的。
+  handleSlaveCommand(mac, message);
 }
 
 // ── ESP-NOW 初始化 ──
@@ -2718,11 +2859,18 @@ void loop() {
       mqttClient.loop();
       maintainEspNow();
 
-      // 名冊在 ESP-NOW callback 裡變動過（配對成功），回到 loop() context 才動 socket
+      // 名冊在 ESP-NOW callback 裡變動過（配對成功／slave 主動解除），
+      // 回到 loop() context 才動 socket。這裡只是把游標歸零排隊，
+      // 真正的 subscribe 由下面的排程器每輪做一格。
       if (pendingSubscribeRefresh && mqttClient.connected()) {
         pendingSubscribeRefresh = false;
         subscribeAllControlTopics();
       }
+
+      // 訂閱對齊：每輪最多一次 subscribe，與 publish 共用同一個名額（review M1）。
+      // 排在 publishStatus() 之前：對齊是有限步數的一次性工作（最多 slaveCount+1 格），
+      // 讓它先走完，代價只是狀態發布晚幾輪（健康網路下是毫秒級）。
+      controlSubscribeScheduler();
 
       if (now - lastStatusPub > 10000) {   // 每 10 秒發一次狀態，master 還要發心跳與輪詢 slave，比 ho_relay2 的 3 秒寬鬆
         lastStatusPub = now;

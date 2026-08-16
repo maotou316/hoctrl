@@ -293,20 +293,34 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 - 連續 10 次關聯失敗後的那一次全頻掃描，期間心跳命中率降到約 1/13
   （已用 200ms 加密心跳把 30 秒內全數落空的機率壓到 6×10⁻⁶ 量級）
 - MQTT 阻塞的 18 秒是估算值上界，若某個 broker 的 DNS 行為更慢仍有超出的可能
-- MQTT 已連線但 socket 寫入卡住的 10 秒是估算值，**而且不是硬上限**
-  （Task 3 review N1 更正）：`NetworkClient::write()` 的迴圈在
-  「`send()` 回傳 > 0 但還沒寫完」的分支裡會執行
-  `retry = WIFI_CLIENT_MAX_WRITE_RETRY;` 把重試計數器**重置回 10**，
-  所以每輪只擠得出幾個 byte 的病態 socket 理論上可以把單次 `write()`
-  拖得比 10 秒更久。10 秒是典型值（完全寫不進去、10 次 `select()` 全部逾時），
-  不是保證。另外重試次數與 `select()` 逾時皆為函式庫寫死的常數，函式庫版本
-  更新導致這兩個數字改變時需要重新推算
-- **單輪 `loop()` 的最壞心跳空窗約 11 秒**（10 秒級的黑箱 ＋ 最多 1 秒的心跳
-  間隔餘裕）。Task 3 的報告與 commit message 寫「約 20 秒」是**過度悲觀且錯誤**
-  的推演——它把 `PINGREQ` 黑箱與 `publish()` 黑箱視為連續的一段空窗，但兩者
-  之間必定隔著一次 `maintainEspNow()`，所以是兩段各約 10 秒的獨立視窗，不是
-  疊加。Task 4 進一步把 `mqttClient.loop()` 前後也明確夾上 `maintainEspNow()`，
-  讓這個切分從「呼叫順序的巧合」變成結構性保證（**不會讓 11 秒變小**）
+- **socket 寫入卡住的 10 秒不是硬上限，病態情況下可以超過 30 秒門檻，
+  而且目前沒有任何防護。** 這是本韌體已知的**最嚴重殘存風險**，
+  請不要被下一段的「約 11 秒」誤導 —— 那個數字的前提正是「單段黑箱 ≤ 10 秒」，
+  前提不成立時結論就不成立。
+  - **機制**（Task 3 review N1）：`NetworkClient::write()` 的迴圈在
+    「`send()` 回傳 > 0 但還沒寫完」的分支裡會執行
+    `retry = WIFI_CLIENT_MAX_WRITE_RETRY;`，把重試計數器**重置回 10**。
+    「10 次重試 × 1 秒 `select()` ＝ 10 秒」只涵蓋「**完全**寫不進去」的情況；
+    每輪只擠得出幾個 byte 的病態 socket（例如對端 TCP 視窗趨近於零、
+    WAN 極度壅塞）可以無限期地反覆重置計數器。
+  - **後果**：單段心跳空窗超過 slave 的 30 秒失聯門檻 ＝ slave 強制關閉繼電器
+    ＝ **籠門被打開**。`maintainEspNow()` 的前後括號在這種情況下幫不上忙，
+    因為函式庫內部的 `write()` **不可中斷**，我們根本拿不回控制權。
+  - **目前的處置**：無。要封死只能 fork `PubSubClient`（在它的 `write()`
+    內部插心跳）或換成非阻塞的 MQTT 客戶端，兩者都超出 Phase 2b 範圍。
+    現行的三／四層防護（見「代發 slave 狀態」）只能保證
+    **「每輪 loop() 最多發生一次這種黑箱」**，不能保證**單次黑箱有多長**。
+  - 另外重試次數與 `select()` 逾時皆為函式庫寫死的常數，函式庫版本更新導致
+    這兩個數字改變時需要重新推算
+- **在「單段黑箱 ≤ 10 秒」成立的前提下**，單輪 `loop()` 的最壞心跳空窗約
+  **11 秒**（10 秒黑箱 ＋ 最多 1 秒的心跳間隔餘裕——`maintainEspNow()` 只有在
+  距上次心跳滿 `HEARTBEAT_INTERVAL` 時才真的送）。Task 3 的報告與 commit
+  message 寫「約 20 秒」是**過度悲觀且錯誤**的推演——它把 `PINGREQ` 黑箱與
+  `publish()` 黑箱視為連續的一段空窗，但兩者之間必定隔著一次
+  `maintainEspNow()`，所以是兩段各約 10 秒的獨立視窗，不是疊加。
+  Task 4 進一步把 `mqttClient.loop()` 前後也明確夾上 `maintainEspNow()`，
+  讓這個切分從「呼叫順序的巧合」變成結構性保證（**不會讓 11 秒變小**）。
+  **再次強調：11 秒是有前提的推演值，不是保證；前提本身見上一條。**
 
 ## MQTT
 
@@ -431,7 +445,13 @@ master 自己 + 20 台 slave = 21 個 topic，若背靠背發布，21 個連發�
    真正呼叫 `mqttClient.publish()` 前會佔用這個旗標；本輪已用掉的話，
    `publishStatus()`／`slaveStatusScheduler()`／`processPendingUnpairPublish()`
    之中排在後面的呼叫方一律讓位給下一輪，**保證每輪 loop() 最多只發生一次
-   會阻塞的 publish**，把原本可能疊加成 20~30 秒的空窗壓回單次約 10 秒。
+   會阻塞的 socket 寫入**，把原本可能疊加成 20~30 秒的空窗壓回單次約 10 秒。
+   **Task 4 review（M1）把這個名額的涵蓋範圍從 `publish()` 擴大到
+   `subscribe()`／`unsubscribe()`**（三者走同一條 `NetworkClient::write()`），
+   取用點是 `publishJsonDoc()`、`controlSubscribeScheduler()`、
+   `unsubscribeSlaveControlTopic()`。
+   **注意這只保證「一輪最多一次」，不保證「單次有多長」** ——
+   單次的長度沒有硬上限，見上方「ESP-NOW 心跳的實際保證」下的殘存風險。
 3. **`publishJsonDoc()` 內部在阻塞呼叫前後各補一次 `maintainEspNow()`**，
    成本近乎零，確保進入 10 秒黑箱前剛發過心跳、出來立刻再發一次。
 4. **（Task 4 新增）`loop()` 也把 `mqttClient.loop()` 前後夾上 `maintainEspNow()`**，
@@ -494,28 +514,71 @@ Phase 2a 的 `mqttCallback()` 是把 topic 與自己的 control topic 做完整�
 `mqttClient.loop()` 是明確的競態。而配對成功（`addSlave()`）發生在
 `onEspNowRecv()` 裡，屬 WiFi task —— 理由與代發狀態不能在 callback 裡直接發
 完全相同。所以 `addSlave()` 只設 `pendingSubscribeRefresh = true;`，
-`loop()` 看到旗標才呼叫 `subscribeAllControlTopics()` 全量重訂
+`loop()` 看到旗標才排隊一次全量對齊
 （重複訂閱同一個 topic 對 broker 是冪等的，所以不必記錄是哪一台）。
+
+**訂閱一次只做一格，與 publish 共用同一個名額（review M1 修正）。**
+`subscribe()` 與 `publish()` 走的是**同一條** `NetworkClient::write()`，
+是同一個 10 秒級黑箱。第一版把 21 條 topic 在單次呼叫裡一口氣訂完 ——
+病態 socket 下單輪 `loop()` 最壞凍結約 **210 秒**。心跳因為有
+`maintainEspNow()` 括號所以不會斷（籠門不會被誤開），但這 210 秒內 master
+**收不到也發不出任何 MQTT 指令**，而本系統的核心需求是「一次要全部關」，
+關不了就是動物逃脫。
+
+因此：
+
+- `mqttPublishBudgetUsed` 的語義**擴大為「本輪 `loop()` 的阻塞式 socket 寫入
+  名額」**，涵蓋 `publish()`／`subscribe()`／`unsubscribe()` 三者
+  （旗標名稱維持 Task 3 取的名字，避免跨文件的指涉斷裂）。
+- `subscribeAllControlTopics()` **不再當場送出任何 `subscribe()`**，
+  只是把 `subscribeCursor` 歸零排隊。
+- `loop()` 的 `controlSubscribeScheduler()` 每輪推進一格
+  （`0` ＝ master 自己，`1..N` ＝ 名冊第 `cursor-1` 台），佔用名額後才寫 socket。
+  健康網路下每輪 `loop()` 是毫秒級，21 格在數十毫秒內走完，與一口氣訂完
+  沒有可感知差別；病態 socket 下自動退化成「每輪一次」，不再凍結整輪。
+- `controlSubscribeScheduler()` 排在 `publishStatus()` **之前**：對齊是有限步數
+  （最多 `slaveCount + 1` 格）的一次性工作，讓它先走完，代價只是狀態發布晚幾輪。
 
 **訂閱的維護點**：
 
 | 時機 | 動作 |
 |---|---|
-| 剛連上 broker（`quickConnectToIndex()`／`quickConnectCustom()`） | `subscribeAllControlTopics()` 一次訂完 master 自己 ＋ 名冊上每一台；接著 `publishStatus()` 與 `markAllSlavesDirty()`（新 broker 上沒有任何 retain，整份名冊要重壓一次） |
-| 配對成功（`addSlave()`，WiFi task） | 只設 `pendingSubscribeRefresh`，由 `loop()` 重跑 `subscribeAllControlTopics()` |
-| 序列埠 `unpair <n>`（`unpairSlave()`） | `publishSlaveOffline()` 之後、陣列搬移之前 `unsubscribeSlaveControlTopic()` |
-| slave 主動解除（`processPendingUnpairPublish()`） | 補發最後一則 offline 之後 `unsubscribeSlaveControlTopic()` |
+| 剛連上 broker（`quickConnectToIndex()`／`quickConnectCustom()`） | `subscribeAllControlTopics()` 排隊全量對齊；接著 `publishStatus()` 與 `markAllSlavesDirty()`（新 broker 上沒有任何 retain，整份名冊要重壓一次） |
+| 配對成功（`addSlave()`，WiFi task） | 只設 `pendingSubscribeRefresh`，由 `loop()` 排隊全量對齊 |
+| slave 主動解除（`onEspNowRecv()` 的 `HO_PKT_UNPAIR`，WiFi task） | 設 `pendingSubscribeRefresh`。**必要**：陣列前移會把某台移到游標已經走過的位置而漏訂（review M3） |
+| 序列埠 `unpair <n>`（`unpairSlave()`） | `publishSlaveOffline()` 之後、陣列搬移之前 `unsubscribeSlaveControlTopic()`；搬移後同樣設 `pendingSubscribeRefresh`（理由同上） |
+| slave 主動解除的收尾（`processPendingUnpairPublish()`） | 補發最後一則 offline 之後 `unsubscribeSlaveControlTopic()` |
 
-`subscribeAllControlTopics()` 最多做 21 次 `subscribe()`，每次都是一小段 TCP
-寫入，但走的仍是會卡住的 `NetworkClient::write()`，所以迴圈內與每次
-`subscribe()`／`unsubscribe()` 前後都補 `maintainEspNow()`，理由與
-`publishJsonDoc()` 相同。
+**取消訂閱是盡力而為。** `unsubscribeSlaveControlTopic()` 在
+「MQTT 未連線」或「本輪 socket 名額已被 publish 用掉」時直接放棄
+（序列埠會印一行）。放棄是安全的：
 
-**已知限制**：`unsubscribeSlaveControlTopic()` 在 MQTT 未連線時直接跳過
-（沒有連線就沒有訂閱可退，也退不了）。若解除配對正好發生在斷線期間，
-重連後的 `subscribeAllControlTopics()` 只會訂閱名冊上還在的台數，
-不會殘留舊訂閱 —— 本韌體呼叫 `mqttClient.connect(...)` 時最後一個參數
-`cleanSession` 傳 `true`，broker 不保留上一個 session 的訂閱清單。
+1. `mqttCallback()` 會用 `findSlave()` 擋掉已不在名冊上的目標，
+   殘留訂閱收到的訊息不會造成任何動作；
+2. 下次重連時 `mqttClient.connect(...)` 的最後一個參數 `cleanSession` 傳 `true`，
+   broker 不保留上一個 session 的訂閱清單，殘留自然消失。
+
+**指令轉發全程用 MAC，不用索引（review M2 修正）。**
+`handleSlaveCommand()` 收的是 `const uint8_t mac[6]` 而不是索引：
+`slaves[]` 會被 WiFi task 的 `HO_PKT_UNPAIR` 分支前移，任何先前取得的索引
+在任何一個可能被打斷的點上都會失效 —— 而 `status` 分支中間夾著
+`publishSlaveStatus()`，那是一次最壞 10 秒級的阻塞 publish，窗口大到不能忽略。
+**索引指錯台 ＝ 開錯門**，對動物捕捉設備是最嚴重的失敗型態。
+送指令走 `sendCmdToSlaveMac()`：`findSlave()` 只用來確認「這個 MAC 目前確實在
+名冊上」（純值比較），實際 `espNowSendTo()` 用的是呼叫方自己那份 MAC 副本，
+所以連「檢查與送出之間」的窗口都不存在。
+
+> 這正是 Task 3 review 抓到的 M4 缺陷（`unpairSlave()` 阻塞後沿用舊 `idx`）。
+> 同一類缺陷在新路徑上被重新引入過一次，改動 `slaves[]` 相關程式碼時請
+> 一律假設「索引在下一個瞬間就會失效」。
+
+**訂閱失敗一定要看得見（review M4 修正）。**
+`[MQTT] 已訂閱 …` 這一行是回歸清單第 5／9a／11 項的**通過判準**，
+所以它只在 `mqttClient.subscribe()` 回傳 `true` 時才印；失敗改印
+`⚠ [MQTT] 訂閱失敗 …`（slave 的對應行是 `⚠ [代理] 訂閱失敗 …`）。
+第一版丟掉回傳值、無條件印「已訂閱」，等於在訂閱失敗時給實測者一個假綠燈。
+訂閱失敗不重試（游標照樣前進），避免「topic 過長」這類必定失敗的原因
+把排程器卡死；下次重連或下次名冊變動時會重新對齊。
 
 ## 與 ho_relay2 的差異
 
@@ -535,8 +598,8 @@ Phase 2a 的 `mqttCallback()` 是把 topic 與自己的 control topic 做完整�
 
 ### 1. WROOM flash 用量偏緊（83.3%）
 
-Phase 2b Task 4 後實測 1,691,923 / 2,031,616 bytes（app0 分區，**83.28%**），
-餘裕約 331KB。**注意 `arduino-cli` 印的百分比（10%）分母是 16MB 的預設值，
+Phase 2b Task 4（含 review 修正）後實測 1,692,467 / 2,031,616 bytes
+（app0 分區，**83.30%**），餘裕約 331KB。**注意 `arduino-cli` 印的百分比（10%）分母是 16MB 的預設值，
 不是本 sketch 實際使用的 `partitions.csv` 的 app0（2,031,616 bytes），
 要自己換算。**
 Phase 4 要加轉送 OTA 的程式碼前，務必先跑 `.\flash.ps1 -Model master` 確認還編得過；
