@@ -49,6 +49,7 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 | `allon` / `alloff` / `allpulse` | 群組控制，含 master 自己的繼電器 |
 | `state <n>` | 要求第 n 台回報狀態 |
 | `unpair <n>` | 解除第 n 台配對 |
+| `unpairall` | 清空整份名冊（分批執行，每輪 `loop()` 拆一台，心跳不中斷） |
 | `ch <n>` | 測試用：切換 channel，驗證 slave 重掃 |
 | `help` | 顯示說明 |
 
@@ -345,16 +346,87 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 | `reset` | 清除 NVS 網路設定並重啟，回到 BLE 配網模式 |
 | `FIND_BEST_SERVER` | 主動斷開目前 MQTT 連線，把輪詢游標歸零（`resetMqttProbe()`）後重新走 `smartConnect()`。注意：`smartConnect()` 一次只試一台，第一台連不上時會由 `loop()` 每 10 秒推進一台，不會在單次呼叫裡試完全部 |
 | `HASRELAY:ON` / `HASRELAY:OFF` | 設定「本機是否有接繼電器」並存 NVS，回報狀態 |
+| `ALL:ON` | `sendCmdToAll(HO_CMD_PULSE, 2000)` —— **廣播點動 2 秒，不是持續 ON**，語義與單台 `ON` 一致；含 master 自己的繼電器 |
+| `ALL:OFF` | `sendCmdToAll(HO_CMD_OFF, 0)` —— 廣播關閉，含 master 自己的繼電器。本系統最關鍵的一條指令 |
+| `SLAVES` | `markAllSlavesDirty()` ＋ 一次 `publishStatus()`。名冊會在接下來一輪內逐台重壓保留訊息，不在這裡連發 20 則 |
+| `PAIR:START` | `enterPairingMode()`，開一個 60 秒配對視窗（`PAIRING_TIMEOUT`，與 App 的 60 秒倒數對齊）。**期間可連續配對多台，配對成功不會自動退出** |
+| `PAIR:STOP` | `exitPairingMode()` |
+| `UNPAIR:<deviceId>` | 解除指定 slave（`hoban-xxxxxxxxxxxx`）。ID 格式錯誤或不在名冊上都只印一行，不動作 |
+| `UNPAIRALL` | 清空整份名冊。**只插旗，實際拆除由 `loop()` 的 `processUnpairAll()` 每輪拆一台**（理由見下方「UNPAIRALL 為什麼必須分批」） |
+| `LR:*` | 尚未實作（Phase 2b Task 6），印一行明確回應而不是掉進「未知指令」 |
 
-目前**尚未支援** `ALL:*` 群組指令、`PAIR:*` / `UNPAIR:*` 針對 slave 的指令、
-`update:{JSON}` OTA 指令 —— 這些是 Phase 2b Task 5／Phase 4 才加。
+目前**尚未支援** `update:{JSON}` OTA 指令 —— 那是 Phase 4 才加。
+
+### 群組指令：廣播 → 事後逐台查狀態 → 對未確認者補送單播
+
+本系統是**多開門的捕捉系統，核心需求是「一次要全部關」**，關門失敗＝動物逃脫或
+未被捕捉；**「全部關」的可靠性優先於「全部開」**。
+
+`sendCmdToAll()` 因此**不是**逐台單播。逐台單播每台間隔 20ms，20 台就是最後一台
+比第一台晚 **400ms** 收到 —— 那不叫「同時」。改用 **ESP-NOW 廣播**
+（`FF:FF:FF:FF:FF:FF`，連送 3 次、間隔 20ms）。
+
+廣播零新基礎設施也不會誤觸發別人的設備：
+
+- 廣播 peer 在 `setupEspNow()` 就註冊好了，心跳本來就走廣播。
+- slave 的 `if (!masterKnown || memcmp(masterMac, info->src_addr, 6) != 0) return;`
+  擋在 `HO_PKT_CMD` 分支之前，而 **ESP-NOW 廣播幀的 `src_addr` 仍是發送端的真實
+  MAC**（廣播只換目的位址），這道檢查對廣播與單播一體適用。
+
+**但廣播沒有 ack。** `esp_now_send()` 送到廣播位址時**永遠回報成功**，那不代表任何
+一台真的收到了 ——「廣播完就回報成功」本身就是一條假綠燈。所以後兩段不是優化，
+是正確性的一部分，由 `loop()` 的 `processGroupCmd()` 非阻塞狀態機執行：
+
+| 段 | 動作 |
+|---|---|
+| 1 | 廣播 `HO_PKT_CMD` 三次（真正同時），master 自己的繼電器同步動作 |
+| 2 | 靜置 `GROUP_SETTLE_MS`(600ms) 收 slave 主動回報；仍未確認的**逐台送 `HO_PKT_STATE_REQ`**（每輪 `loop()` 一台，間隔 20ms） |
+| 3 | 仍未確認的**逐台補送單播**（`sendCmdToSlaveMac()`）。2、3 段交替最多 `GROUP_MAX_SWEEPS`(4) 趟 |
+
+**確認條件刻意很嚴（反假綠燈）。** 本專案已抓到四條假綠燈，全部同源：*動作之前就
+存在的狀態被當成動作之後的證據*。所以一律要求「這台在 `sentAt` **之後**有一則新的
+狀態回報」，光看 `slaves[i].relay == 0` 不算數 —— 那可能是廣播前就存在的舊值，而
+這台其實早已收不到任何封包、門根本沒關。
+
+- `HO_CMD_OFF`：新回報且 `relay == 0`
+- `HO_CMD_ON` / `HO_CMD_PULSE`：新回報且 `relay == 1`
+  （slave 收到 `HO_CMD_PULSE` 會先開繼電器再 `sendState()`，這則回報的 `relay` 必為 1）
+
+「新回報」是強證據而不是巧合：**`ho_slave1` 沒有週期性狀態回報**，它只在收到
+`HO_PKT_CMD` 後、收到 `HO_PKT_STATE_REQ` 後、以及點動自動結束時才送 `HO_PKT_STATE`。
+為了不讓例行輪詢問出來的回報混進來當證據，**群組指令進行期間 `pollNextSlave()`
+整個讓開**（見 `loop()`）—— 用「我們自己問出來的回應」證明「指令有被收到」，
+就是同一個假綠燈模式。基於同一理由，**`HO_CMD_PULSE` 不做第 2 段的逐台查狀態**：
+點動是瞬時的，`STATE_REQ` 問回來的 `relay` 值證明不了門有沒有動過，直接補送單播
+（重送只是重觸發 2000ms 計時器，冪等且安全）。
+
+`confirmed[]` 是**只加不減**的：先確認、之後點動自然結束回報 `relay=0`，不會把
+已確認的那台又翻回未確認而造成重複點動。
+
+收尾一定看得見：全部確認印 `[群組] 指令 <N> 已逐台確認：…`；有未確認的印
+`⚠ [群組] 指令 <N> 未能全部確認：…` 並逐台列出 ID，`ALL:OFF` 另外多印一行
+「未確認的籠門可能仍是開的」。兩種結果都會 `markAllSlavesDirty()` 讓 App 收到每台的
+真實狀態 —— 未確認的那幾台維持名冊上最後已知的 `relay` 值（**不會被改寫成 0**），
+所以 App 端不會出現「明明沒關卻顯示已關」。
+
+### UNPAIRALL 為什麼必須分批
+
+一口氣跑完的版本是 `while (slaveCount > 0) unpairSlave(slaveCount - 1);`。
+`unpairSlave()` 內含 `espNowDelay(100)` 與一次 `publishSlaveOffline()`，而單次阻塞
+publish 最壞是 10 秒級黑箱 —— 20 台合計最壞**超過 60 秒沒有心跳**，直接撞破 slave
+的 30 秒失聯門檻，等於為了清名冊而把所有籠門一次打開。
+
+改成 `unpairAllPending` 旗標 ＋ `loop()` 的 `processUnpairAll()` 每輪拆一台：
+`espNowDelay()` 期間心跳照發，publish 又受 `mqttPublishBudgetUsed` 名額管轄
+（每輪最多一次），全程心跳不中斷。從**最後一台往前拆**，`unpairSlave()` 內部的
+陣列前移就不會搬動任何元素。
 
 ### 代理指令表（slave 的 `hoban/<slaveId>/control`，Phase 2b Task 4）
 
 | 指令 | 行為 |
 |---|---|
-| `ON` | `sendCmdToSlave(idx, HO_CMD_PULSE, 2000)` —— **點動 2 秒，不是持續開啟** |
-| `OFF` | `sendCmdToSlave(idx, HO_CMD_OFF, 0)` |
+| `ON` | `sendCmdToSlaveMac(mac, HO_CMD_PULSE, 2000)` —— **點動 2 秒，不是持續開啟** |
+| `OFF` | `sendCmdToSlaveMac(mac, HO_CMD_OFF, 0)` |
 | `status` | 先用名冊上目前已知的狀態立刻代發一則（`publishSlaveStatus()`），同時 `requestSlaveState()` 向 slave 要一次最新狀態，回來時 `dirty` 會觸發第二則代發 |
 | 其他 | 序列埠印 `[代理] <slaveId> 不支援的指令: …`，不做任何動作 |
 
@@ -549,9 +621,13 @@ Phase 2a 的 `mqttCallback()` 是把 topic 與自己的 control topic 做完整�
 | 序列埠 `unpair <n>`（`unpairSlave()`） | `publishSlaveOffline()` 之後、陣列搬移之前 `unsubscribeSlaveControlTopic()`；搬移後同樣設 `pendingSubscribeRefresh`（理由同上） |
 | slave 主動解除的收尾（`processPendingUnpairPublish()`） | 補發最後一則 offline 之後 `unsubscribeSlaveControlTopic()` |
 
-**取消訂閱是盡力而為。** `unsubscribeSlaveControlTopic()` 在
-「MQTT 未連線」或「本輪 socket 名額已被 publish 用掉」時直接放棄
-（序列埠會印一行）。放棄是安全的：
+**取消訂閱目前 100% 不會真的送出（敘述更正）。** `unsubscribeSlaveControlTopic()`
+受「每輪 `loop()` 只做一次阻塞式 socket 寫入」的名額管轄，名額被用掉就放棄
+（序列埠會印一行）。這裡原本寫成「盡力而為」，暗示有時退得成 —— **實際上必定
+退不成**：兩個呼叫端（`unpairSlave()`、`processPendingUnpairPublish()`）在呼叫它
+之前都**一定**先做過一次 offline publish，那次 publish 必然已經佔走本輪名額。
+保留這個函式的意義是：未來若有「不先 publish」的呼叫端加進來，這條路徑立刻生效。
+放棄是安全的：
 
 1. `mqttCallback()` 會用 `findSlave()` 擋掉已不在名冊上的目標，
    殘留訂閱收到的訊息不會造成任何動作；

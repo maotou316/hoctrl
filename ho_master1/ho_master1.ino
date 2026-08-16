@@ -1056,21 +1056,6 @@ void exitPairingMode() {
 }
 
 // ── 控制 slave ──
-void sendCmdToSlave(int idx, HoRelayCmd cmd, uint16_t pulseMs) {
-  if (idx < 0 || idx >= slaveCount) {
-    Serial.println("[控制] 編號超出範圍");
-    return;
-  }
-  HoCmdPayload payload;
-  payload.cmd = (uint8_t)cmd;
-  payload.pulseMs = pulseMs;
-
-  char id[20];
-  hoFormatDeviceId(slaves[idx].mac, id);
-  Serial.printf("[控制] 送指令 %u 給 %s\n", (uint8_t)cmd, id);
-  espNowSendTo(slaves[idx].mac, HO_PKT_CMD, &payload, sizeof(payload));
-}
-
 // 用 MAC 直接送，不經過名冊索引（Task 4 review M2 修正）。
 // 給「索引隨時可能失效」的呼叫路徑用 —— 目前是 MQTT 代理指令：
 // topic 解析出 MAC 之後，中間可能隔著阻塞的 publish，而 WiFi task 的
@@ -1096,13 +1081,289 @@ void sendCmdToSlaveMac(const uint8_t mac[6], HoRelayCmd cmd, uint16_t pulseMs) {
   espNowSendTo(mac, HO_PKT_CMD, &payload, sizeof(payload));
 }
 
-void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
-  Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, slaveCount);
-  for (int i = 0; i < slaveCount; i++) {
-    sendCmdToSlave(i, cmd, pulseMs);
-    delay(20);   // 錯開送出時間，降低同頻碰撞
+// 序列埠專用：把 `list` 顯示的編號轉成 MAC，之後一律走 sendCmdToSlaveMac()。
+//
+// 為什麼不保留原本那個「拿索引直接 espNowSendTo(slaves[idx].mac, ...)」的版本：
+// 檔案裡曾同時存在 MAC 與索引兩套送指令慣例，而同一類缺陷（索引在阻塞或被
+// 搶佔之後失效）已經出現過兩次（Task 3 review 的 M4、Task 4 review 的 M2），
+// 後果是**開錯門**。這裡只留一個「編號 → MAC」的薄轉換層，真正的送出點
+// 全檔只剩 sendCmdToSlaveMac() 一個，索引無法再流進送出路徑。
+void sendCmdToSlaveIndex(int idx, HoRelayCmd cmd, uint16_t pulseMs) {
+  if (idx < 0 || idx >= slaveCount) {
+    Serial.println("[控制] 編號超出範圍");
+    return;
   }
-  // master 自己的繼電器也跟著動作
+  uint8_t mac[6];
+  memcpy(mac, slaves[idx].mac, 6);   // 先取值，之後不再依賴 idx
+  sendCmdToSlaveMac(mac, cmd, pulseMs);
+}
+
+void requestSlaveState(int idx) {
+  if (idx < 0 || idx >= slaveCount) return;
+  espNowSendTo(slaves[idx].mac, HO_PKT_STATE_REQ, nullptr, 0);
+}
+
+// 用 MAC 要求回報狀態（理由同 sendCmdToSlaveMac()：索引隨時可能失效）。
+// 群組指令的「事後逐台查狀態」用這條，因為它手上只有快照下來的 MAC。
+void requestSlaveStateMac(const uint8_t mac[6]) {
+  if (findSlave(mac) < 0) return;
+  espNowSendTo(mac, HO_PKT_STATE_REQ, nullptr, 0);
+}
+
+// ── 群組指令：廣播 → 事後逐台查狀態 → 對未確認者補送單播 ──
+//
+// **為什麼不是逐台單播。** 本系統是多開門的捕捉系統，核心需求是「一次要全部關」，
+// 關門失敗＝動物逃脫或未被捕捉。舊寫法逐台單播、每台間隔 20ms，20 台就是最後一台
+// 比第一台晚 400ms 收到 —— 那不叫「同時」，規格已明文否決這個落差。
+// 改用 ESP-NOW 廣播（FF:FF:FF:FF:FF:FF）：一次送出，所有已配對 slave 同時收到。
+//
+// **廣播不需要任何新基礎設施，也不會誤觸發別人的 slave**（兩個前提已查證）：
+//   1. 廣播 peer 在 setupEspNow() 就註冊好了（BROADCAST_MAC），心跳本來就走廣播。
+//   2. slave 對廣播一樣有 MAC 檢查 —— ho_slave1.ino 的
+//      `if (!masterKnown || memcmp(masterMac, info->src_addr, 6) != 0) return;`
+//      擋在 HO_PKT_CMD 分支之前，而 **ESP-NOW 廣播幀的 src_addr 仍是發送端的真實
+//      MAC**（廣播只換目的位址），所以這道檢查對廣播與單播一體適用；未配對
+//      （masterKnown == false）或配對到別台 master 的 slave 一律拒收。
+//
+// **但廣播沒有 ack。** esp_now_send() 送到廣播位址時**永遠回報成功**，那不代表
+// 任何一台真的收到了。「廣播完就回報成功」本身就是一條假綠燈。因此第 2 段
+// （事後逐台查狀態，找出誰沒關上）與第 3 段（對未確認者補送單播）不是優化，
+// 是正確性的一部分；而且必須用 loop() 的非阻塞狀態機跑 —— 在指令回呼裡一口氣
+// 跑完會是數秒級阻塞，撞破 slave 的 30 秒失聯門檻＝所有籠門被強制打開。
+const int GROUP_BROADCAST_REPEAT = 3;             // 廣播連送次數（無 ack，靠重送提高命中）
+const unsigned long GROUP_BROADCAST_GAP = 20;     // 每次廣播之間的間隔（ms）
+const unsigned long GROUP_SETTLE_MS = 600;        // 送出後等 slave 回報的靜置時間（ms）
+const unsigned long GROUP_STEP_GAP = 20;          // 逐台掃描時每台之間的間隔（ms）
+const int GROUP_MAX_SWEEPS = 4;                   // 查狀態／補送最多來回幾趟
+
+enum : uint8_t {
+  GROUP_JOB_IDLE = 0,
+  GROUP_JOB_WAIT,     // 靜置等回報，時間到就查證
+  GROUP_JOB_QUERY,    // 第 2 段：對未確認者逐台送 HO_PKT_STATE_REQ
+  GROUP_JOB_RETRY,    // 第 3 段：對未確認者逐台補送單播指令
+};
+
+struct GroupCmdJob {
+  uint8_t phase;
+  uint8_t cmd;              // HoRelayCmd
+  uint16_t pulseMs;
+  int count;                // 快照下來的台數
+  uint8_t macs[HO_ESPNOW_MAX_SLAVES][6];
+  bool confirmed[HO_ESPNOW_MAX_SLAVES];   // 一旦確認就不再翻回去（只加不減）
+  // 執行期間離開名冊的台數。這些台**不是「已確認關門」**，只是不再追蹤；
+  // 必須跟真正確認的分開計數，否則「20 台全部被 UNPAIRALL 拆掉」會讓
+  // confirmed[] 全滿而印出「全部回報預期狀態」—— 那正是假綠燈。
+  int dropped;
+  unsigned long sentAt;     // 最近一次送出動作的時間；證據必須不早於它
+  unsigned long waitUntil;
+  unsigned long nextStepAt;
+  int cursor;
+  int sweep;
+};
+GroupCmdJob groupJob;   // 全域，開機零初始化 ＝ GROUP_JOB_IDLE
+
+bool groupCmdActive() { return groupJob.phase != GROUP_JOB_IDLE; }
+
+// 判斷快照第 i 台是否已完成本次群組指令。
+//
+// ── 反假綠燈的核心規則 ──
+// 本專案已抓到四條假綠燈，全部同源：**動作之前就存在的狀態被當成動作之後的證據**。
+// 所以這裡一律要求「這台在 sentAt 之後有一則新的狀態回報」—— 光看
+// slaves[i].relay == 0 不算數，那可能是廣播前就存在的舊值，而這台其實早就
+// 收不到任何封包、門根本沒關。
+//
+// 「新回報」是強證據而不是巧合：ho_slave1 **沒有週期性狀態回報**，它只在三種
+// 情況送 HO_PKT_STATE —— 收到 HO_PKT_CMD 之後、收到 HO_PKT_STATE_REQ 之後、
+// 以及點動自動結束時。master 端 slaves[i].lastSeen 也只在 onEspNowRecv() 的
+// HO_PKT_STATE 分支更新，所以它就是「最後一次狀態回報時間」。
+// 為了不讓例行輪詢問出來的回報混進來當證據，群組指令期間 pollNextSlave()
+// 整個讓開（見 loop()）—— 用「我們自己問出來的回應」證明「指令有被收到」，
+// 就是同一個假綠燈模式。
+bool groupSlaveConfirmed(int idx) {
+  if (slaves[idx].lastSeen == 0) return false;
+  // wrap-safe：回報時間必須不早於指令送出時間（millis() 溢位時仍成立）
+  if ((long)(slaves[idx].lastSeen - groupJob.sentAt) < 0) return false;
+  if (groupJob.cmd == HO_CMD_OFF) return slaves[idx].relay == 0;
+  // ON 與 PULSE 都要求回報 relay==1。PULSE 的 relay==1 是真證據：slave 收到
+  // HO_CMD_PULSE 會先把繼電器打開再 sendState()，這則回報的 relay 一定是 1；
+  // 而點動結束時它會再送一則 relay=0。confirmed[] 是 sticky 的，所以「先確認、
+  // 之後點動自然結束」不會把已確認的那台又翻回未確認、造成重複點動。
+  return slaves[idx].relay == 1;
+}
+
+// 每次 loop() 都重新掃一遍未確認的（confirmed 只加不減），不必等靜置時間到 ——
+// 讓 PULSE 這種瞬時狀態能在點動還活著的期間就先鎖定下來。
+void groupUpdateConfirmations() {
+  for (int i = 0; i < groupJob.count; i++) {
+    if (groupJob.confirmed[i]) continue;
+    int idx = findSlave(groupJob.macs[i]);
+    if (idx < 0) {
+      // 這台在群組指令進行期間被解除配對了，不再追蹤（不是「已確認關門」，
+      // 但它已經不屬於這個 master 的名冊，繼續追下去只會對不存在的 peer 送封包）
+      char id[20];
+      hoFormatDeviceId(groupJob.macs[i], id);
+      Serial.printf("[群組] %s 已不在名冊上，停止追蹤（不計為已確認）\n", id);
+      groupJob.confirmed[i] = true;
+      groupJob.dropped++;
+      continue;
+    }
+    if (groupSlaveConfirmed(idx)) groupJob.confirmed[i] = true;
+  }
+}
+
+int groupCountMissing() {
+  int missing = 0;
+  for (int i = 0; i < groupJob.count; i++) {
+    if (!groupJob.confirmed[i]) missing++;
+  }
+  return missing;
+}
+
+void groupFinishJob(int missing) {
+  if (missing == 0 && groupJob.dropped > 0) {
+    // 不能說「全部確認」：dropped 那幾台是在執行期間離開名冊而停止追蹤的，
+    // 不是回報了預期狀態。混在一起講就是假綠燈。
+    Serial.printf("[群組] 指令 %u 收工：%d 台已確認、%d 台執行期間離開名冊（未確認）\n",
+                  groupJob.cmd, groupJob.count - groupJob.dropped, groupJob.dropped);
+  } else if (missing == 0) {
+    Serial.printf("[群組] 指令 %u 已逐台確認：%d 台全部回報預期狀態\n",
+                  groupJob.cmd, groupJob.count);
+  } else {
+    Serial.printf("⚠ [群組] 指令 %u 未能全部確認：%d 台中有 %d 台沒有回報預期狀態\n",
+                  groupJob.cmd, groupJob.count, missing);
+    if (groupJob.dropped > 0) {
+      Serial.printf("⚠ [群組]   另有 %d 台在執行期間離開名冊，同樣未確認\n",
+                    groupJob.dropped);
+    }
+    for (int i = 0; i < groupJob.count; i++) {
+      if (groupJob.confirmed[i]) continue;
+      char id[20];
+      hoFormatDeviceId(groupJob.macs[i], id);
+      Serial.printf("⚠ [群組]   未確認：%s\n", id);
+    }
+    if (groupJob.cmd == HO_CMD_OFF) {
+      Serial.println("⚠ [群組] 這是「全部關」指令 —— 未確認的籠門可能仍是開的，"
+                     "請現場確認，不要當成已關閉");
+    }
+  }
+  // 讓 App 收到每一台的真實狀態，而不是靠「指令已送出」去推測。
+  // 未確認的那幾台會維持名冊上最後已知的 relay 值（不會被改寫成 0），
+  // 所以 App 端不會出現「明明沒關卻顯示已關」的假綠燈。
+  markAllSlavesDirty();
+  groupJob.phase = GROUP_JOB_IDLE;
+}
+
+// 群組指令的第 2／3 段。由 loop() 每輪呼叫，每次最多動一台，完全不阻塞。
+void processGroupCmd() {
+  if (groupJob.phase == GROUP_JOB_IDLE) return;
+
+  unsigned long now = millis();
+  groupUpdateConfirmations();
+
+  if (groupJob.phase == GROUP_JOB_WAIT) {
+    if ((long)(now - groupJob.waitUntil) < 0) return;
+
+    int missing = groupCountMissing();
+    if (missing == 0 || groupJob.sweep >= GROUP_MAX_SWEEPS) {
+      groupFinishJob(missing);
+      return;
+    }
+
+    groupJob.sweep++;
+    groupJob.cursor = 0;
+    groupJob.nextStepAt = now;
+    // 這一趟送出的東西才是接下來的證據來源，時間基準跟著推進。
+    // confirmed[] 是 sticky 的，已確認的不會因為基準推進而被翻回去。
+    groupJob.sentAt = now;
+
+    // PULSE 不做「逐台查狀態」：點動是瞬時的，STATE_REQ 問回來的 relay 值
+    // 無法證明門有沒有動過（問的時候可能已經點動結束），而且「有回報」這件事
+    // 會變成我們自己那則查詢造成的 —— 拿它當「指令有被收到」的證據，正是本專案
+    // 假綠燈的同一個模式。所以 PULSE 一律直接補送單播（重送只是重觸發 2000ms
+    // 計時器，冪等且安全）。
+    bool doQuery = (groupJob.cmd != HO_CMD_PULSE) && (groupJob.sweep % 2 == 1);
+    groupJob.phase = doQuery ? GROUP_JOB_QUERY : GROUP_JOB_RETRY;
+    Serial.printf("[群組] 第 %d 趟：對 %d 台未確認的%s\n",
+                  groupJob.sweep, missing, doQuery ? "逐台查狀態" : "補送單播");
+    return;
+  }
+
+  // ── 逐台掃描（QUERY／RETRY 共用）：每次 loop() 最多一台 ──
+  if ((long)(now - groupJob.nextStepAt) < 0) return;
+
+  // 送出迴圈只讀快照，完全不碰 slaves[]／slaveCount ——
+  // 舊寫法的迴圈上界每次迭代重讀 volatile slaveCount，中途陣列搬移會同時造成
+  // 「跳過一台」與「提前結束」＝ **alloff 少關一扇門**（複審的關鍵警告）。
+  while (groupJob.cursor < groupJob.count && groupJob.confirmed[groupJob.cursor]) {
+    groupJob.cursor++;
+  }
+  if (groupJob.cursor >= groupJob.count) {
+    groupJob.phase = GROUP_JOB_WAIT;
+    groupJob.waitUntil = now + GROUP_SETTLE_MS;
+    return;
+  }
+
+  if (groupJob.phase == GROUP_JOB_QUERY) {
+    requestSlaveStateMac(groupJob.macs[groupJob.cursor]);
+  } else {
+    sendCmdToSlaveMac(groupJob.macs[groupJob.cursor],
+                      (HoRelayCmd)groupJob.cmd, groupJob.pulseMs);
+  }
+  groupJob.cursor++;
+  groupJob.nextStepAt = now + GROUP_STEP_GAP;
+}
+
+// 送出廣播「之前」先備妥第 2／3 段要用的快照與時間基準。
+//
+// 快照的必要性（複審的關鍵警告）：整個群組流程橫跨多輪 loop()，中間 WiFi task
+// 的 HO_PKT_UNPAIR 分支隨時可能前移 slaves[]。全程只用這份區域快照，就不存在
+// 「索引跑掉→補送給錯的那台」的可能。快照本身是一段沒有讓出 CPU 的緊湊迴圈。
+//
+// sentAt 必須在廣播「之前」取：廣播後立刻回來的狀態回報若比 sentAt 早，
+// 會被誤判成無效證據而白跑一趟。
+void groupCmdSnapshot(uint8_t cmd, uint16_t pulseMs) {
+  groupJob.phase = GROUP_JOB_IDLE;   // 舊的未完成工作直接作廢，最新的意圖才是對的
+  int n = slaveCount;
+  if (n < 0) n = 0;
+  if (n > HO_ESPNOW_MAX_SLAVES) n = HO_ESPNOW_MAX_SLAVES;
+
+  groupJob.count = n;
+  for (int i = 0; i < n; i++) {
+    memcpy(groupJob.macs[i], slaves[i].mac, 6);
+    groupJob.confirmed[i] = false;
+  }
+  groupJob.cmd = cmd;
+  groupJob.pulseMs = pulseMs;
+  groupJob.dropped = 0;
+  groupJob.sweep = 0;
+  groupJob.cursor = 0;
+  groupJob.sentAt = millis();
+  groupJob.nextStepAt = groupJob.sentAt;
+}
+
+void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
+  // 這一行的格式刻意不動：docs/phase1-regression-checklist.md 第 8 項拿它當判準。
+  Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, slaveCount);
+
+  // 後到的群組指令直接接管前一個未完成的（例如 ALL:ON 之後緊接 ALL:OFF）：
+  // 最新的意圖才是對的，尤其「全部關」必須能立刻壓過「全部開」。
+  groupCmdSnapshot((uint8_t)cmd, pulseMs);
+
+  HoCmdPayload payload;
+  payload.cmd = (uint8_t)cmd;
+  payload.pulseMs = pulseMs;
+
+  // 第 1 段：真正同時 —— 一次廣播，所有已配對 slave 同一瞬間收到。
+  // 連送 GROUP_BROADCAST_REPEAT 次、間隔 GROUP_BROADCAST_GAP：廣播沒有 ack
+  // 也沒有重傳，只能靠重送提高命中率。HO_CMD_OFF（關繼電器）與 HO_CMD_PULSE
+  // （重觸發 2000ms 計時器）都是冪等的，重送安全。
+  // 等待走 espNowDelay() 而非裸 delay()：整段最多 40ms，期間心跳照發。
+  for (int i = 0; i < GROUP_BROADCAST_REPEAT; i++) {
+    espNowSendTo(BROADCAST_MAC, HO_PKT_CMD, &payload, sizeof(payload));
+    if (i < GROUP_BROADCAST_REPEAT - 1) espNowDelay(GROUP_BROADCAST_GAP);
+  }
+
+  // master 自己的繼電器也跟著動作（本機 GPIO，不需要無線查證）
   if (cmd == HO_CMD_ON) {
     setRelayPins(true);
   } else if (cmd == HO_CMD_OFF) {
@@ -1110,11 +1371,18 @@ void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
   } else if (cmd == HO_CMD_PULSE) {
     pulseRelay(pulseMs > 0 ? pulseMs : 2000);
   }
-}
 
-void requestSlaveState(int idx) {
-  if (idx < 0 || idx >= slaveCount) return;
-  espNowSendTo(slaves[idx].mac, HO_PKT_STATE_REQ, nullptr, 0);
+  if (groupJob.count <= 0) {
+    groupJob.phase = GROUP_JOB_IDLE;   // 名冊是空的，沒有東西要查證
+    return;
+  }
+
+  // 第 2／3 段交給 loop() 的 processGroupCmd()。這裡刻意**不印任何「成功」字樣**：
+  // esp_now_send() 對廣播位址永遠回報成功，把它當成「已送達」就是第五條假綠燈。
+  groupJob.phase = GROUP_JOB_WAIT;
+  groupJob.waitUntil = millis() + GROUP_SETTLE_MS;
+  Serial.printf("[群組] 已廣播 %d 次（廣播無 ack，送出成功不代表任何一台收到），"
+                "開始逐台查證 %d 台\n", GROUP_BROADCAST_REPEAT, groupJob.count);
 }
 
 // 分散式輪詢：每次 loop() 呼叫最多只問一台，用「15000ms ÷ 台數」的間隔
@@ -1195,7 +1463,10 @@ void unpairSlave(int idx) {
   unsubscribeSlaveControlTopic(mac);
 
   espNowSendTo(mac, HO_PKT_UNPAIR, nullptr, 0);
-  delay(100);   // 給對方時間收到再刪 peer
+  // 給對方時間收到再刪 peer。改用 espNowDelay() 而非裸 delay(100)：
+  // UNPAIRALL 會連續呼叫本函式，裸 delay() 期間一則心跳都發不出去，
+  // 而 slave 超過 30 秒收不到心跳就強制關閉繼電器＝籠門被打開。
+  espNowDelay(100);
 
   esp_now_del_peer(mac);
 
@@ -1213,6 +1484,29 @@ void unpairSlave(int idx) {
   pendingSubscribeRefresh = true;
   saveSlaves();
   Serial.printf("[配對] 已移除 %s，剩 %d 台\n", id, slaveCount);
+}
+
+// ── UNPAIRALL：清空整份名冊，但必須分批 ──
+// 一口氣跑完的版本是：`while (slaveCount > 0) unpairSlave(slaveCount - 1);`
+// 20 台 × (espNowDelay(100) ＋ 一次 publishSlaveOffline())，而單次阻塞 publish
+// 最壞是 10 秒級的黑箱，合計最壞 **超過 60 秒沒有心跳** —— 直接撞破 slave 的
+// 30 秒失聯門檻，等於把所有已配對的籠門一次打開。這是「為了清名冊而開全部的門」，
+// 完全不可接受。
+// 改成每次 loop() 只拆一台：espNowDelay() 期間心跳照發，publish 又受
+// mqttPublishBudgetUsed 名額管轄（每輪最多一次），全程心跳不中斷。
+bool unpairAllPending = false;
+
+void processUnpairAll() {
+  if (!unpairAllPending) return;
+  if (slaveCount <= 0) {
+    unpairAllPending = false;
+    Serial.println("[配對] 名冊已清空");
+    publishStatus();
+    return;
+  }
+  // 從最後一台往前拆：unpairSlave() 內部的陣列前移只會影響被刪那台之後的元素，
+  // 拆最後一台就沒有任何元素需要搬移，剩下的內容全部保持原位。
+  unpairSlave(slaveCount - 1);
 }
 
 void printSlaveList() {
@@ -1292,6 +1586,7 @@ void printHelp() {
   Serial.println("  allpulse      全部點動 2 秒");
   Serial.println("  state <n>     要求第 n 台回報狀態");
   Serial.println("  unpair <n>    解除第 n 台配對");
+  Serial.println("  unpairall     清空整份名冊（分批執行，每輪 loop 拆一台，心跳不中斷）");
   Serial.println("  ch <n>        測試用：切換 master 的 channel（1~13）");
   Serial.println("  fakeslaves <n> 測試用：把名冊灌成 n 台假 slave，實測容量（不寫 NVS；");
   Serial.println("                 灌入後到重開機前，pair／unpair 會被擋下，避免假 MAC 寫進 NVS）");
@@ -1339,11 +1634,11 @@ void handleSerialCommand(const String& line) {
   } else if (verb == "pair") {
     if (pairingMode) exitPairingMode(); else enterPairingMode();
   } else if (verb == "on") {
-    sendCmdToSlave(arg, HO_CMD_ON, 0);
+    sendCmdToSlaveIndex(arg, HO_CMD_ON, 0);
   } else if (verb == "off") {
-    sendCmdToSlave(arg, HO_CMD_OFF, 0);
+    sendCmdToSlaveIndex(arg, HO_CMD_OFF, 0);
   } else if (verb == "pulse") {
-    sendCmdToSlave(arg, HO_CMD_PULSE, 2000);
+    sendCmdToSlaveIndex(arg, HO_CMD_PULSE, 2000);
   } else if (verb == "allon") {
     sendCmdToAll(HO_CMD_ON, 0);
   } else if (verb == "alloff") {
@@ -1354,6 +1649,14 @@ void handleSerialCommand(const String& line) {
     requestSlaveState(arg);
   } else if (verb == "unpair") {
     unpairSlave(arg);
+  } else if (verb == "unpairall") {
+    // 與 MQTT 的 UNPAIRALL 同一條路徑：只插旗，實際拆除由 loop() 分批做
+    if (slaveCount <= 0) {
+      Serial.println("[配對] 名冊本來就是空的");
+    } else {
+      unpairAllPending = true;
+      Serial.printf("[配對] 開始清空名冊，共 %d 台（每輪 loop 拆一台）\n", slaveCount);
+    }
   } else if (verb == "ch") {
     // 測試用：手動切換 channel，模擬 Phase 2 連上不同路由器的情況
     if (arg >= 1 && arg <= 13) {
@@ -1855,13 +2158,23 @@ void subscribeSlaveControlTopic(int idx) {
   }
 }
 
-// 取消訂閱是**盡力而為**：本輪的 socket 名額已被 publish 用掉時就放棄，
-// 不硬擠第二次阻塞寫入（review M1 的同一個不變式）。放棄是安全的，因為
+// 取消訂閱受「每輪 loop() 只做一次阻塞式 socket 寫入」的名額管轄
+// （review M1 的同一個不變式），名額已被用掉就放棄，不硬擠第二次阻塞寫入。
+//
+// ── 敘述更正（Task 4 複審建議 (a)，Task 5 順手改）──
+// 這段原本寫成「取消訂閱是**盡力而為**」，暗示「有時退得成、有時退不成」。
+// **實際上必定退不成**：目前兩個呼叫端（unpairSlave()、
+// processPendingUnpairPublish()）在呼叫本函式之前都**一定**先做過一次 offline
+// publish，那次 publish 必然已經佔走本輪的名額，所以本函式 **100% 走進下面的
+// 「略過」分支**，一次都不會真的送出 unsubscribe。
+//
+// 安全性不受影響（這一點複審已逐環節確認），理由不變：
 //   (a) handleSlaveCommand() 進來前 mqttCallback() 會用 findSlave() 擋掉
-//       已不在名冊上的目標，殘留訂閱收到的訊息不會造成任何動作；
+//       已不在名冊上的目標，殘留訂閱收到的訊息不會造成任何 ESP-NOW 動作；
 //   (b) 下次重連時 mqttClient.connect(...) 的 cleanSession 傳 true，
-//       broker 不保留舊 session 的訂閱清單，殘留自然消失。
-// 仍在序列埠留一行，讓現場除錯看得出「這次沒退成」。
+//       broker 不保留舊 session 的訂閱清單，殘留自然消失（殘留有上限）。
+// 保留本函式與那行序列埠輸出的意義：未來若有「不先 publish」的呼叫端加進來，
+// 這條路徑立刻就會生效；現場除錯也看得出「這次沒退成」。
 void unsubscribeSlaveControlTopic(const uint8_t mac[6]) {
   if (!mqttClient.connected()) return;
   char id[20];
@@ -2592,6 +2905,67 @@ void handleMasterCommand(const String& message) {
     saveNetConfig();
     Serial.printf("[設定] 繼電器宣告為 %s\n", hasRelay ? "有接" : "未接");
     publishStatus();
+  } else if (message == "ALL:ON") {
+    // 規格：「廣播 pulse 給所有已配對 slave」——是 PULSE 不是持續 ON，
+    // 語義與單台的 ON（pulseRelay(2000)）一致。
+    // sendCmdToAll() 內部會連 master 自己那顆一起動作（規格：ALL:ON 連自己一起），
+    // 並排入「事後查證 → 補送單播」的第 2／3 段。
+    sendCmdToAll(HO_CMD_PULSE, 2000);
+    markAllSlavesDirty();
+    publishStatus();
+  } else if (message == "ALL:OFF") {
+    // 本系統最關鍵的一條指令：關門失敗＝動物逃脫或未被捕捉。
+    // 廣播只是第 1 段，真正保證「全部關」的是 processGroupCmd() 的查證與補送。
+    sendCmdToAll(HO_CMD_OFF, 0);
+    markAllSlavesDirty();
+    publishStatus();
+  } else if (message == "SLAVES") {
+    // 規格：「立刻回報 slave 清單（發一次 status）」。
+    // 另外把所有 slave 標記成 dirty，讓每台的代發 topic 在接下來一輪內
+    // 也各自重壓一次保留訊息 —— 但不在這裡連發 20 則（見 slaveStatusScheduler()）。
+    markAllSlavesDirty();
+    publishStatus();
+  } else if (message == "PAIR:START") {
+    // 語義與 BOOT 短按／序列埠 pair 完全一致：開一個 60 秒的配對視窗
+    // （PAIRING_TIMEOUT，與 App 端的 60 秒倒數對齊），期間可以連續配對多台，
+    // **配對成功不會自動退出**（onEspNowRecv() 的 HO_PKT_PAIR_REQ 分支只做
+    // addSlave() 與回一則 PAIR_ACK）。退出只有三條路：PAIR:STOP／序列埠 pair
+    // 或 BOOT 短按切換／60 秒逾時。App 端已依賴這個行為，不要自創
+    // 「配對成功即退出」。重複下 PAIR:START 等於把 60 秒視窗重新計時。
+    enterPairingMode();
+    publishStatus();
+  } else if (message == "PAIR:STOP") {
+    exitPairingMode();
+    publishStatus();
+  } else if (message.startsWith("UNPAIR:")) {
+    String idStr = message.substring(7);
+    idStr.trim();
+    uint8_t mac[6];
+    if (!hoParseMacFromDeviceId(idStr.c_str(), mac)) {
+      Serial.printf("[配對] UNPAIR 的設備 ID 格式錯誤: %s\n", idStr.c_str());
+    } else {
+      int idx = findSlave(mac);
+      if (idx < 0) {
+        Serial.printf("[配對] UNPAIR 的設備不在名冊上: %s\n", idStr.c_str());
+      } else {
+        unpairSlave(idx);
+        publishStatus();
+      }
+    }
+  } else if (message == "UNPAIRALL") {
+    // 規格沒有這條，是 Phase 2a 交付時列出的待辦：目前完全沒有辦法清空名冊，
+    // master 要重新部署只能整台重燒。
+    // **只插旗，不在這裡跑迴圈** —— 一口氣拆 20 台最壞超過 60 秒沒有心跳，
+    // 會撞破 slave 的 30 秒失聯門檻（理由詳見 processUnpairAll() 上方註釋）。
+    if (slaveCount <= 0) {
+      Serial.println("[配對] 名冊本來就是空的");
+    } else {
+      unpairAllPending = true;
+      Serial.printf("[配對] 開始清空名冊，共 %d 台（每輪 loop 拆一台）\n", slaveCount);
+    }
+  } else if (message.startsWith("LR:")) {
+    // Task 6 實作，先給一個明確的回應而不是掉進「未知指令」
+    Serial.println("[LR] 指令尚未實作（Task 6）");
   } else {
     Serial.printf("[MQTT] 未知指令: %s\n", message.c_str());
   }
@@ -2879,8 +3253,21 @@ void loop() {
     }
   }
 
+  // ── 群組指令的第 2／3 段：事後逐台查狀態 → 對未確認者補送單播 ──
+  // ESP-NOW 廣播沒有 ack，「廣播完就當成功」是假綠燈；而查證與補送若在指令
+  // 回呼裡一口氣跑完會是數秒級阻塞，撞破 slave 的 30 秒失聯門檻。
+  // 本函式每次 loop() 最多動一台，完全不阻塞（見 processGroupCmd()）。
+  processGroupCmd();
+
   // ── 分散式輪詢 slave 狀態，每次 loop() 最多問一台（見 pollNextSlave()）──
-  pollNextSlave();
+  // 群組指令進行期間整個讓開：例行輪詢送的 HO_PKT_STATE_REQ 也會讓 slave 回報，
+  // 而群組指令正是拿「指令之後的新回報」當證據。讓輪詢問出來的回報混進去，
+  // 等於用「我們自己問出來的回應」證明「指令有被收到」—— 那是假綠燈。
+  // 群組指令最長約 5 秒，15 秒的輪詢週期完全吃得下這段讓開。
+  if (!groupCmdActive()) pollNextSlave();
+
+  // ── UNPAIRALL 分批拆除，每輪 loop() 最多一台（見 processUnpairAll()）──
+  processUnpairAll();
 
   // ── 代發 slave 狀態（每次 loop() 最多代發一台，見 slaveStatusScheduler()）──
   processPendingUnpairPublish();
