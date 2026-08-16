@@ -246,8 +246,11 @@ PubSubClient mqttClient(espClient);
 //      寧可不發，也絕不發半截 JSON。
 
 // 單筆 slave 條目的位元組上界。最壞情況實算：
-//   {"id":"hoban-aabbccddeeff","relay":1,"online":false,"rssi":-100,"version":"255.255.255"},
-//   = 89 bytes（含尾端逗號）。取 96 留餘裕，並讓除法算式是整數。
+//   {"id":"hoban-aabbccddeeff","relay":1,"online":false,"rssi":-100,"version":"255.255.255",
+//    "grp":0},
+//   = 89 ＋ 8（Task 5 review M2 新增的 "grp" 欄位，`,"grp":0`）＝ 97 bytes（含尾端逗號）。
+//   取 104 留餘裕，並讓除法算式仍是整數。
+//   （原本是 96；新增 "grp" 後 97 已經超過，這正是下方註釋警告過的情況，故一併調高。）
 //
 // review 補充（實測數字比對）：實機用 fakeslaves 20 量到的「餘裕 971 bytes」是樂觀值——
 // 那台測試板 SSID 短、沒設自訂 MQTT 伺服器，基礎欄位只吃了 310 bytes，遠低於
@@ -259,7 +262,7 @@ PubSubClient mqttClient(espClient);
 // 編譯期完全檢查不出「單筆條目其實已經超過 96 bytes」，那 52 bytes 的邊際
 // 會在不知不覺間被吃光，直到現場真的湊到 27 台才會發布時被 publishJsonDoc()
 // 的防線 1 擋下（不是編譯期，是執行期靜默放棄發布）。
-const size_t SLAVE_ENTRY_MAX_BYTES = 96;
+const size_t SLAVE_ENTRY_MAX_BYTES = 104;
 
 // slaves 陣列以外所有欄位的位元組上界。實算：
 //   Phase 2a 的既有欄位最壞 317
@@ -267,8 +270,14 @@ const size_t SLAVE_ENTRY_MAX_BYTES = 96;
 //   + "free_heap":123456,                     = 19
 //   + "slaves_truncated":true,"slaves_shown":20, = 42
 //   + "long_range_pending":true,               = 27（Task 6 加）
-//   ≈ 480，取 512。
-const size_t STATUS_BASE_MAX_BYTES = 512;
+//   + "group":{...}                            = 96（Task 5 review M2 加，見下）
+//   ≈ 576，取 640。
+//
+// "group" 物件的最壞實算（appendGroupResult()）：
+//   "group":{"cmd":255,"age_s":4294967,"n":20,"ack":20,"noack":20,"gone":20,
+//            "exec":"unprovable"},
+//   = 94 bytes，取 96。
+const size_t STATUS_BASE_MAX_BYTES = 640;
 
 // "slaves":[] 這個 key 與中括號本身
 const size_t SLAVES_KEY_OVERHEAD = 11;
@@ -1086,8 +1095,13 @@ void sendCmdToSlaveMac(const uint8_t mac[6], HoRelayCmd cmd, uint16_t pulseMs) {
 // 為什麼不保留原本那個「拿索引直接 espNowSendTo(slaves[idx].mac, ...)」的版本：
 // 檔案裡曾同時存在 MAC 與索引兩套送指令慣例，而同一類缺陷（索引在阻塞或被
 // 搶佔之後失效）已經出現過兩次（Task 3 review 的 M4、Task 4 review 的 M2），
-// 後果是**開錯門**。這裡只留一個「編號 → MAC」的薄轉換層，真正的送出點
-// 全檔只剩 sendCmdToSlaveMac() 一個，索引無法再流進送出路徑。
+// 後果是**開錯門**。這裡只留一個「編號 → MAC」的薄轉換層。
+//
+// 精確的敘述（review M4 更正）：**索引式的送出路徑已經消失**，而**單播的
+// 繼電器指令送出點只剩 sendCmdToSlaveMac() 一個**。全檔的 HO_PKT_CMD 送出點
+// 其實有兩個 —— 另一個是 sendCmdToAll() 裡送往 BROADCAST_MAC 的那次廣播，
+// 它天生就不經過名冊、也沒有索引可以指錯，屬於另一類。
+// 原本寫成「送出點只剩一個」是錯的，這裡改對。
 void sendCmdToSlaveIndex(int idx, HoRelayCmd cmd, uint16_t pulseMs) {
   if (idx < 0 || idx >= slaveCount) {
     Serial.println("[控制] 編號超出範圍");
@@ -1098,49 +1112,88 @@ void sendCmdToSlaveIndex(int idx, HoRelayCmd cmd, uint16_t pulseMs) {
   sendCmdToSlaveMac(mac, cmd, pulseMs);
 }
 
-void requestSlaveState(int idx) {
-  if (idx < 0 || idx >= slaveCount) return;
-  espNowSendTo(slaves[idx].mac, HO_PKT_STATE_REQ, nullptr, 0);
-}
-
 // 用 MAC 要求回報狀態（理由同 sendCmdToSlaveMac()：索引隨時可能失效）。
-// 群組指令的「事後逐台查狀態」用這條，因為它手上只有快照下來的 MAC。
 void requestSlaveStateMac(const uint8_t mac[6]) {
   if (findSlave(mac) < 0) return;
   espNowSendTo(mac, HO_PKT_STATE_REQ, nullptr, 0);
 }
 
-// ── 群組指令：廣播 → 事後逐台查狀態 → 對未確認者補送單播 ──
+// 序列埠／輪詢用的編號版本，同樣先取 MAC 值再送（review Mi2）。
 //
-// **為什麼不是逐台單播。** 本系統是多開門的捕捉系統，核心需求是「一次要全部關」，
-// 關門失敗＝動物逃脫或未被捕捉。舊寫法逐台單播、每台間隔 20ms，20 台就是最後一台
-// 比第一台晚 400ms 收到 —— 那不叫「同時」，規格已明文否決這個落差。
-// 改用 ESP-NOW 廣播（FF:FF:FF:FF:FF:FF）：一次送出，所有已配對 slave 同時收到。
+// 第一版把它留成索引式，理由是「唯讀查詢，指錯台不驅動繼電器」。**那個判斷
+// 被本 Task 自己推翻了**：狀態回報會刷新 slaves[idx].lastSeen 與 online，
+// 而 online 正是 App 判定「這台有沒有回報」的依據（hoctrl 的
+// master_slave_logic.dart `evaluateGroupCloseProgress()` 讀的是 slave.online）。
+// 指錯台 ＝ **替沒人問的 slave 偽造存活證據**，在「一次要全部關」的系統裡
+// 那是誤綠方向的錯誤。因此檔案裡不再保留任何索引式的 ESP-NOW 送出路徑。
+void requestSlaveStateIndex(int idx) {
+  if (idx < 0 || idx >= slaveCount) return;
+  uint8_t mac[6];
+  memcpy(mac, slaves[idx].mac, 6);   // 先取值，之後不再依賴 idx
+  requestSlaveStateMac(mac);
+}
+
+// ── 群組指令：廣播（真正同時）→ 逐台單播（唯一可證明的送達）──
 //
-// **廣播不需要任何新基礎設施，也不會誤觸發別人的 slave**（兩個前提已查證）：
-//   1. 廣播 peer 在 setupEspNow() 就註冊好了（BROADCAST_MAC），心跳本來就走廣播。
-//   2. slave 對廣播一樣有 MAC 檢查 —— ho_slave1.ino 的
-//      `if (!masterKnown || memcmp(masterMac, info->src_addr, 6) != 0) return;`
-//      擋在 HO_PKT_CMD 分支之前，而 **ESP-NOW 廣播幀的 src_addr 仍是發送端的真實
-//      MAC**（廣播只換目的位址），所以這道檢查對廣播與單播一體適用；未配對
-//      （masterKnown == false）或配對到別台 master 的 slave 一律拒收。
+// **為什麼不是純逐台單播。** 本系統是多開門的捕捉系統，核心需求是
+// 「一次要全部關」，關門失敗＝動物逃脫或未被捕捉。純逐台單播每台間隔 20ms，
+// 20 台就是最後一台晚 400ms 收到 —— 那不叫「同時」，規格已明文否決這個落差。
+// 所以主指令走 ESP-NOW 廣播（FF:FF:FF:FF:FF:FF），一次送出、所有已配對 slave
+// 同一瞬間收到。
 //
-// **但廣播沒有 ack。** esp_now_send() 送到廣播位址時**永遠回報成功**，那不代表
-// 任何一台真的收到了。「廣播完就回報成功」本身就是一條假綠燈。因此第 2 段
-// （事後逐台查狀態，找出誰沒關上）與第 3 段（對未確認者補送單播）不是優化，
-// 是正確性的一部分；而且必須用 loop() 的非阻塞狀態機跑 —— 在指令回呼裡一口氣
-// 跑完會是數秒級阻塞，撞破 slave 的 30 秒失聯門檻＝所有籠門被強制打開。
-const int GROUP_BROADCAST_REPEAT = 3;             // 廣播連送次數（無 ack，靠重送提高命中）
+// 廣播零新基礎設施也不會誤觸發別人的設備：廣播 peer 在 setupEspNow() 就註冊好、
+// 心跳本來就走廣播；slave 端
+// `if (!masterKnown || memcmp(masterMac, info->src_addr, 6) != 0) return;`
+// 擋在 HO_PKT_CMD 分支之前，而 **ESP-NOW 廣播幀的 src_addr 仍是發送端的真實
+// MAC**（廣播只換目的位址），這道檢查對廣播與單播一體適用。
+//
+// ── review C1 之後的重寫：只宣稱可證明的事 ──
+//
+// 第一版試圖證明「指令已被執行」：靜置後看 slaves[i].relay 是不是預期值，
+// 並用 master 自己送的 HO_PKT_STATE_REQ 去「製造」一則新回報當作證據。
+// **那是假綠燈。** 對 HO_CMD_OFF 而言，「新回報」是我們自己那則查詢造成的，
+// 而 relay == 0 是 slave 的**靜止預設值**（開機、點動結束、loadSlaves()、
+// addSlave() 全都初始化成 0）。兩半都不是證據，AND 起來仍然不是證據 ——
+// 一台從未收到 OFF 的 slave 會被判成「已確認」。更糟的是確認是 sticky 的，
+// 假確認一旦成立就再也不會補送，而「收不到廣播、卻收得到單播」正是邊界訊號
+// 那台的典型表現（廣播沒有 MAC 層 ACK 與重傳，單播有）。
+//
+// **根因是結構性的**：`HoStatePayload` 沒有任何指令歸因欄位（沒有「我剛執行了
+// 哪一則指令」的 seq／echo），所以在現行協定下「指令有被執行」**原理上無法證明**。
+// 裁決：這一輪不試圖證明「已執行」，改成誠實區分兩件事 ——
+//
+//   1. **「已送達」是可證明的**：單播有 MAC 層 ACK，esp_now_send() 的送出回呼
+//      （onEspNowSent()）會逐幀回報成功／失敗，且 wifi_tx_info_t::des_addr
+//      帶著目的 MAC，可以逐台歸因。**廣播沒有 ACK**，永遠回報成功，不算證據。
+//   2. **「已執行」不可證明**：不准用任何自製證據去宣稱它。收工訊息與 MQTT 狀態
+//      都明講這一點。
+//
+// 因此流程改成：**廣播 3 次（同時性）＋ 對每一台都送一次單播（可證明的送達）**，
+// 未取得 ACK 的再補送。**誤紅可接受、誤綠不可接受** —— 寧可每次都補送，
+// 也不要用假證據省下那幾個封包。20 台的單播不貴。
+//
+// 指令歸因欄位是已登記的技術債，**交 Phase 4 Task 1**（那個 Task 本來就要動協定、
+// 是已排定的 flag-day、兩端同時重燒），在那之前不為此單獨改協定。
+const int GROUP_BROADCAST_REPEAT = 3;             // 廣播連送次數（無 ACK，靠重送提高命中）
 const unsigned long GROUP_BROADCAST_GAP = 20;     // 每次廣播之間的間隔（ms）
-const unsigned long GROUP_SETTLE_MS = 600;        // 送出後等 slave 回報的靜置時間（ms）
-const unsigned long GROUP_STEP_GAP = 20;          // 逐台掃描時每台之間的間隔（ms）
-const int GROUP_MAX_SWEEPS = 4;                   // 查狀態／補送最多來回幾趟
+const unsigned long GROUP_STEP_GAP = 20;          // 逐台單播時每台之間的間隔（ms）
+const unsigned long GROUP_ACK_WAIT_MS = 300;      // 一趟掃完後，等 MAC 層 ACK 回來的時間
+const int GROUP_MAX_SWEEPS = 3;                   // 第一趟（全部）＋ 最多 2 趟補送
+
+// ── review M3：整個 job 的 wall-clock 硬上限 ──
+// 沒有這道上限，job 的長度＝趟數 ×（台數 × 每步間隔 ＋ 等待），而「每步」實際上是
+// 一次 loop() 迭代 —— 只要 loop() 被任何一個 10 秒級的阻塞 socket 寫入拖慢，
+// 整個 job 就會被拉長到不可預期。而 job 進行期間 pollNextSlave() 是讓開的
+// （理由見 groupNoteUnicastAck()），輪詢被餓死超過 30 秒就會讓
+// updateSlaveOnlineStatus() 把全部 slave 誤判離線。
+// 6 秒是刻意選的：輪詢週期 15 秒 ＋ 最多 6 秒停擺 ＝ 21 秒 < 30 秒門檻，留 9 秒餘裕。
+// 時間到就立刻收工並據實回報，不再補送。
+const unsigned long GROUP_JOB_MAX_MS = 6000;
 
 enum : uint8_t {
   GROUP_JOB_IDLE = 0,
-  GROUP_JOB_WAIT,     // 靜置等回報，時間到就查證
-  GROUP_JOB_QUERY,    // 第 2 段：對未確認者逐台送 HO_PKT_STATE_REQ
-  GROUP_JOB_RETRY,    // 第 3 段：對未確認者逐台補送單播指令
+  GROUP_JOB_WAIT,     // 等 MAC 層 ACK 回來，時間到就結算
+  GROUP_JOB_SWEEP,    // 逐台補送單播（每輪 loop() 最多一台）
 };
 
 struct GroupCmdJob {
@@ -1149,180 +1202,197 @@ struct GroupCmdJob {
   uint16_t pulseMs;
   int count;                // 快照下來的台數
   uint8_t macs[HO_ESPNOW_MAX_SLAVES][6];
-  bool confirmed[HO_ESPNOW_MAX_SLAVES];   // 一旦確認就不再翻回去（只加不減）
-  // 執行期間離開名冊的台數。這些台**不是「已確認關門」**，只是不再追蹤；
-  // 必須跟真正確認的分開計數，否則「20 台全部被 UNPAIRALL 拆掉」會讓
-  // confirmed[] 全滿而印出「全部回報預期狀態」—— 那正是假綠燈。
-  int dropped;
-  unsigned long sentAt;     // 最近一次送出動作的時間；證據必須不早於它
+  bool gone[HO_ESPNOW_MAX_SLAVES];   // 執行期間離開名冊（**不是**「已送達」）
+  unsigned long startedAt;
   unsigned long waitUntil;
   unsigned long nextStepAt;
   int cursor;
   int sweep;
+  bool everRan;             // 開機以來至少跑過一次群組指令（決定 MQTT 要不要帶 group 欄位）
 };
 GroupCmdJob groupJob;   // 全域，開機零初始化 ＝ GROUP_JOB_IDLE
 
+// ── 單播的 MAC 層送達旗標 ──
+// 由 onEspNowSent()（**WiFi task**）寫入、由 loop() 讀取，所以是 volatile。
+// 語義嚴格限定為「這一台在本次群組指令中，至少有一次單播 HO_PKT_CMD 拿到了
+// MAC 層 ACK」。**不代表繼電器動作了**（見上方 C1 的說明）。
+volatile bool groupDelivered[HO_ESPNOW_MAX_SLAVES];
+
+// ── ACK 歸因閂鎖 ──
+// onEspNowSent() 會被**每一次** espNowSendTo() 觸發，包含心跳（廣播）、
+// HO_PKT_STATE_REQ（單播！）、HO_PKT_UNPAIR（單播）。若不加限制，一則
+// STATE_REQ 的 ACK 會被誤記成「群組指令已送達」—— 那正是 C1 的同一個錯誤
+// （拿不相干的證據去宣稱另一件事）。
+// 所以只在「剛送出群組單播、還沒收到它的回呼」這個窗口內開閂，並且比對目的 MAC。
+// 殘留窗口：若在閂開著時，剛好有另一則送往**同一個 MAC** 的封包先拿到 ACK，
+// 會被誤記。為此群組指令進行期間 pollNextSlave() 與 handleSlaveCommand() 的
+// status 分支都讓開（見 loop()／handleSlaveCommand()），剩下的同 MAC 送出只有
+// HO_PKT_UNPAIR，而那一台會被 groupRefreshRoster() 標成 gone、不列入已送達。
+volatile bool groupAckArmed = false;
+volatile int groupAckIdx = -1;
+uint8_t groupAckMac[6];   // loop() 先寫值再開閂；WiFi task 只在閂開著時讀
+
 bool groupCmdActive() { return groupJob.phase != GROUP_JOB_IDLE; }
 
-// 判斷快照第 i 台是否已完成本次群組指令。
-//
-// ── 反假綠燈的核心規則 ──
-// 本專案已抓到四條假綠燈，全部同源：**動作之前就存在的狀態被當成動作之後的證據**。
-// 所以這裡一律要求「這台在 sentAt 之後有一則新的狀態回報」—— 光看
-// slaves[i].relay == 0 不算數，那可能是廣播前就存在的舊值，而這台其實早就
-// 收不到任何封包、門根本沒關。
-//
-// 「新回報」是強證據而不是巧合：ho_slave1 **沒有週期性狀態回報**，它只在三種
-// 情況送 HO_PKT_STATE —— 收到 HO_PKT_CMD 之後、收到 HO_PKT_STATE_REQ 之後、
-// 以及點動自動結束時。master 端 slaves[i].lastSeen 也只在 onEspNowRecv() 的
-// HO_PKT_STATE 分支更新，所以它就是「最後一次狀態回報時間」。
-// 為了不讓例行輪詢問出來的回報混進來當證據，群組指令期間 pollNextSlave()
-// 整個讓開（見 loop()）—— 用「我們自己問出來的回應」證明「指令有被收到」，
-// 就是同一個假綠燈模式。
-bool groupSlaveConfirmed(int idx) {
-  if (slaves[idx].lastSeen == 0) return false;
-  // wrap-safe：回報時間必須不早於指令送出時間（millis() 溢位時仍成立）
-  if ((long)(slaves[idx].lastSeen - groupJob.sentAt) < 0) return false;
-  if (groupJob.cmd == HO_CMD_OFF) return slaves[idx].relay == 0;
-  // ON 與 PULSE 都要求回報 relay==1。PULSE 的 relay==1 是真證據：slave 收到
-  // HO_CMD_PULSE 會先把繼電器打開再 sendState()，這則回報的 relay 一定是 1；
-  // 而點動結束時它會再送一則 relay=0。confirmed[] 是 sticky 的，所以「先確認、
-  // 之後點動自然結束」不會把已確認的那台又翻回未確認、造成重複點動。
-  return slaves[idx].relay == 1;
+// 由 onEspNowSent() 呼叫（WiFi task）。desAddr 可能為 nullptr（防禦性檢查）。
+void groupNoteUnicastAck(const uint8_t* desAddr, bool ok) {
+  if (!groupAckArmed) return;
+  if (desAddr == nullptr) return;
+  // 廣播的送出回呼永遠回報成功，明確排除 —— 把它當送達就是假綠燈
+  if (memcmp(desAddr, BROADCAST_MAC, 6) == 0) return;
+  if (memcmp(desAddr, groupAckMac, 6) != 0) return;
+
+  int i = groupAckIdx;
+  groupAckArmed = false;    // 先關閂，避免同一則回呼被重複歸因
+  if (!ok) return;
+  if (i < 0 || i >= HO_ESPNOW_MAX_SLAVES) return;
+  groupDelivered[i] = true;
 }
 
-// 每次 loop() 都重新掃一遍未確認的（confirmed 只加不減），不必等靜置時間到 ——
-// 讓 PULSE 這種瞬時狀態能在點動還活著的期間就先鎖定下來。
-void groupUpdateConfirmations() {
+// 送一則群組單播給快照第 i 台，並開啟 ACK 歸因閂鎖。
+// 先寫 MAC 再開閂：WiFi task 只在閂開著時讀 groupAckMac，順序反過來會讀到舊值。
+void groupSendUnicast(int i) {
+  if (i < 0 || i >= groupJob.count) return;
+  memcpy(groupAckMac, groupJob.macs[i], 6);
+  groupAckIdx = i;
+  groupAckArmed = true;
+  sendCmdToSlaveMac(groupJob.macs[i], (HoRelayCmd)groupJob.cmd, groupJob.pulseMs);
+}
+
+// 把「執行期間離開名冊」的標記更新一次。這些台**不計為已送達**。
+void groupRefreshRoster() {
   for (int i = 0; i < groupJob.count; i++) {
-    if (groupJob.confirmed[i]) continue;
-    int idx = findSlave(groupJob.macs[i]);
-    if (idx < 0) {
-      // 這台在群組指令進行期間被解除配對了，不再追蹤（不是「已確認關門」，
-      // 但它已經不屬於這個 master 的名冊，繼續追下去只會對不存在的 peer 送封包）
+    if (groupJob.gone[i]) continue;
+    if (findSlave(groupJob.macs[i]) < 0) {
       char id[20];
       hoFormatDeviceId(groupJob.macs[i], id);
-      Serial.printf("[群組] %s 已不在名冊上，停止追蹤（不計為已確認）\n", id);
-      groupJob.confirmed[i] = true;
-      groupJob.dropped++;
-      continue;
+      Serial.printf("[群組] %s 已不在名冊上，停止補送（不計為已送達）\n", id);
+      groupJob.gone[i] = true;
     }
-    if (groupSlaveConfirmed(idx)) groupJob.confirmed[i] = true;
   }
 }
 
-int groupCountMissing() {
-  int missing = 0;
+// 仍需補送的台數：沒拿到 ACK、且還在名冊上的
+int groupCountPending() {
+  int n = 0;
   for (int i = 0; i < groupJob.count; i++) {
-    if (!groupJob.confirmed[i]) missing++;
+    if (!groupDelivered[i] && !groupJob.gone[i]) n++;
   }
-  return missing;
+  return n;
 }
 
-void groupFinishJob(int missing) {
-  if (missing == 0 && groupJob.dropped > 0) {
-    // 不能說「全部確認」：dropped 那幾台是在執行期間離開名冊而停止追蹤的，
-    // 不是回報了預期狀態。混在一起講就是假綠燈。
-    Serial.printf("[群組] 指令 %u 收工：%d 台已確認、%d 台執行期間離開名冊（未確認）\n",
-                  groupJob.cmd, groupJob.count - groupJob.dropped, groupJob.dropped);
-  } else if (missing == 0) {
-    Serial.printf("[群組] 指令 %u 已逐台確認：%d 台全部回報預期狀態\n",
-                  groupJob.cmd, groupJob.count);
-  } else {
-    Serial.printf("⚠ [群組] 指令 %u 未能全部確認：%d 台中有 %d 台沒有回報預期狀態\n",
-                  groupJob.cmd, groupJob.count, missing);
-    if (groupJob.dropped > 0) {
-      Serial.printf("⚠ [群組]   另有 %d 台在執行期間離開名冊，同樣未確認\n",
-                    groupJob.dropped);
-    }
+void groupCountAll(int& ack, int& noack, int& gone) {
+  ack = 0;
+  noack = 0;
+  gone = 0;
+  for (int i = 0; i < groupJob.count; i++) {
+    if (groupJob.gone[i]) gone++;
+    else if (groupDelivered[i]) ack++;
+    else noack++;
+  }
+}
+
+// 收工。**只講可證明的事**：MAC 層送達與否。執行與否一律明講無法證明。
+void groupFinishJob(bool hitTimeCap) {
+  int ack, noack, gone;
+  groupCountAll(ack, noack, gone);
+
+  Serial.printf("[群組] 指令 %u 收工%s：單播 MAC 層已送達 %d／%d 台\n",
+                groupJob.cmd, hitTimeCap ? "（達 wall-clock 上限）" : "",
+                ack, groupJob.count);
+  if (noack > 0) {
+    Serial.printf("⚠ [群組] %d 台連「送達」都沒有（單播沒拿到 MAC 層 ACK）\n", noack);
     for (int i = 0; i < groupJob.count; i++) {
-      if (groupJob.confirmed[i]) continue;
+      if (groupDelivered[i] || groupJob.gone[i]) continue;
       char id[20];
       hoFormatDeviceId(groupJob.macs[i], id);
-      Serial.printf("⚠ [群組]   未確認：%s\n", id);
-    }
-    if (groupJob.cmd == HO_CMD_OFF) {
-      Serial.println("⚠ [群組] 這是「全部關」指令 —— 未確認的籠門可能仍是開的，"
-                     "請現場確認，不要當成已關閉");
+      Serial.printf("⚠ [群組]   未送達：%s\n", id);
     }
   }
-  // 讓 App 收到每一台的真實狀態，而不是靠「指令已送出」去推測。
-  // 未確認的那幾台會維持名冊上最後已知的 relay 值（不會被改寫成 0），
-  // 所以 App 端不會出現「明明沒關卻顯示已關」的假綠燈。
+  if (gone > 0) {
+    Serial.printf("⚠ [群組] %d 台在執行期間離開名冊，同樣未送達\n", gone);
+  }
+
+  // 這兩行是本 Task 最重要的輸出，**任何情況都要印**（包含全部送達時）。
+  Serial.println("[群組] 注意：MAC 層 ACK 只證明「封包已送達」，"
+                 "不能證明繼電器真的動作");
+  Serial.println("[群組] 現行 HoStatePayload 沒有指令歸因欄位，"
+                 "「已執行」在本版協定下無法證明（技術債：Phase 4 Task 1 補）");
+
+  // 關門路徑要額外點名。App 的「全部關門」按鈕送的是 **ALL:ON**（＝廣播 PULSE，
+  // 見 hoctrl 的 device_detail_page.dart `_sendGroupCloseCommand()`），
+  // 不是 ALL:OFF —— 所以警語掛在 PULSE 上才有意義。OFF 也一併掛（序列埠 alloff）。
+  if (groupJob.cmd == HO_CMD_PULSE || groupJob.cmd == HO_CMD_OFF) {
+    Serial.println("⚠ [群組] 這是關門路徑：未送達的籠門必然沒關；已送達的也只代表"
+                   "封包到了，一律以現場確認為準，不要當成已關閉");
+  }
+
+  // 讓 App 收到每一台的真實狀態與本次的送達結果（見 appendSlavesArray()／
+  // buildStatusDoc() 的 "grp" 與 "group" 欄位，review M2）
   markAllSlavesDirty();
   groupJob.phase = GROUP_JOB_IDLE;
 }
 
-// 群組指令的第 2／3 段。由 loop() 每輪呼叫，每次最多動一台，完全不阻塞。
+// 群組指令的補送段。由 loop() 每輪呼叫，每次最多送一台，完全不阻塞。
 void processGroupCmd() {
   if (groupJob.phase == GROUP_JOB_IDLE) return;
 
   unsigned long now = millis();
-  groupUpdateConfirmations();
+
+  // review M3：wall-clock 硬上限優先於一切，時間到就收工
+  if ((long)(now - (groupJob.startedAt + GROUP_JOB_MAX_MS)) >= 0) {
+    groupRefreshRoster();
+    groupFinishJob(true);
+    return;
+  }
+
+  groupRefreshRoster();
 
   if (groupJob.phase == GROUP_JOB_WAIT) {
     if ((long)(now - groupJob.waitUntil) < 0) return;
 
-    int missing = groupCountMissing();
-    if (missing == 0 || groupJob.sweep >= GROUP_MAX_SWEEPS) {
-      groupFinishJob(missing);
+    int pending = groupCountPending();
+    if (pending == 0 || groupJob.sweep >= GROUP_MAX_SWEEPS) {
+      groupFinishJob(false);
       return;
     }
-
     groupJob.sweep++;
     groupJob.cursor = 0;
     groupJob.nextStepAt = now;
-    // 這一趟送出的東西才是接下來的證據來源，時間基準跟著推進。
-    // confirmed[] 是 sticky 的，已確認的不會因為基準推進而被翻回去。
-    groupJob.sentAt = now;
-
-    // PULSE 不做「逐台查狀態」：點動是瞬時的，STATE_REQ 問回來的 relay 值
-    // 無法證明門有沒有動過（問的時候可能已經點動結束），而且「有回報」這件事
-    // 會變成我們自己那則查詢造成的 —— 拿它當「指令有被收到」的證據，正是本專案
-    // 假綠燈的同一個模式。所以 PULSE 一律直接補送單播（重送只是重觸發 2000ms
-    // 計時器，冪等且安全）。
-    bool doQuery = (groupJob.cmd != HO_CMD_PULSE) && (groupJob.sweep % 2 == 1);
-    groupJob.phase = doQuery ? GROUP_JOB_QUERY : GROUP_JOB_RETRY;
-    Serial.printf("[群組] 第 %d 趟：對 %d 台未確認的%s\n",
-                  groupJob.sweep, missing, doQuery ? "逐台查狀態" : "補送單播");
+    groupJob.phase = GROUP_JOB_SWEEP;
+    Serial.printf("[群組] 第 %d 趟補送：對 %d 台未取得 MAC 層 ACK 的重送單播\n",
+                  groupJob.sweep, pending);
     return;
   }
 
-  // ── 逐台掃描（QUERY／RETRY 共用）：每次 loop() 最多一台 ──
+  // ── GROUP_JOB_SWEEP：每次 loop() 最多送一台 ──
   if ((long)(now - groupJob.nextStepAt) < 0) return;
 
-  // 送出迴圈只讀快照，完全不碰 slaves[]／slaveCount ——
-  // 舊寫法的迴圈上界每次迭代重讀 volatile slaveCount，中途陣列搬移會同時造成
-  // 「跳過一台」與「提前結束」＝ **alloff 少關一扇門**（複審的關鍵警告）。
-  while (groupJob.cursor < groupJob.count && groupJob.confirmed[groupJob.cursor]) {
+  // 掃描只讀快照，完全不碰 slaves[]／slaveCount（裁決二）
+  while (groupJob.cursor < groupJob.count &&
+         (groupDelivered[groupJob.cursor] || groupJob.gone[groupJob.cursor])) {
     groupJob.cursor++;
   }
   if (groupJob.cursor >= groupJob.count) {
     groupJob.phase = GROUP_JOB_WAIT;
-    groupJob.waitUntil = now + GROUP_SETTLE_MS;
+    groupJob.waitUntil = now + GROUP_ACK_WAIT_MS;
     return;
   }
 
-  if (groupJob.phase == GROUP_JOB_QUERY) {
-    requestSlaveStateMac(groupJob.macs[groupJob.cursor]);
-  } else {
-    sendCmdToSlaveMac(groupJob.macs[groupJob.cursor],
-                      (HoRelayCmd)groupJob.cmd, groupJob.pulseMs);
-  }
+  groupSendUnicast(groupJob.cursor);
   groupJob.cursor++;
   groupJob.nextStepAt = now + GROUP_STEP_GAP;
 }
 
-// 送出廣播「之前」先備妥第 2／3 段要用的快照與時間基準。
+// 送出「之前」先把 MAC 清單快照到區域陣列。
 //
 // 快照的必要性（複審的關鍵警告）：整個群組流程橫跨多輪 loop()，中間 WiFi task
-// 的 HO_PKT_UNPAIR 分支隨時可能前移 slaves[]。全程只用這份區域快照，就不存在
+// 的 HO_PKT_UNPAIR 分支隨時可能前移 slaves[]。全程只用這份快照，就不存在
 // 「索引跑掉→補送給錯的那台」的可能。快照本身是一段沒有讓出 CPU 的緊湊迴圈。
-//
-// sentAt 必須在廣播「之前」取：廣播後立刻回來的狀態回報若比 sentAt 早，
-// 會被誤判成無效證據而白跑一趟。
 void groupCmdSnapshot(uint8_t cmd, uint16_t pulseMs) {
   groupJob.phase = GROUP_JOB_IDLE;   // 舊的未完成工作直接作廢，最新的意圖才是對的
+  groupAckArmed = false;
+
   int n = slaveCount;
   if (n < 0) n = 0;
   if (n > HO_ESPNOW_MAX_SLAVES) n = HO_ESPNOW_MAX_SLAVES;
@@ -1330,31 +1400,29 @@ void groupCmdSnapshot(uint8_t cmd, uint16_t pulseMs) {
   groupJob.count = n;
   for (int i = 0; i < n; i++) {
     memcpy(groupJob.macs[i], slaves[i].mac, 6);
-    groupJob.confirmed[i] = false;
+    groupJob.gone[i] = false;
+    groupDelivered[i] = false;
   }
   groupJob.cmd = cmd;
   groupJob.pulseMs = pulseMs;
-  groupJob.dropped = 0;
-  groupJob.sweep = 0;
+  groupJob.sweep = 1;          // 第 1 趟就是下面那段 inline 的「對每一台都送」
   groupJob.cursor = 0;
-  groupJob.sentAt = millis();
-  groupJob.nextStepAt = groupJob.sentAt;
+  groupJob.startedAt = millis();
+  groupJob.everRan = true;
 }
 
 void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
   // 這一行的格式刻意不動：docs/phase1-regression-checklist.md 第 8 項拿它當判準。
   Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, slaveCount);
 
-  // 後到的群組指令直接接管前一個未完成的（例如 ALL:ON 之後緊接 ALL:OFF）：
-  // 最新的意圖才是對的，尤其「全部關」必須能立刻壓過「全部開」。
   groupCmdSnapshot((uint8_t)cmd, pulseMs);
 
   HoCmdPayload payload;
   payload.cmd = (uint8_t)cmd;
   payload.pulseMs = pulseMs;
 
-  // 第 1 段：真正同時 —— 一次廣播，所有已配對 slave 同一瞬間收到。
-  // 連送 GROUP_BROADCAST_REPEAT 次、間隔 GROUP_BROADCAST_GAP：廣播沒有 ack
+  // ── 第 1 段：廣播（同時性）──
+  // 連送 GROUP_BROADCAST_REPEAT 次、間隔 GROUP_BROADCAST_GAP：廣播沒有 ACK
   // 也沒有重傳，只能靠重送提高命中率。HO_CMD_OFF（關繼電器）與 HO_CMD_PULSE
   // （重觸發 2000ms 計時器）都是冪等的，重送安全。
   // 等待走 espNowDelay() 而非裸 delay()：整段最多 40ms，期間心跳照發。
@@ -1363,7 +1431,7 @@ void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
     if (i < GROUP_BROADCAST_REPEAT - 1) espNowDelay(GROUP_BROADCAST_GAP);
   }
 
-  // master 自己的繼電器也跟著動作（本機 GPIO，不需要無線查證）
+  // master 自己的繼電器也跟著動作（本機 GPIO，不需要無線送達證明）
   if (cmd == HO_CMD_ON) {
     setRelayPins(true);
   } else if (cmd == HO_CMD_OFF) {
@@ -1373,16 +1441,36 @@ void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
   }
 
   if (groupJob.count <= 0) {
-    groupJob.phase = GROUP_JOB_IDLE;   // 名冊是空的，沒有東西要查證
+    groupJob.phase = GROUP_JOB_IDLE;   // 名冊是空的，沒有東西要送
+    Serial.println("[群組] 名冊是空的，只有 master 自己動作");
     return;
   }
 
-  // 第 2／3 段交給 loop() 的 processGroupCmd()。這裡刻意**不印任何「成功」字樣**：
-  // esp_now_send() 對廣播位址永遠回報成功，把它當成「已送達」就是第五條假綠燈。
+  // ── 第 2 段：對**每一台**都送一次單播（唯一可證明的送達）──
+  //
+  // 這一趟刻意寫成 inline 而不是丟給 loop()（review Mi3）：
+  // handleMasterCommand() 的 ALL:* 分支結尾就是 publishStatus()，而單次阻塞
+  // publish 最壞是 10 秒級黑箱（App 端依賴那則 publishStatus()，不能拿掉）。
+  // 若第一趟單播排在它後面，「一次要全部關」的補強會被整整延後 10 秒 ——
+  // 那是這套系統最不能延後的動作。
+  // 代價是最多 20 × 20ms ＝ 400ms 的 inline 阻塞，全程走 espNowDelay()，
+  // 心跳與點動結束檢查都照跑，遠低於 30 秒門檻。
+  //
+  // 只讀快照，不讀 slaves[]／slaveCount（裁決二：舊寫法的迴圈上界每次迭代重讀
+  // volatile slaveCount，中途陣列搬移會同時造成「跳過一台」與「提前結束」
+  // ＝ alloff 少關一扇門）。
+  for (int i = 0; i < groupJob.count; i++) {
+    groupSendUnicast(i);
+    if (i < groupJob.count - 1) espNowDelay(GROUP_STEP_GAP);
+  }
+
+  // 補送段交給 loop() 的 processGroupCmd()。這裡刻意**不印任何「成功」字樣**：
+  // esp_now_send() 對廣播位址永遠回報成功，把它當成「已送達」就是假綠燈。
   groupJob.phase = GROUP_JOB_WAIT;
-  groupJob.waitUntil = millis() + GROUP_SETTLE_MS;
-  Serial.printf("[群組] 已廣播 %d 次（廣播無 ack，送出成功不代表任何一台收到），"
-                "開始逐台查證 %d 台\n", GROUP_BROADCAST_REPEAT, groupJob.count);
+  groupJob.waitUntil = millis() + GROUP_ACK_WAIT_MS;
+  Serial.printf("[群組] 已廣播 %d 次（廣播無 ACK，送出成功不代表任何一台收到），"
+                "並對 %d 台各送一次單播，等 MAC 層 ACK\n",
+                GROUP_BROADCAST_REPEAT, groupJob.count);
 }
 
 // 分散式輪詢：每次 loop() 呼叫最多只問一台，用「15000ms ÷ 台數」的間隔
@@ -1412,7 +1500,7 @@ void pollNextSlave() {
   // slaveCount 可能因配對／解除配對中途變動，索引越界就重頭開始，
   // 不特別處理「跳過某台」，反正下一輪就會輪到
   if (pollIdx >= n) pollIdx = 0;
-  requestSlaveState(pollIdx);
+  requestSlaveStateIndex(pollIdx);
   pollIdx = (pollIdx + 1) % n;
 }
 
@@ -1540,6 +1628,65 @@ void formatSlaveVersion(int idx, char* out, size_t outSize) {
 // 且已有 static_assert 在編譯期擋住「有人把 statusBuf 改小」。
 // 保留執行期截斷的意義是：萬一真的走到，App 看得到 slaves_truncated、
 // 序列埠也會告警，而不是靜默給出一份不完整的清單。
+// 最近一次群組指令的摘要（review M2）。開機以來沒下過群組指令就整個不帶。
+//
+// 每一個欄位的語義都嚴格限定在「送達」，沒有任何一個欄位宣稱「已執行」：
+//   cmd    最近一次群組指令的 HoRelayCmd（1=ON 2=OFF 3=PULSE）
+//   age_s  距離指令送出的秒數
+//   busy   1 = 補送還在進行中，0 = 已收工（收工的數字才是定案）
+//   n      快照台數
+//   ack    單播拿到 MAC 層 ACK 的台數（**只是送達**）
+//   noack  沒拿到的台數 —— 這就是 App 該顯示紅色的依據
+//   gone   指令期間離開名冊的台數（同樣未送達）
+//   exec   固定 "unprovable"：現行 HoStatePayload 沒有指令歸因欄位，
+//          「已執行」原理上無法證明。這個欄位是刻意寫死的，用來擋掉
+//          「App 把 ack 當成關門成功」這條誤讀路徑。
+void appendGroupResult(JsonDocument& doc) {
+  if (!groupJob.everRan) return;
+  int ack, noack, gone;
+  groupCountAll(ack, noack, gone);
+
+  JsonObject g = doc["group"].to<JsonObject>();
+  g["cmd"] = groupJob.cmd;
+  g["age_s"] = (uint32_t)((millis() - groupJob.startedAt) / 1000);
+  g["busy"] = groupCmdActive() ? 1 : 0;
+  g["n"] = groupJob.count;
+  g["ack"] = ack;
+  g["noack"] = noack;
+  g["gone"] = gone;
+  g["exec"] = "unprovable";
+}
+
+// 查出某台 slave 在**最近一次**群組指令中的送達結果。
+// 回傳 -1 = 這台不在最近一次群組指令的快照裡（例如指令之後才配對進來），
+//        0 = 單播沒拿到 MAC 層 ACK（未送達），
+//        1 = 單播拿到了 MAC 層 ACK（已送達，**但不代表繼電器動作了**）。
+int groupDeliveryFor(const uint8_t mac[6]) {
+  if (!groupJob.everRan) return -1;
+  for (int i = 0; i < groupJob.count; i++) {
+    if (memcmp(groupJob.macs[i], mac, 6) != 0) continue;
+    if (groupJob.gone[i]) return 0;      // 離開名冊＝未送達，不是「不知道」
+    return groupDelivered[i] ? 1 : 0;
+  }
+  return -1;
+}
+
+// ── review M2：把「未送達」帶進 MQTT ──
+// 收工判定原本只存在於序列埠，App 沒有任何依據可以顯示紅色。
+// 這裡在 master 狀態的 slaves 陣列每一筆加上 "grp"，並在 buildStatusDoc()
+// 加上 "group" 摘要物件。
+//
+// **語義只有一個，且刻意取一個不會被誤讀成「已關門」的名字**：
+//   "grp": 1 → 最近一次群組指令的單播對這台拿到了 MAC 層 ACK（封包已送達）
+//   "grp": 0 → 沒拿到（未送達；或它在指令期間離開了名冊）
+//   欄位不存在 → 這台不在最近一次群組指令的快照裡，或開機以來還沒下過群組指令
+//
+// **"grp": 1 不等於「門關了」。** 現行協定證明不了執行（見 sendCmdToAll() 上方
+// C1 的說明），所以 "group" 摘要固定帶 "exec":"unprovable"，讓 App 端不可能
+// 把送達誤讀成執行。
+//
+// 舊版 App 的相容性：`SlaveStatus.fromJson()` 只挑它認得的 key，多出來的
+// 欄位會被忽略，不會解析失敗（hoctrl 的 lib/models/slave_status.dart）。
 void appendSlavesArray(JsonDocument& doc) {
   const int maxEntries =
       (int)((STATUS_BUF_SIZE - 1 - STATUS_BASE_MAX_BYTES - SLAVES_KEY_OVERHEAD)
@@ -1563,6 +1710,8 @@ void appendSlavesArray(JsonDocument& doc) {
     o["online"] = slaves[i].online;
     o["rssi"] = slaves[i].rssi;
     o["version"] = ver;
+    int grp = groupDeliveryFor(slaves[i].mac);
+    if (grp >= 0) o["grp"] = grp;
   }
 
   if (shown < slaveCount) {
@@ -1646,7 +1795,7 @@ void handleSerialCommand(const String& line) {
   } else if (verb == "allpulse") {
     sendCmdToAll(HO_CMD_PULSE, 2000);
   } else if (verb == "state") {
-    requestSlaveState(arg);
+    requestSlaveStateIndex(arg);
   } else if (verb == "unpair") {
     unpairSlave(arg);
   } else if (verb == "unpairall") {
@@ -1792,10 +1941,17 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
   }
 }
 
+// 送出回呼（**WiFi task context**，不是 loop()）。
+// Task 5 review C1 起，這裡是「已送達」的**唯一**證據來源：單播有 MAC 層 ACK，
+// 這個回呼會逐幀回報成功／失敗，且 wifi_tx_info_t::des_addr 帶著目的 MAC，
+// 可以逐台歸因。廣播沒有 ACK、永遠回報成功，groupNoteUnicastAck() 內部會明確
+// 把廣播位址排除掉。
 void onEspNowSent(const wifi_tx_info_t* txInfo, esp_now_send_status_t status) {
-  if (status != ESP_NOW_SEND_SUCCESS) {
+  bool ok = (status == ESP_NOW_SEND_SUCCESS);
+  if (!ok) {
     Serial.println("[ESP-NOW] 送出失敗");
   }
+  groupNoteUnicastAck(txInfo != nullptr ? txInfo->des_addr : nullptr, ok);
 }
 
 // ── 送出封包 ──
@@ -2551,6 +2707,7 @@ void buildStatusDoc(JsonDocument& doc) {
   dev["long_range"] = longRangeEnabled;
   dev["free_heap"] = (uint32_t)ESP.getFreeHeap();
 
+  appendGroupResult(doc);
   appendSlavesArray(doc);
 }
 
@@ -2642,6 +2799,10 @@ void publishSlaveStatus(int idx) {
 
   JsonObject dev = doc["device"].to<JsonObject>();
   dev["relay"] = slaves[idx].relay ? 1 : 0;
+  // 與 master 狀態的 slaves 陣列同一個語義（review M2）：只講「送達」，
+  // 不講「已執行」。這台不在最近一次群組指令的快照裡就整個不帶這個欄位。
+  int grp = groupDeliveryFor(slaves[idx].mac);
+  if (grp >= 0) dev["grp"] = grp;
 
   if (publishJsonDoc(topic.c_str(), doc, true)) {
     slaves[idx].dirty = false;
@@ -2857,12 +3018,22 @@ void handleSlaveCommand(const uint8_t mac[6], const String& message) {
   } else if (message == "status") {
     // 先用目前已知的狀態立刻回一則，App 不必空等；
     // 同時向 slave 要一次最新狀態，回來時 dirty 會觸發第二則代發。
-    // 兩次動作各自重查索引：中間的 publishSlaveStatus() 可能阻塞 10 秒級，
-    // 沿用同一個 idx 會讓 requestSlaveState() 問到別台去。
+    // 索引每次重查：中間的 publishSlaveStatus() 可能阻塞 10 秒級，
+    // 沿用同一個 idx 會問到別台去。
     int idx = findSlave(mac);
     if (idx >= 0) publishSlaveStatus(idx);
-    idx = findSlave(mac);
-    if (idx >= 0) requestSlaveState(idx);
+    // review Mi2：群組指令進行期間讓開這則 STATE_REQ。
+    // 它是送往某一台 slave 的**單播**，其 MAC 層 ACK 會落進 onEspNowSent()；
+    // 若剛好與群組單播的 ACK 歸因閂鎖撞在同一個 MAC 上，會把「查詢已送達」
+    // 誤記成「群組指令已送達」—— 與 C1 同一類的錯誤歸因。
+    // 群組指令有 6 秒 wall-clock 硬上限，最多只讓開這麼久；上面那則
+    // publishSlaveStatus() 已經先回了 App 一份目前已知的狀態，不會空等。
+    if (groupCmdActive()) {
+      Serial.printf("[代理] %s 群組指令進行中，稍後再向它要最新狀態\n", id);
+    } else {
+      idx = findSlave(mac);
+      if (idx >= 0) requestSlaveStateIndex(idx);
+    }
   } else {
     Serial.printf("[代理] %s 不支援的指令: %s\n", id, message.c_str());
   }
@@ -3253,17 +3424,19 @@ void loop() {
     }
   }
 
-  // ── 群組指令的第 2／3 段：事後逐台查狀態 → 對未確認者補送單播 ──
-  // ESP-NOW 廣播沒有 ack，「廣播完就當成功」是假綠燈；而查證與補送若在指令
-  // 回呼裡一口氣跑完會是數秒級阻塞，撞破 slave 的 30 秒失聯門檻。
-  // 本函式每次 loop() 最多動一台，完全不阻塞（見 processGroupCmd()）。
+  // ── 群組指令的補送段（見 processGroupCmd()）──
+  // ESP-NOW 廣播沒有 ACK，「廣播完就當成功」是假綠燈；補送若在指令回呼裡
+  // 一口氣跑完會是數秒級阻塞，撞破 slave 的 30 秒失聯門檻。
+  // 本函式每次 loop() 最多送一台，完全不阻塞，並有 6 秒 wall-clock 硬上限。
   processGroupCmd();
 
   // ── 分散式輪詢 slave 狀態，每次 loop() 最多問一台（見 pollNextSlave()）──
-  // 群組指令進行期間整個讓開：例行輪詢送的 HO_PKT_STATE_REQ 也會讓 slave 回報，
-  // 而群組指令正是拿「指令之後的新回報」當證據。讓輪詢問出來的回報混進去，
-  // 等於用「我們自己問出來的回應」證明「指令有被收到」—— 那是假綠燈。
-  // 群組指令最長約 5 秒，15 秒的輪詢週期完全吃得下這段讓開。
+  // 群組指令進行期間整個讓開：輪詢送的 HO_PKT_STATE_REQ 是**單播**，它的
+  // MAC 層 ACK 會落進 onEspNowSent()，若與群組單播的 ACK 歸因閂鎖撞在同一個
+  // MAC 上，會把「查詢已送達」誤記成「群組指令已送達」（與 C1 同一類的錯誤歸因）。
+  // 讓開的長度由 GROUP_JOB_MAX_MS 硬性封頂在 6 秒（review M3）：
+  // 輪詢週期 15 秒 ＋ 6 秒停擺 ＝ 21 秒 < updateSlaveOnlineStatus() 的 30 秒
+  // 離線門檻，不可能因此把全台誤判離線。
   if (!groupCmdActive()) pollNextSlave();
 
   // ── UNPAIRALL 分批拆除，每輪 loop() 最多一台（見 processUnpairAll()）──

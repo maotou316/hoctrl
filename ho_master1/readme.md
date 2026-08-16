@@ -47,7 +47,7 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 | `on <n>` / `off <n>` | 開啟／關閉第 n 台 **slave** 的繼電器 |
 | `pulse <n>` | 點動第 n 台 slave 2 秒 |
 | `allon` / `alloff` / `allpulse` | 群組控制，含 master 自己的繼電器 |
-| `state <n>` | 要求第 n 台回報狀態 |
+| `state <n>` | 要求第 n 台回報狀態（走 `requestSlaveStateIndex()`，先取 MAC 值再送） |
 | `unpair <n>` | 解除第 n 台配對 |
 | `unpairall` | 清空整份名冊（分批執行，每輪 `loop()` 拆一台，心跳不中斷） |
 | `ch <n>` | 測試用：切換 channel，驗證 slave 重掃 |
@@ -346,8 +346,8 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 | `reset` | 清除 NVS 網路設定並重啟，回到 BLE 配網模式 |
 | `FIND_BEST_SERVER` | 主動斷開目前 MQTT 連線，把輪詢游標歸零（`resetMqttProbe()`）後重新走 `smartConnect()`。注意：`smartConnect()` 一次只試一台，第一台連不上時會由 `loop()` 每 10 秒推進一台，不會在單次呼叫裡試完全部 |
 | `HASRELAY:ON` / `HASRELAY:OFF` | 設定「本機是否有接繼電器」並存 NVS，回報狀態 |
-| `ALL:ON` | `sendCmdToAll(HO_CMD_PULSE, 2000)` —— **廣播點動 2 秒，不是持續 ON**，語義與單台 `ON` 一致；含 master 自己的繼電器 |
-| `ALL:OFF` | `sendCmdToAll(HO_CMD_OFF, 0)` —— 廣播關閉，含 master 自己的繼電器。本系統最關鍵的一條指令 |
+| `ALL:ON` | `sendCmdToAll(HO_CMD_PULSE, 2000)` —— **廣播點動 2 秒，不是持續 ON**，語義與單台 `ON` 一致；含 master 自己的繼電器。**這就是 App「全部關門」按鈕實際送的指令** |
+| `ALL:OFF` | `sendCmdToAll(HO_CMD_OFF, 0)` —— 把所有繼電器**持續斷開**，含 master 自己的。**App 不送這條**（全 repo 的 `lib/`／`test/` 沒有任何一處），目前只有序列埠 `alloff` 會走到 |
 | `SLAVES` | `markAllSlavesDirty()` ＋ 一次 `publishStatus()`。名冊會在接下來一輪內逐台重壓保留訊息，不在這裡連發 20 則 |
 | `PAIR:START` | `enterPairingMode()`，開一個 60 秒配對視窗（`PAIRING_TIMEOUT`，與 App 的 60 秒倒數對齊）。**期間可連續配對多台，配對成功不會自動退出** |
 | `PAIR:STOP` | `exitPairingMode()` |
@@ -357,57 +357,131 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 
 目前**尚未支援** `update:{JSON}` OTA 指令 —— 那是 Phase 4 才加。
 
-### 群組指令：廣播 → 事後逐台查狀態 → 對未確認者補送單播
+### 群組指令：廣播（同時）＋ 逐台單播（唯一可證明的送達）
 
 本系統是**多開門的捕捉系統，核心需求是「一次要全部關」**，關門失敗＝動物逃脫或
-未被捕捉；**「全部關」的可靠性優先於「全部開」**。
+未被捕捉；**「全部關」的可靠性優先於「全部開」**，且**誤紅可接受、誤綠不可接受**。
 
-`sendCmdToAll()` 因此**不是**逐台單播。逐台單播每台間隔 20ms，20 台就是最後一台
-比第一台晚 **400ms** 收到 —— 那不叫「同時」。改用 **ESP-NOW 廣播**
-（`FF:FF:FF:FF:FF:FF`，連送 3 次、間隔 20ms）。
+> **實際的關門路徑是 `ALL:ON`，不是 `ALL:OFF`。**
+> App 的「全部關門」按鈕送的是 `ALL:ON`（見 hoctrl 的
+> `lib/pages/device_detail_page.dart` 的 `_sendGroupCloseCommand()`）——
+> 因為韌體規格裡 `ALL:ON` ＝「廣播 pulse」＝觸發一次關門動作，與單機 `ON` 一致；
+> `ALL:OFF` 是「把所有繼電器持續斷開」，不是關門。全 App 沒有任何一處送 `ALL:OFF`。
+> 韌體的關門警語因此掛在 `HO_CMD_PULSE`（與 `HO_CMD_OFF`）上。
 
-廣播零新基礎設施也不會誤觸發別人的設備：
+`sendCmdToAll()` 因此**不是**純逐台單播（20 台會有 400ms 落差，不叫「同時」），
+而是兩段：
 
-- 廣播 peer 在 `setupEspNow()` 就註冊好了，心跳本來就走廣播。
-- slave 的 `if (!masterKnown || memcmp(masterMac, info->src_addr, 6) != 0) return;`
-  擋在 `HO_PKT_CMD` 分支之前，而 **ESP-NOW 廣播幀的 `src_addr` 仍是發送端的真實
-  MAC**（廣播只換目的位址），這道檢查對廣播與單播一體適用。
+| 段 | 動作 | 位置 |
+|---|---|---|
+| 1 | **廣播** `HO_PKT_CMD` 到 `FF:FF:FF:FF:FF:FF` 連送 3 次、間隔 20ms（同時性），master 自己的繼電器同步動作 | `sendCmdToAll()`（inline） |
+| 2 | **對每一台都送一次單播**，間隔 20ms（可證明的送達）。刻意 inline，理由見下 | `sendCmdToAll()`（inline） |
+| 3 | 未取得 MAC 層 ACK 的**補送單播**，每輪 `loop()` 一台，最多 2 趟 | `processGroupCmd()` |
 
-**但廣播沒有 ack。** `esp_now_send()` 送到廣播位址時**永遠回報成功**，那不代表任何
-一台真的收到了 ——「廣播完就回報成功」本身就是一條假綠燈。所以後兩段不是優化，
-是正確性的一部分，由 `loop()` 的 `processGroupCmd()` 非阻塞狀態機執行：
+廣播零新基礎設施也不會誤觸發別人的設備：廣播 peer 在 `setupEspNow()` 就註冊好、
+心跳本來就走廣播；slave 的
+`if (!masterKnown || memcmp(masterMac, info->src_addr, 6) != 0) return;`
+擋在 `HO_PKT_CMD` 分支之前，而 **ESP-NOW 廣播幀的 `src_addr` 仍是發送端的真實
+MAC**（廣播只換目的位址），這道檢查對廣播與單播一體適用。
 
-| 段 | 動作 |
-|---|---|
-| 1 | 廣播 `HO_PKT_CMD` 三次（真正同時），master 自己的繼電器同步動作 |
-| 2 | 靜置 `GROUP_SETTLE_MS`(600ms) 收 slave 主動回報；仍未確認的**逐台送 `HO_PKT_STATE_REQ`**（每輪 `loop()` 一台，間隔 20ms） |
-| 3 | 仍未確認的**逐台補送單播**（`sendCmdToSlaveMac()`）。2、3 段交替最多 `GROUP_MAX_SWEEPS`(4) 趟 |
+#### 只宣稱可證明的事：「已送達」可證明，「已執行」不可證明
 
-**確認條件刻意很嚴（反假綠燈）。** 本專案已抓到四條假綠燈，全部同源：*動作之前就
-存在的狀態被當成動作之後的證據*。所以一律要求「這台在 `sentAt` **之後**有一則新的
-狀態回報」，光看 `slaves[i].relay == 0` 不算數 —— 那可能是廣播前就存在的舊值，而
-這台其實早已收不到任何封包、門根本沒關。
+這是本設計最重要的一條，也是第一版被 review 判為 **C1 假綠燈**之後重寫的結果。
 
-- `HO_CMD_OFF`：新回報且 `relay == 0`
-- `HO_CMD_ON` / `HO_CMD_PULSE`：新回報且 `relay == 1`
-  （slave 收到 `HO_CMD_PULSE` 會先開繼電器再 `sendState()`，這則回報的 `relay` 必為 1）
+第一版試圖證明「指令已被執行」：靜置後看 `slaves[i].relay` 是不是預期值，並用
+master 自己送的 `HO_PKT_STATE_REQ` 去「製造」一則新回報當證據。**那是假綠燈。**
+對 `HO_CMD_OFF` 而言，「新回報」是我們自己那則查詢造成的，而 `relay == 0` 是
+slave 的**靜止預設值**（開機、點動結束、`loadSlaves()`、`addSlave()` 全都初始化
+成 0）。兩半都不是證據，AND 起來仍然不是證據 —— 一台從未收到 OFF 的 slave 會被
+判成「已確認」，而且確認是 sticky 的，假確認一旦成立就再也不會補送。
+「收不到廣播、卻收得到單播」正是邊界訊號那台的典型表現。
 
-「新回報」是強證據而不是巧合：**`ho_slave1` 沒有週期性狀態回報**，它只在收到
-`HO_PKT_CMD` 後、收到 `HO_PKT_STATE_REQ` 後、以及點動自動結束時才送 `HO_PKT_STATE`。
-為了不讓例行輪詢問出來的回報混進來當證據，**群組指令進行期間 `pollNextSlave()`
-整個讓開**（見 `loop()`）—— 用「我們自己問出來的回應」證明「指令有被收到」，
-就是同一個假綠燈模式。基於同一理由，**`HO_CMD_PULSE` 不做第 2 段的逐台查狀態**：
-點動是瞬時的，`STATE_REQ` 問回來的 `relay` 值證明不了門有沒有動過，直接補送單播
-（重送只是重觸發 2000ms 計時器，冪等且安全）。
+**根因是結構性的：`HoStatePayload` 沒有任何指令歸因欄位**（沒有「我剛執行了哪一則
+指令」的 seq／echo），所以現行協定下「指令有被執行」**原理上無法證明**。
 
-`confirmed[]` 是**只加不減**的：先確認、之後點動自然結束回報 `relay=0`，不會把
-已確認的那台又翻回未確認而造成重複點動。
+因此現在只區分兩件事：
 
-收尾一定看得見：全部確認印 `[群組] 指令 <N> 已逐台確認：…`；有未確認的印
-`⚠ [群組] 指令 <N> 未能全部確認：…` 並逐台列出 ID，`ALL:OFF` 另外多印一行
-「未確認的籠門可能仍是開的」。兩種結果都會 `markAllSlavesDirty()` 讓 App 收到每台的
-真實狀態 —— 未確認的那幾台維持名冊上最後已知的 `relay` 值（**不會被改寫成 0**），
-所以 App 端不會出現「明明沒關卻顯示已關」。
+| 事實 | 可否證明 | 依據 |
+|---|---|---|
+| **已送達** | ✅ 可證明 | 單播有 MAC 層 ACK。`esp_now_send()` 的送出回呼 `onEspNowSent()` 逐幀回報成功／失敗，`wifi_tx_info_t::des_addr` 帶目的 MAC，可逐台歸因 |
+| **已執行** | ❌ 不可證明 | 協定沒有指令歸因欄位。**不准用任何自製證據去宣稱它** |
+| 廣播是否被收到 | ❌ 不可證明 | 廣播沒有 ACK，`esp_now_send()` 永遠回報成功 |
+
+> **技術債：指令歸因欄位交 Phase 4 Task 1** 一併處理。那個 Task 本來就要動協定
+> （CRC 涵蓋標頭），是已排定的 flag-day、兩端同時重燒。在那之前不為此單獨改協定。
+
+#### ACK 歸因閂鎖
+
+`onEspNowSent()` 會被**每一次** `espNowSendTo()` 觸發，包含心跳（廣播）、
+`HO_PKT_STATE_REQ`（單播！）、`HO_PKT_UNPAIR`（單播）。若不加限制，一則
+`STATE_REQ` 的 ACK 會被誤記成「群組指令已送達」—— 與 C1 同一類的錯誤歸因。
+所以只在「剛送出群組單播、還沒收到它的回呼」的窗口內開閂，並比對目的 MAC。
+為了收掉殘留窗口，群組指令進行期間：
+
+- `loop()` 的 `pollNextSlave()` 整個讓開
+- `handleSlaveCommand()` 的 `status` 分支跳過 `requestSlaveStateIndex()`
+  （`publishSlaveStatus()` 照發，App 不會空等）
+
+歸因失敗一律往**誤紅**方向掉（回呼太晚到 → 這台被當成未送達 → 多補送一次），
+不會往誤綠掉。
+
+#### wall-clock 硬上限 `GROUP_JOB_MAX_MS = 6000`
+
+job 的長度＝趟數 ×（台數 × 每步間隔 ＋ 等待），而「每步」是一次 `loop()` 迭代 ——
+只要 `loop()` 被任何一個 10 秒級的阻塞 socket 寫入拖慢，整個 job 就會被拉長到
+不可預期。而 job 期間 `pollNextSlave()` 是讓開的，輪詢被餓死超過 30 秒就會讓
+`updateSlaveOnlineStatus()` **把全部 slave 誤判離線**。
+6 秒是刻意選的：輪詢週期 15 秒 ＋ 最多 6 秒停擺 ＝ 21 秒 < 30 秒門檻，留 9 秒餘裕。
+時間到就立刻收工並據實回報，不再補送。
+
+#### 第 2 段為什麼 inline
+
+`handleMasterCommand()` 的 `ALL:*` 分支結尾就是 `publishStatus()`，而單次阻塞
+publish 最壞是 10 秒級黑箱（**App 端依賴那則 `publishStatus()`，不能拿掉** ——
+`device_detail_page.dart` 明講「沒有排 +2 秒那一次，因為韌體 `ALL:ON` 的分支結尾
+本來就會 `publishStatus()`」）。若第一趟單播排在它後面，「一次要全部關」的補強會被
+整整延後 10 秒。代價是最多 20 × 20ms ＝ 400ms 的 inline 阻塞，全程走
+`espNowDelay()`，心跳與點動結束檢查照跑，遠低於 30 秒門檻。
+
+#### 收工輸出
+
+序列埠一定看得見，且**任何情況都會印**「不能證明已執行」那兩行：
+
+```
+[群組] 指令 <N> 收工：單播 MAC 層已送達 X／Y 台
+⚠ [群組] Z 台連「送達」都沒有（單播沒拿到 MAC 層 ACK）
+⚠ [群組]   未送達：hoban-xxxxxxxxxxxx
+⚠ [群組] W 台在執行期間離開名冊，同樣未送達
+[群組] 注意：MAC 層 ACK 只證明「封包已送達」，不能證明繼電器真的動作
+[群組] 現行 HoStatePayload 沒有指令歸因欄位，「已執行」在本版協定下無法證明（技術債：Phase 4 Task 1 補）
+⚠ [群組] 這是關門路徑：未送達的籠門必然沒關；已送達的也只代表封包到了，一律以現場確認為準，不要當成已關閉
+```
+
+達 wall-clock 上限時第一行會多一段「（達 wall-clock 上限）」。
+
+#### 收工判定必須進 MQTT（review M2）
+
+只印序列埠等於 App 沒有任何依據顯示紅色。所以：
+
+- master 狀態的 `slaves[]` 每一筆多一個 **`"grp"`**：`1` ＝ 單播拿到 MAC 層 ACK
+  （**只是送達**），`0` ＝ 沒拿到（或指令期間離開名冊），欄位不存在 ＝ 這台不在
+  最近一次群組指令的快照裡。單台的 `hoban/<slaveId>/status` 也在 `device.grp` 帶同一個值。
+- master 狀態多一個 **`"group"`** 摘要物件：
+
+```json
+"group": {"cmd":3,"age_s":2,"busy":0,"n":20,"ack":18,"noack":2,"gone":0,
+          "exec":"unprovable"}
+```
+
+`noack` 就是 App 該顯示紅色的依據。`exec` 固定 `"unprovable"`，用來擋掉
+「App 把 `ack` 當成關門成功」這條誤讀路徑。
+
+> **舊版 App 相容**：`SlaveStatus.fromJson()` 只挑它認得的 key，多出來的欄位會被
+> 忽略、不會解析失敗（hoctrl 的 `lib/models/slave_status.dart`）。
+>
+> **App 端目前仍讀 `online` 而不是 `grp`**（`master_slave_logic.dart` 的
+> `evaluateGroupCloseProgress()` 用 `slave.online`）。韌體這邊先把依據送上去，
+> App 端改讀 `grp`／`group.noack` 是另一個 Task。
 
 ### UNPAIRALL 為什麼必須分批
 
@@ -643,6 +717,15 @@ Phase 2a 的 `mqttCallback()` 是把 topic 與自己的 control topic 做完整�
 送指令走 `sendCmdToSlaveMac()`：`findSlave()` 只用來確認「這個 MAC 目前確實在
 名冊上」（純值比較），實際 `espNowSendTo()` 用的是呼叫方自己那份 MAC 副本，
 所以連「檢查與送出之間」的窗口都不存在。
+
+**精確的敘述（Task 5 review M4 更正）**：Task 5 之後**索引式的送出路徑已經消失**
+（`sendCmdToSlave(int idx, …)` 已刪除，序列埠改走只做「編號 → MAC 值複製」的
+`sendCmdToSlaveIndex()`；`requestSlaveState(int idx)` 同樣改成
+`requestSlaveStateIndex()`），而**單播的繼電器指令送出點只剩
+`sendCmdToSlaveMac()` 一個**。
+但**全檔的 `HO_PKT_CMD` 送出點其實有兩個** —— 另一個是 `sendCmdToAll()` 裡送往
+`BROADCAST_MAC` 的那次廣播，它天生不經過名冊、沒有索引可以指錯，屬於另一類。
+「送出點只剩一個」是錯的說法，不要再這樣寫。
 
 > 這正是 Task 3 review 抓到的 M4 缺陷（`unpairSlave()` 阻塞後沿用舊 `idx`）。
 > 同一類缺陷在新路徑上被重新引入過一次，改動 `slaves[]` 相關程式碼時請
