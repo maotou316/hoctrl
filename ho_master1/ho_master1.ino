@@ -1196,12 +1196,19 @@ const unsigned long GROUP_JOB_MAX_MS = 6000;
 
 enum : uint8_t {
   GROUP_JOB_IDLE = 0,
+  // review 第 4 輪：inline 第一趟單播進行中。
+  // 這個階段的存在理由見 groupCmdSnapshot()／groupNoteUnicastAck()：
+  // 「job 已啟動」的時點必須**早於** sendCmdToAll() 裡那趟 inline 單播，
+  // 否則所有以 groupCmdActive() 為條件的守衛在那 400ms 內全部是假的。
+  GROUP_JOB_ARMED,
   GROUP_JOB_WAIT,     // 等 MAC 層 ACK 回來，時間到就結算
   GROUP_JOB_SWEEP,    // 逐台補送單播（每輪 loop() 最多一台）
 };
 
 struct GroupCmdJob {
-  uint8_t phase;
+  // volatile：groupNoteUnicastAck() 在 **WiFi task** 讀它（透過 groupCmdActive()），
+  // loop() 寫它。與 slaveCount 同一個理由。
+  volatile uint8_t phase;
   uint8_t cmd;              // HoRelayCmd
   uint16_t pulseMs;
   int count;                // 快照下來的台數
@@ -1228,10 +1235,27 @@ volatile bool groupDelivered[HO_ESPNOW_MAX_SLAVES];
 // STATE_REQ 的 ACK 會被誤記成「群組指令已送達」—— 那正是 C1 的同一個錯誤
 // （拿不相干的證據去宣稱另一件事）。
 // 所以只在「剛送出群組單播、還沒收到它的回呼」這個窗口內開閂，並且比對目的 MAC。
-// 殘留窗口：若在閂開著時，剛好有另一則送往**同一個 MAC** 的封包先拿到 ACK，
-// 會被誤記。為此群組指令進行期間 pollNextSlave() 與 handleSlaveCommand() 的
-// status 分支都讓開（見 loop()／handleSlaveCommand()），剩下的同 MAC 送出只有
-// HO_PKT_UNPAIR，而那一台會被 groupRefreshRoster() 標成 gone、不列入已送達。
+//
+// ── 殘留窗口的完整清單（review 第 4 輪更正）──
+// 若在閂開著的那 1~2ms 內，剛好有另一則送往**同一個 MAC** 的單播先拿到 ACK，
+// 會被誤記。上一版寫「剩下的同 MAC 送出只有 HO_PKT_UNPAIR」是**錯的**，
+// 實際上有三條，而且後兩條那台**仍在名冊上**（gone 論證不適用）：
+//
+//   1. HO_PKT_UNPAIR（unpairSlave()）—— 那台會被 groupRefreshRoster() 標成
+//      gone，而 gone 在 groupCountAll() 與 groupDeliveryFor() 都優先於
+//      delivered，不會被算成已送達。**這條有守住。**
+//   2. 序列埠 state <n>（requestSlaveStateIndex()）—— 上一版**沒有**守衛，
+//      而 8a 的校準步驟正好教操作者用它，等於驗收程序自己製造危害。
+//      **本輪已補上 groupCmdActive() 守衛**，與 pollNextSlave()／
+//      handleSlaveCommand() 一致。
+//   3. HO_PKT_PAIR_ACK（onEspNowRecv() 的 HO_PKT_PAIR_REQ 分支）——
+//      **這條擋不掉也不該擋**：配對請求必須回覆，而且它跑在 WiFi task。
+//      ho_slave1 的 requestPairing() 沒有「已配對就不送」守衛，所以一台已配對的
+//      slave 理論上可以在那 1~2ms 內送 PAIR_REQ 進來。
+//      風險評估（誠實版）：這會讓證據的**指向性**變差（拿 PAIR_ACK 的 ACK 去
+//      認 CMD 的送達），但它**不是 C1 那種自製證據** —— MAC 層 ACK 仍然是由
+//      對方射頻產生的，master 造不出來，所以那台當下確實可達。
+//      量級：需要同一台、在同一個 1~2ms、剛好送出 PAIR_REQ。**沒有實機驗證過。**
 volatile bool groupAckArmed = false;
 volatile int groupAckIdx = -1;
 uint8_t groupAckMac[6];   // loop() 先寫值再開閂；WiFi task 只在閂開著時讀
@@ -1240,6 +1264,17 @@ bool groupCmdActive() { return groupJob.phase != GROUP_JOB_IDLE; }
 
 // 由 onEspNowSent() 呼叫（WiFi task）。desAddr 可能為 nullptr（防禦性檢查）。
 void groupNoteUnicastAck(const uint8_t* desAddr, bool ok) {
+  // ── review 第 4 輪：結構性防線 —— job 之外一律拒絕寫入 ──
+  // 「只有群組單播才會開閂」原本只是一個**約定**（靠每個開閂點自律）。
+  // 這一行把它變成**結構**：不在 job 內就不可能寫到 groupDelivered[]，
+  // 順帶殺掉「跨 job 的過期回呼」那條理論殘留。
+  //
+  // **這一行的位置有陷阱**：groupCmdSnapshot() 曾經把 phase 設成 IDLE，而
+  // sendCmdToAll() 要到 inline 第一趟單播跑完才設 WAIT —— 若沿用那個順序，
+  // 第一趟全程 groupCmdActive() 都是 false，這行會把第一趟的 ACK 全部丟掉，
+  // 變成**大規模誤紅**。所以 groupCmdSnapshot() 已改成在快照完成時就設
+  // GROUP_JOB_ARMED（見該函式），「已啟動」的時點前移到 inline 段之前。
+  if (!groupCmdActive()) return;
   if (!groupAckArmed) return;
   if (desAddr == nullptr) return;
   // 廣播的送出回呼永遠回報成功，明確排除 —— 把它當送達就是假綠燈
@@ -1372,6 +1407,14 @@ void processGroupCmd() {
     return;
   }
 
+  // inline 第一趟單播還在跑（sendCmdToAll() 內），loop() 不該插手。
+  // 正常情況下這個分支**進不來** —— espNowDelay() 只跑 maintainEspNow()，
+  // 不跑 loop()，所以 sendCmdToAll() 一定會在下一次 loop() 之前把 phase 推到
+  // WAIT 或 IDLE。留這個分支是為了：萬一未來有人讓 loop() 在那段期間跑起來，
+  // 也不會半途接手一個還沒送完的 job；而真的卡住時，上面的 wall-clock 上限
+  // 會在 6 秒後把它收掉（那個檢查排在本分支之前，刻意的）。
+  if (groupJob.phase == GROUP_JOB_ARMED) return;
+
   groupRefreshRoster();
 
   if (groupJob.phase == GROUP_JOB_WAIT) {
@@ -1435,6 +1478,18 @@ void groupCmdSnapshot(uint8_t cmd, uint16_t pulseMs) {
   groupJob.cursor = 0;
   groupJob.startedAt = millis();
   groupJob.everRan = true;
+
+  // ── review 第 4 輪：「已啟動」的時點必須前移到 inline 第一趟單播之前 ──
+  // 舊順序是「snapshot 設 IDLE → 廣播 → inline 單播 400ms → 才設 WAIT」，
+  // 於是那 400ms 內 groupCmdActive() 全程是 false，導致：
+  //   (a) groupNoteUnicastAck() 的新守衛會把第一趟 ACK 全丟掉（大規模誤紅）；
+  //   (b) pollNextSlave() 與 handleSlaveCommand() 的兩道讓路守衛**其實是失效的**
+  //       —— 它們之所以沒出事，只是因為 espNowDelay() 內部只跑 maintainEspNow()、
+  //       不跑 loop() 也不跑 mqttClient.loop()，所以那兩條路徑實務上進不來。
+  //       **那是巧合，不是設計。** 現在時點前移，守衛在 400ms 內是真的成立。
+  // 必須排在所有欄位寫完之後：WiFi task 一看到非 IDLE 就會開始信任這份 job。
+  // n == 0 時不進入 job（沒有任何一台要追），phase 維持 IDLE。
+  if (n > 0) groupJob.phase = GROUP_JOB_ARMED;
 }
 
 void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
@@ -1471,6 +1526,8 @@ void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
   }
 
   if (groupJob.count <= 0) {
+    // groupCmdSnapshot() 在 n == 0 時本來就沒有進入 job（phase 維持 IDLE），
+    // 這裡再寫一次是明示不變式，不是修補。
     groupJob.phase = GROUP_JOB_IDLE;   // 名冊是空的，沒有東西要送
     Serial.println("[群組] 名冊是空的，只有 master 自己動作");
     return;
@@ -1825,7 +1882,18 @@ void handleSerialCommand(const String& line) {
   } else if (verb == "allpulse") {
     sendCmdToAll(HO_CMD_PULSE, 2000);
   } else if (verb == "state") {
-    requestSlaveStateIndex(arg);
+    // review 第 4 輪：這條缺了與 pollNextSlave()／handleSlaveCommand() 一致的
+    // 守衛。它送的是**單播** HO_PKT_STATE_REQ，其 MAC 層 ACK 會落進
+    // onEspNowSent()；若與群組單播的 ACK 歸因閂鎖撞在同一個 MAC 上，
+    // 會把「查詢已送達」誤記成「群組指令已送達」（與 C1 同一類的錯誤歸因）。
+    // 而這條特別要守：回歸清單 8a 的校準步驟正好教操作者用 state <n> 來判斷
+    // 訊號有沒有調到不對稱可達的位置 —— **驗收程序本身會製造這個危害**。
+    // 群組指令有 6 秒 wall-clock 硬上限，最多只擋這麼久。
+    if (groupCmdActive()) {
+      Serial.println("[指令] 群組指令進行中，稍後再試 state（避免污染送達判定）");
+    } else {
+      requestSlaveStateIndex(arg);
+    }
   } else if (verb == "unpair") {
     unpairSlave(arg);
   } else if (verb == "unpairall") {

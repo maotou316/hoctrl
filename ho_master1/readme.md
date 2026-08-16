@@ -416,14 +416,42 @@ slave 的**靜止預設值**（開機、點動結束、`loadSlaves()`、`addSlav
 `HO_PKT_STATE_REQ`（單播！）、`HO_PKT_UNPAIR`（單播）。若不加限制，一則
 `STATE_REQ` 的 ACK 會被誤記成「群組指令已送達」—— 與 C1 同一類的錯誤歸因。
 所以只在「剛送出群組單播、還沒收到它的回呼」的窗口內開閂，並比對目的 MAC。
-為了收掉殘留窗口，群組指令進行期間：
 
-- `loop()` 的 `pollNextSlave()` 整個讓開
-- `handleSlaveCommand()` 的 `status` 分支跳過 `requestSlaveStateIndex()`
-  （`publishSlaveStatus()` 照發，App 不會空等）
+**同 MAC 單播的完整清單（第 4 輪 review 更正）。** 上一版寫「剩下的同 MAC 送出
+只有 `HO_PKT_UNPAIR`」**是錯的**，實際上有三條，而且後兩條那台**仍在名冊上**
+（`gone` 論證不適用）：
+
+| 來源 | 狀態 |
+|---|---|
+| `HO_PKT_UNPAIR`（`unpairSlave()`） | 守住了 —— 那台會被 `groupRefreshRoster()` 標成 `gone`，而 `gone` 在 `groupCountAll()` 與 `groupDeliveryFor()` **都優先於** `delivered` |
+| `pollNextSlave()` 的 `HO_PKT_STATE_REQ` | 守住了 —— `loop()` 用 `groupCmdActive()` 整個讓開 |
+| `handleSlaveCommand()` 的 `status` 分支 | 守住了 —— 跳過 `requestSlaveStateIndex()`，`publishSlaveStatus()` 照發，App 不空等 |
+| **序列埠 `state <n>`** | 上一版**漏了**。特別諷刺：回歸清單 8a 的校準步驟正好教操作者用它 ——**驗收程序自己製造危害**。**第 4 輪已補上同樣的 `groupCmdActive()` 守衛** |
+| **`HO_PKT_PAIR_ACK`**（`onEspNowRecv()` 的 `HO_PKT_PAIR_REQ` 分支） | **擋不掉也不該擋**：配對請求必須回覆，且它跑在 WiFi task。`ho_slave1` 的 `requestPairing()` 沒有「已配對就不送」守衛，所以已配對的 slave 理論上能在那 1~2ms 內送 `PAIR_REQ` 進來 |
+
+最後那條的誠實評估：它會讓證據的**指向性**變差（拿 `PAIR_ACK` 的 ACK 去認 `CMD`
+的送達），但**不是 C1 那種自製證據** —— MAC 層 ACK 仍由對方射頻產生、master 造不
+出來，所以那台當下確實可達。量級上需要同一台、在同一個 1~2ms、剛好送出
+`PAIR_REQ`。**沒有實機驗證過。**
 
 歸因失敗一律往**誤紅**方向掉（回呼太晚到 → 這台被當成未送達 → 多補送一次），
 不會往誤綠掉。
+
+**「job 之外一律拒絕寫入」是結構而不是約定（第 4 輪 review）。**
+`groupNoteUnicastAck()` 開頭多一道 `if (!groupCmdActive()) return;`，
+把「只有群組單播才會開閂」從每個開閂點的自律變成結構保證，順帶殺掉「跨 job 的
+過期回呼」那條理論殘留。
+
+> **這一行的位置有陷阱。** `groupCmdSnapshot()` 原本把 phase 設成 `IDLE`，而
+> `sendCmdToAll()` 要到 inline 第一趟單播跑完才設 `WAIT` —— 照抄會讓**第一趟
+> 全程 `groupCmdActive()` 為 false**，ACK 全被丟掉，變成**大規模誤紅**。
+> 所以先新增 `GROUP_JOB_ARMED` 階段、把「已啟動」的時點前移到快照完成的當下，
+> 再加守衛。
+>
+> 附帶收穫：那 400ms 內的兩道讓路守衛（`pollNextSlave()`／`handleSlaveCommand()`）
+> **原本其實是失效的**，只因為 `espNowDelay()` 只跑 `maintainEspNow()`、不跑
+> `loop()` 也不跑 `mqttClient.loop()`，那兩條路徑實務上進不來 ——
+> **那是巧合不是設計**。時點前移之後，它們在那 400ms 內是真的成立。
 
 **閂一定要關得掉（review N1）。** 只防「開閂那一端」是不夠的：
 `groupSendUnicast()` 是先開閂再送，而 `sendCmdToSlaveMac()` 在
