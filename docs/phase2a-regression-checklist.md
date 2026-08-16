@@ -187,8 +187,14 @@ Phase 1 channel 同步機制第一次面對真實情境（AP 決定 channel，�
 **預期序列埠輸出（master）**：
 ```
 [MQTT] 嘗試 mqttgo.io …
-[MQTT] 已連線 mqttgo.io，訂閱 hoban/hoban-a0b1c2d3e4f5/control
+[MQTT] 已連線 mqttgo.io
+[MQTT] 已訂閱 hoban/hoban-a0b1c2d3e4f5/control
 ```
+> **Phase 2b Task 4 更新**：訂閱動作已從連線函式抽到
+> `subscribeAllControlTopics()`，所以「已連線」與「已訂閱」變成**兩行**
+> （原本是同一行的 `[MQTT] 已連線 X，訂閱 Y`）。
+> 若名冊上有 slave，後面還會逐台印 `[代理] 已訂閱 hoban/<slaveId>/control`，
+> 每台一行 —— 這是正常輸出，不是失敗。
 之後每 10 秒應收到一則 retain 的 status 訊息（`lastStatusPub` 間隔），
 JSON 內容見第 6 項。
 
@@ -351,9 +357,12 @@ status 訊息的變化。
 ```
 [MQTT] 收到指令: FIND_BEST_SERVER
 [MQTT] 嘗試自訂伺服器 mqttgo.io …
-[MQTT] 已連線自訂伺服器 mqttgo.io，訂閱 hoban/hoban-a0b1c2d3e4f5/control
+[MQTT] 已連線自訂伺服器 mqttgo.io
+[MQTT] 已訂閱 hoban/hoban-a0b1c2d3e4f5/control
 ```
 （可能又連回同一台，這是正常行為，不是失敗）
+> **Phase 2b Task 4 更新**：同第 5 項的說明，「已連線」與「已訂閱」現在是兩行；
+> 名冊上有 slave 時後面會再逐台印 `[代理] 已訂閱 …`。
 
 ### 9b. 真正要測的情況：broker 不可達（本項的重點）
 
@@ -451,8 +460,10 @@ status 訊息的變化。
 **預期序列埠輸出（master）**：
 ```
 [MQTT] 嘗試自訂伺服器 自訂broker位址 …
-[MQTT] 已連線自訂伺服器 自訂broker位址，訂閱 hoban/hoban-a0b1c2d3e4f5/control
+[MQTT] 已連線自訂伺服器 自訂broker位址
+[MQTT] 已訂閱 hoban/hoban-a0b1c2d3e4f5/control
 ```
+> **Phase 2b Task 4 更新**：同第 5 項的說明，「已連線」與「已訂閱」現在是兩行。
 
 **失敗判定**：若看到 `[MQTT] 自訂伺服器 X 失敗，state=X` 反覆出現，且已確認
 broker 端帳密設定無誤，代表密碼在某處被截斷，NVS 欄位長度或寫入邏輯有回歸。

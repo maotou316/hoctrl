@@ -278,7 +278,8 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 | BLE 配網中 | 有（`loop()` 只跳過 WiFi/MQTT 區塊） | 有，開機時由 `restoreEspNowChannelForOfflineBoot()` 從 NVS `homaster/espch` 切回（前提：NVS 已有該鍵） | < 1 秒 |
 | WiFi 關聯中 | 有（等待迴圈走 `maintainEspNow()`） | 以已知 channel 起始掃描（AP 在該 channel 時一擊命中，不在時可能續掃，見上節）；連續失敗 10 次後的那一次全頻掃描例外 | < 1 秒（間隔已加密到 200ms） |
 | MQTT 連線中 | **沒有** —— `mqttClient.connect()` 是不可中斷的阻塞呼叫 | 不影響 channel | **約 18 秒**（DNS `getaddrinfo()` 無 timeout 參數，由 lwIP `DNS_MAX_RETRIES` 決定約 15 秒＋TCP 3 秒） |
-| MQTT 已連線但 socket 寫入卡住（Task 3 review 發現） | 有——`publishJsonDoc()` 在阻塞呼叫前後各補一次 `maintainEspNow()` | 不影響 channel | **約 10 秒**／每輪 loop()。`PubSubClient::setSocketTimeout(3)` 只管等 CONNACK 與 `readByte()`，對 `publish()` 完全無效；`publish()` 實際走 `NetworkClient::write()` 的 10 次重試 × 1 秒 `select()`，卡住時最壞吃滿 10 秒。典型觸發：AP 正常但 WAN 斷線，本地 socket 仍是 `ESTABLISHED`、`mqttClient.connected()` 仍回 true，代發照發，直到 TCP 送出緩衝塞滿。已用 `mqttPublishBudgetUsed` 名額守衛把每輪 loop() 限制在最多一次這種阻塞，見「代發 slave 狀態」一節 |
+| MQTT 已連線但 socket 寫入卡住（Task 3 review 發現） | 有——`publishJsonDoc()` 在阻塞呼叫前後各補一次 `maintainEspNow()` | 不影響 channel | **約 10 秒**／每輪 loop()。`PubSubClient::setSocketTimeout(3)` 只管等 CONNACK 與 `readByte()`，對 `publish()` 完全無效；`publish()` 實際走 `NetworkClient::write()`：**10 次重試 × 1 秒 `select()`，但部分寫入會重置計數，故非硬上限**（見下方殘存風險）。典型觸發：AP 正常但 WAN 斷線，本地 socket 仍是 `ESTABLISHED`、`mqttClient.connected()` 仍回 true，代發照發，直到 TCP 送出緩衝塞滿。已用 `mqttPublishBudgetUsed` 名額守衛把每輪 loop() 限制在最多一次這種阻塞，見「代發 slave 狀態」一節 |
+| `mqttClient.loop()` 內部的 keepalive `PINGREQ`（Task 4 起明確夾住） | 有——`loop()` 在 `mqttClient.loop()` 前後各補一次 `maintainEspNow()` | 不影響 channel | **約 10 秒**（同一套 `NetworkClient::write()`，同樣非硬上限）。`setKeepAlive(30)` 下**每 30 秒觸發一次，是例行事件不是偶發**：`PubSubClient::loop()` 的條件是 `(t - lastInActivity > keepAlive*1000) \|\| (t - lastOutActivity > ...)`，是 OR，而 `lastInActivity` 只在真的**收到**封包時更新，broker 平時不主動送東西，所以即使我們每 10 秒 publish 一次也擋不住它 |
 | `espNowDelay()` 各處等待 | 有 | 不影響 channel | < 1 秒 |
 
 因此 `smartConnect()` 刻意設計成**一次呼叫只嘗試一台 broker**，由 `loop()` 的
@@ -292,9 +293,20 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 - 連續 10 次關聯失敗後的那一次全頻掃描，期間心跳命中率降到約 1/13
   （已用 200ms 加密心跳把 30 秒內全數落空的機率壓到 6×10⁻⁶ 量級）
 - MQTT 阻塞的 18 秒是估算值上界，若某個 broker 的 DNS 行為更慢仍有超出的可能
-- MQTT 已連線但 socket 寫入卡住的 10 秒同樣是估算值上界（`NetworkClient::write()`
-  的重試次數與 `select()` 逾時皆為函式庫寫死的常數，實測若函式庫版本更新導致
-  這兩個數字改變，需要重新推算）
+- MQTT 已連線但 socket 寫入卡住的 10 秒是估算值，**而且不是硬上限**
+  （Task 3 review N1 更正）：`NetworkClient::write()` 的迴圈在
+  「`send()` 回傳 > 0 但還沒寫完」的分支裡會執行
+  `retry = WIFI_CLIENT_MAX_WRITE_RETRY;` 把重試計數器**重置回 10**，
+  所以每輪只擠得出幾個 byte 的病態 socket 理論上可以把單次 `write()`
+  拖得比 10 秒更久。10 秒是典型值（完全寫不進去、10 次 `select()` 全部逾時），
+  不是保證。另外重試次數與 `select()` 逾時皆為函式庫寫死的常數，函式庫版本
+  更新導致這兩個數字改變時需要重新推算
+- **單輪 `loop()` 的最壞心跳空窗約 11 秒**（10 秒級的黑箱 ＋ 最多 1 秒的心跳
+  間隔餘裕）。Task 3 的報告與 commit message 寫「約 20 秒」是**過度悲觀且錯誤**
+  的推演——它把 `PINGREQ` 黑箱與 `publish()` 黑箱視為連續的一段空窗，但兩者
+  之間必定隔著一次 `maintainEspNow()`，所以是兩段各約 10 秒的獨立視窗，不是
+  疊加。Task 4 進一步把 `mqttClient.loop()` 前後也明確夾上 `maintainEspNow()`，
+  讓這個切分從「呼叫順序的巧合」變成結構性保證（**不會讓 11 秒變小**）
 
 ## MQTT
 
@@ -305,10 +317,11 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 | `hoban/<deviceId>/status` | 發布 | master 自身狀態回報，QoS1、retain，每 10 秒一次；LWT 也發到這個 topic（`status:"offline"`） |
 | `hoban/<deviceId>/control` | 訂閱 | App／使用者送控制指令 |
 | `hoban/<slaveDeviceId>/status` | 發布（代發） | master 用每台 slave 的 MAC 代發它的狀態，retain。見下方「代發 slave 狀態」 |
+| `hoban/<slaveDeviceId>/control` | 訂閱（代訂） | master 代名冊上每一台 slave 訂閱，收到的指令轉成 ESP-NOW 送給對應的 slave。見下方「代訂閱與指令轉發」 |
 
 `<deviceId>` 格式為 `hoban-<MAC位址>`，與 BLE 裝置名稱相同；`<slaveDeviceId>` 同格式，用 slave 自己的 MAC。
 
-### 控制指令表
+### 控制指令表（master 自己的 `hoban/<masterId>/control`）
 
 | 指令 | 行為 |
 |---|---|
@@ -319,8 +332,23 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 | `FIND_BEST_SERVER` | 主動斷開目前 MQTT 連線，把輪詢游標歸零（`resetMqttProbe()`）後重新走 `smartConnect()`。注意：`smartConnect()` 一次只試一台，第一台連不上時會由 `loop()` 每 10 秒推進一台，不會在單次呼叫裡試完全部 |
 | `HASRELAY:ON` / `HASRELAY:OFF` | 設定「本機是否有接繼電器」並存 NVS，回報狀態 |
 
-Phase 2a **尚未支援** `ALL:*` 群組指令、`PAIR:*` / `UNPAIR:*` 針對 slave 的指令、
-`update:{JSON}` OTA 指令 —— 這些是 Phase 2b／Phase 4 才加。
+目前**尚未支援** `ALL:*` 群組指令、`PAIR:*` / `UNPAIR:*` 針對 slave 的指令、
+`update:{JSON}` OTA 指令 —— 這些是 Phase 2b Task 5／Phase 4 才加。
+
+### 代理指令表（slave 的 `hoban/<slaveId>/control`，Phase 2b Task 4）
+
+| 指令 | 行為 |
+|---|---|
+| `ON` | `sendCmdToSlave(idx, HO_CMD_PULSE, 2000)` —— **點動 2 秒，不是持續開啟** |
+| `OFF` | `sendCmdToSlave(idx, HO_CMD_OFF, 0)` |
+| `status` | 先用名冊上目前已知的狀態立刻代發一則（`publishSlaveStatus()`），同時 `requestSlaveState()` 向 slave 要一次最新狀態，回來時 `dirty` 會觸發第二則代發 |
+| 其他 | 序列埠印 `[代理] <slaveId> 不支援的指令: …`，不做任何動作 |
+
+`ON` 送 `HO_CMD_PULSE` 而不是 `HO_CMD_ON` 是刻意的：App 對一般 hoRelay 設備送的
+`ON` 語義是「開門」＝點動一次，master 自己的 `ON` 分支也是 `pulseRelay(2000)`。
+slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否則
+「開保險 → 關門 → 關保險」三段鎖流程對 slave 的行為會與其他設備不同。
+**持續開啟只保留給序列埠的 `on <n>`**（現場除錯用）。
 
 ### 狀態 JSON 範例
 
@@ -389,8 +417,9 @@ master 除了自己的 `hoban/<deviceId>/status`，還會用**每台 slave 的 M
 `PubSubClient::write()` → `_client->write(buf, len)`，`NetworkClient::write()`
 內部是 `retry = WIFI_CLIENT_MAX_WRITE_RETRY(10)` 迴圈，每輪 `select()` 的
 `tv_usec` 硬編碼 1 秒；`send()` 帶 `MSG_DONTWAIT`，`setSocketTimeout()` 設的
-`SO_SNDTIMEO` 對它無效。**單次 `mqttClient.publish()` 最壞卡 10 秒，不是 3 秒**
-（見上方「ESP-NOW 心跳的實際保證」表格新增的一列）。觸發情境：AP 正常但 WAN
+`SO_SNDTIMEO` 對它無效。**單次 `mqttClient.publish()` 的典型上界是 10 次重試
+× 1 秒 `select()` ＝ 10 秒，不是 3 秒；而且部分寫入會重置重試計數，所以 10 秒
+不是硬上限**（見上方「ESP-NOW 心跳的實際保證」表格與其下方的殘存風險）。觸發情境：AP 正常但 WAN
 斷線，`NetworkClient::connected()` 仍回 true（本地 socket 還在 `ESTABLISHED`），
 代發照發，直到 lwIP 的 `TCP_SND_BUF`（約 5.7KB）被塞滿後每次 write 都吃滿 10 秒。
 
@@ -402,9 +431,13 @@ master 自己 + 20 台 slave = 21 個 topic，若背靠背發布，21 個連發�
    真正呼叫 `mqttClient.publish()` 前會佔用這個旗標；本輪已用掉的話，
    `publishStatus()`／`slaveStatusScheduler()`／`processPendingUnpairPublish()`
    之中排在後面的呼叫方一律讓位給下一輪，**保證每輪 loop() 最多只發生一次
-   會阻塞的 publish**，把原本可能疊加成 20~30 秒的空窗壓回單次最壞 10 秒。
+   會阻塞的 publish**，把原本可能疊加成 20~30 秒的空窗壓回單次約 10 秒。
 3. **`publishJsonDoc()` 內部在阻塞呼叫前後各補一次 `maintainEspNow()`**，
    成本近乎零，確保進入 10 秒黑箱前剛發過心跳、出來立刻再發一次。
+4. **（Task 4 新增）`loop()` 也把 `mqttClient.loop()` 前後夾上 `maintainEspNow()`**，
+   把函式庫內部每 30 秒一次的 keepalive `PINGREQ` 黑箱同樣切成獨立視窗。
+   **這不會讓最壞空窗變小**（單輪仍約 11 秒），但它讓「`PINGREQ` 黑箱與
+   `publish()` 黑箱之間必定隔著一次心跳」這件事從呼叫順序的巧合變成結構性保證。
 
 一輪例行輪播「大約」15 秒（`SLAVE_STATUS_CYCLE_MS`），與 `pollNextSlave()`
 更新 slave 資料的節奏對齊 —— 代發比資料更新還快是純浪費頻寬。**review 更正**：
@@ -426,7 +459,7 @@ master 自己 + 20 台 slave = 21 個 topic，若背靠背發布，21 個連發�
 會把它標記離線並設 `dirty`，下一輪代發就會送出 `status:"offline"`，避免 App
 一直顯示上線。解除配對時（無論是序列埠 `unpair <n>` 還是 slave 主動送
 `HO_PKT_UNPAIR`）也會補發一次 offline，否則 broker 上會留下永遠在線的幽靈設備。
-序列埠 `unpair <n>` 這條路徑上，`publishSlaveOffline()` 可能阻塞最壞 10 秒，
+序列埠 `unpair <n>` 這條路徑上，`publishSlaveOffline()` 可能阻塞約 10 秒，
 期間若另一台 slave 經 ESP-NOW 主動解除配對造成陣列搬移，`unpairSlave()`
 會在阻塞呼叫後改用先前存好的 MAC 重新 `findSlave()`，不會用過期的索引刪錯人。
 
@@ -436,6 +469,53 @@ master 自己 + 20 台 slave = 21 個 topic，若背靠背發布，21 個連發�
 不會被代發成 offline（沒有 loop() 可以跑，代發機制本身也停了）。這個缺口
 由 App 端用 `via` 欄位彌補：master 若本身離線，其底下所有 slave 都應視為
 狀態不明，不能單看 slave 自己那則 retain 的 `"online"` 就判斷實際在線。
+
+### 代訂閱與指令轉發（Phase 2b Task 4）
+
+代發狀態的反方向：master 代名冊上每一台 slave 訂閱 `hoban/<slaveId>/control`，
+收到的 MQTT 純文字指令轉成 ESP-NOW 封包送給對應的 slave（指令內容見上方
+「代理指令表」）。slave 沒有 WiFi，master 是它與 App 之間唯一的橋。
+
+**topic 比對：解析出 MAC → 查名冊，不維護 topic 字串表。**
+Phase 2a 的 `mqttCallback()` 是把 topic 與自己的 control topic 做完整字串相等，
+現在同時代理最多 20 台，一台一條字串去比對等於要維護一份 21 條的 topic 表
+（21 × 33 ＝ 693 bytes RAM），而且配對／解除配對時得同步維護 ——
+那是名冊之外的第二份真相，遲早會不一致。名冊已經是唯一真相。
+`parseControlTopic()` 是純長度檢查 + hex 解析（O(1)），之後 `findSlave()`
+最多 20 次 6 bytes 的 `memcmp` ＝ 微秒級，而且只在收到 MQTT 訊息時才跑。
+
+**逐台訂閱，不用萬用字元 `hoban/+/control`。**
+預設清單裡有三台是公用 broker（emqx.io、hivemq.com、eclipseprojects.io），
+`hoban/+/control` 會收到全世界所有 hoban 設備的控制訊息 —— 雖然
+`findSlave()` 會全部過濾掉，但流量與被動接收他人指令的風險完全不必要。
+
+**訂閱動作一律回到 `loop()` context 才做。**
+`mqttClient.subscribe()`／`unsubscribe()` 會動 socket，與 `loop()` 裡的
+`mqttClient.loop()` 是明確的競態。而配對成功（`addSlave()`）發生在
+`onEspNowRecv()` 裡，屬 WiFi task —— 理由與代發狀態不能在 callback 裡直接發
+完全相同。所以 `addSlave()` 只設 `pendingSubscribeRefresh = true;`，
+`loop()` 看到旗標才呼叫 `subscribeAllControlTopics()` 全量重訂
+（重複訂閱同一個 topic 對 broker 是冪等的，所以不必記錄是哪一台）。
+
+**訂閱的維護點**：
+
+| 時機 | 動作 |
+|---|---|
+| 剛連上 broker（`quickConnectToIndex()`／`quickConnectCustom()`） | `subscribeAllControlTopics()` 一次訂完 master 自己 ＋ 名冊上每一台；接著 `publishStatus()` 與 `markAllSlavesDirty()`（新 broker 上沒有任何 retain，整份名冊要重壓一次） |
+| 配對成功（`addSlave()`，WiFi task） | 只設 `pendingSubscribeRefresh`，由 `loop()` 重跑 `subscribeAllControlTopics()` |
+| 序列埠 `unpair <n>`（`unpairSlave()`） | `publishSlaveOffline()` 之後、陣列搬移之前 `unsubscribeSlaveControlTopic()` |
+| slave 主動解除（`processPendingUnpairPublish()`） | 補發最後一則 offline 之後 `unsubscribeSlaveControlTopic()` |
+
+`subscribeAllControlTopics()` 最多做 21 次 `subscribe()`，每次都是一小段 TCP
+寫入，但走的仍是會卡住的 `NetworkClient::write()`，所以迴圈內與每次
+`subscribe()`／`unsubscribe()` 前後都補 `maintainEspNow()`，理由與
+`publishJsonDoc()` 相同。
+
+**已知限制**：`unsubscribeSlaveControlTopic()` 在 MQTT 未連線時直接跳過
+（沒有連線就沒有訂閱可退，也退不了）。若解除配對正好發生在斷線期間，
+重連後的 `subscribeAllControlTopics()` 只會訂閱名冊上還在的台數，
+不會殘留舊訂閱 —— 本韌體呼叫 `mqttClient.connect(...)` 時最後一個參數
+`cleanSession` 傳 `true`，broker 不保留上一個 session 的訂閱清單。
 
 ## 與 ho_relay2 的差異
 
@@ -453,12 +533,15 @@ master 自己 + 20 台 slave = 21 個 topic，若背靠背發布，21 個連發�
 
 ## 已知風險
 
-### 1. WROOM flash 用量偏緊（82.7%）
+### 1. WROOM flash 用量偏緊（83.3%）
 
-實測 1,682,707 / 2,031,616 bytes（app0 分區，82.8%），餘裕僅約 341KB。
+Phase 2b Task 4 後實測 1,691,923 / 2,031,616 bytes（app0 分區，**83.28%**），
+餘裕約 331KB。**注意 `arduino-cli` 印的百分比（10%）分母是 16MB 的預設值，
+不是本 sketch 實際使用的 `partitions.csv` 的 app0（2,031,616 bytes），
+要自己換算。**
 Phase 4 要加轉送 OTA 的程式碼前，務必先跑 `.\flash.ps1 -Model master` 確認還編得過；
 若餘裕不足，需考慮用 NimBLE 取代目前的 Bluedroid（BLE stack 是兩板差距的主因，
-C3 同一份 `partitions.csv` 下用量僅約 63.8%）。
+C3 同一份 `partitions.csv` 下用量僅約 64.5%）。
 
 ### 2. WiFi 連線沒有 auth mode 退避
 
