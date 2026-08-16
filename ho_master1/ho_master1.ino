@@ -1076,18 +1076,22 @@ void exitPairingMode() {
 // slaves[idx].mac。即使檢查與送出之間陣列剛好搬移，送出的目標仍然是被驗證
 // 過的那一台；最壞情況只是對一台剛剛解除配對的設備多送一則指令，而它的
 // peer 已被 esp_now_del_peer() 移除，esp_now_send() 會直接失敗，無副作用。
-void sendCmdToSlaveMac(const uint8_t mac[6], HoRelayCmd cmd, uint16_t pulseMs) {
+// 回傳值（review N1 新增）：封包**有沒有真的被交給 esp_now_send()**。
+// 群組指令的 ACK 歸因閂鎖靠它判斷「這次會不會有送出回呼」——不會有回呼就必須
+// 立刻關閂，否則閂會一直開著，把後續任何一則送往同一 MAC 的 ACK 誤記成
+// 「群組指令已送達」。既有呼叫端忽略回傳值不受影響。
+bool sendCmdToSlaveMac(const uint8_t mac[6], HoRelayCmd cmd, uint16_t pulseMs) {
   char id[20];
   hoFormatDeviceId(mac, id);
   if (findSlave(mac) < 0) {
     Serial.printf("[控制] %s 已不在名冊上，放棄送出指令 %u\n", id, (uint8_t)cmd);
-    return;
+    return false;
   }
   HoCmdPayload payload;
   payload.cmd = (uint8_t)cmd;
   payload.pulseMs = pulseMs;
   Serial.printf("[控制] 送指令 %u 給 %s\n", (uint8_t)cmd, id);
-  espNowSendTo(mac, HO_PKT_CMD, &payload, sizeof(payload));
+  return espNowSendTo(mac, HO_PKT_CMD, &payload, sizeof(payload));
 }
 
 // 序列埠專用：把 `list` 顯示的編號轉成 MAC，之後一律走 sendCmdToSlaveMac()。
@@ -1256,7 +1260,14 @@ void groupSendUnicast(int i) {
   memcpy(groupAckMac, groupJob.macs[i], 6);
   groupAckIdx = i;
   groupAckArmed = true;
-  sendCmdToSlaveMac(groupJob.macs[i], (HoRelayCmd)groupJob.cmd, groupJob.pulseMs);
+  // review N1 的根因修正：sendCmdToSlaveMac() 在「已不在名冊上」或
+  // esp_now_send() 回錯時**根本不送**，那次就不會有送出回呼來關閂。
+  // 閂若留著開，下一則送往同一 MAC 的封包（收工後恢復的 pollNextSlave()
+  // 所送的 HO_PKT_STATE_REQ 最典型）會被誤記成「群組指令已送達」，
+  // 讓序列埠已經印過的「未送達」在 MQTT 上被翻成綠的。送不出去就當場關閂。
+  if (!sendCmdToSlaveMac(groupJob.macs[i], (HoRelayCmd)groupJob.cmd, groupJob.pulseMs)) {
+    groupAckArmed = false;
+  }
 }
 
 // 把「執行期間離開名冊」的標記更新一次。這些台**不計為已送達**。
@@ -1326,6 +1337,21 @@ void groupFinishJob(bool hitTimeCap) {
     Serial.println("⚠ [群組] 這是關門路徑：未送達的籠門必然沒關；已送達的也只代表"
                    "封包到了，一律以現場確認為準，不要當成已關閉");
   }
+
+  // ── review N1：收工一定要關閂 ──
+  // 少了這一行就是第八條假綠燈，機制齊全、只差一個觸發條件：
+  // groupSendUnicast() 是「先開閂再送」，但 sendCmdToSlaveMac() 在 findSlave()
+  // 失敗或 esp_now_send() 回錯時**根本不送**，於是那次開的閂沒有回呼來關它，
+  // 會**跨過收工繼續開著**。而收工當輪 pollNextSlave() 立刻恢復，它送的
+  // HO_PKT_STATE_REQ 是單播，只要命中同一個 MAC 就會把 groupDelivered[] 設成
+  // true —— 而 groupDelivered[] 在 job 結束後**仍持續被 MQTT 讀取**
+  // （groupDeliveryFor()／appendGroupResult()）。結果是序列埠誠實印了「未送達」，
+  // 下一則 status 卻把那台的 "grp" 由 0 翻成 1、"noack" 減成 0。
+  //
+  // 這正是 ACK 歸因閂鎖本來要防的那件事 —— 第一版只防了開閂那一端。
+  // 真正的根因（送不出去卻開了閂）已在 groupSendUnicast() 一併堵掉，這裡是
+  // 第二道：無論閂為什麼還開著，收工一律關閉。
+  groupAckArmed = false;
 
   // 讓 App 收到每一台的真實狀態與本次的送達結果（見 appendSlavesArray()／
   // buildStatusDoc() 的 "grp" 與 "group" 欄位，review M2）
@@ -1412,10 +1438,14 @@ void groupCmdSnapshot(uint8_t cmd, uint16_t pulseMs) {
 }
 
 void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
-  // 這一行的格式刻意不動：docs/phase1-regression-checklist.md 第 8 項拿它當判準。
-  Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, slaveCount);
-
+  // 先快照再印（review Mi3 更正）。原本這行排在 groupCmdSnapshot() **之前**、
+  // 直接讀 volatile slaveCount，於是序列埠印的台數與這次實際處理的台數可能
+  // 對不起來（WiFi task 在兩者之間動了名冊）。沒有安全後果 —— 送出迴圈本來
+  // 就只讀快照 —— 但既然整個函式的原則是「先快照、之後只信快照」，
+  // 這行也該遵守，否則現場除錯會拿到一個對不上的數字。
+  // 輸出格式一字未動：docs/phase1-regression-checklist.md 第 8 項拿它當判準。
   groupCmdSnapshot((uint8_t)cmd, pulseMs);
+  Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, groupJob.count);
 
   HoCmdPayload payload;
   payload.cmd = (uint8_t)cmd;

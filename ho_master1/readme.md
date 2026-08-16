@@ -425,6 +425,20 @@ slave 的**靜止預設值**（開機、點動結束、`loadSlaves()`、`addSlav
 歸因失敗一律往**誤紅**方向掉（回呼太晚到 → 這台被當成未送達 → 多補送一次），
 不會往誤綠掉。
 
+**閂一定要關得掉（review N1）。** 只防「開閂那一端」是不夠的：
+`groupSendUnicast()` 是先開閂再送，而 `sendCmdToSlaveMac()` 在
+「已不在名冊上」或 `esp_now_send()` 回錯時**根本不送**，那次就沒有回呼來關閂。
+閂若跨過收工繼續開著，收工當輪恢復的 `pollNextSlave()` 所送的 `HO_PKT_STATE_REQ`
+（單播）只要命中同一個 MAC，就會把送達旗標翻成 `true` —— 而送達旗標在 job 結束後
+**仍持續被 MQTT 讀取**。結果是**序列埠誠實印過「未送達」，下一則 status 卻自己
+把 `grp` 由 0 翻成 1、`noack` 減成 0**，誤綠方向。兩道防線：
+
+1. `sendCmdToSlaveMac()` 現在回傳「有沒有真的交給 `esp_now_send()`」，
+   `groupSendUnicast()` 送不出去就**當場關閂**（根因）。
+2. `groupFinishJob()` 無條件 `groupAckArmed = false`（兜底）。
+
+回歸清單第 8a／8a-2 項的「收工後 40 秒內 `grp` 不得由 0 翻成 1」就是這條的守衛。
+
 #### wall-clock 硬上限 `GROUP_JOB_MAX_MS = 6000`
 
 job 的長度＝趟數 ×（台數 × 每步間隔 ＋ 等待），而「每步」是一次 `loop()` 迭代 ——
