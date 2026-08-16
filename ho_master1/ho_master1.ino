@@ -1258,7 +1258,26 @@ volatile bool groupDelivered[HO_ESPNOW_MAX_SLAVES];
 //      量級：需要同一台、在同一個 1~2ms、剛好送出 PAIR_REQ。**沒有實機驗證過。**
 volatile bool groupAckArmed = false;
 volatile int groupAckIdx = -1;
-uint8_t groupAckMac[6];   // loop() 先寫值再開閂；WiFi task 只在閂開著時讀
+// ── review N-e：groupAckMac 也要 volatile ──
+// loop() 先寫值再開閂、WiFi task 只在閂開著時讀，這個順序本身是對的，但
+// groupAckMac 原本是**非** volatile，而 groupAckArmed／groupAckIdx 是 volatile，
+// 兩者之間沒有任何記憶體屏障。Arduino-ESP32 的 WiFi task 通常釘在 core 0、
+// loopTask 在 core 1，是真併發；嚴格依 C++ 記憶體模型，編譯器可以把非 volatile
+// 的存取搬到 volatile 存取之前。實務上 LX6 對內部 SRAM 有序、C3 是單核，踩不到，
+// 但那是**約定而非結構** —— 與本輪要修的毛病同一形狀，所以一併改掉。
+// 代價：memcpy／memcmp 不能用在 volatile 上，改成 6 次的逐 byte 迴圈。
+volatile uint8_t groupAckMac[6];
+
+void groupAckMacSet(const uint8_t* mac) {
+  for (int k = 0; k < 6; k++) groupAckMac[k] = mac[k];
+}
+
+bool groupAckMacMatches(const uint8_t* mac) {
+  for (int k = 0; k < 6; k++) {
+    if (groupAckMac[k] != mac[k]) return false;
+  }
+  return true;
+}
 
 bool groupCmdActive() { return groupJob.phase != GROUP_JOB_IDLE; }
 
@@ -1266,8 +1285,19 @@ bool groupCmdActive() { return groupJob.phase != GROUP_JOB_IDLE; }
 void groupNoteUnicastAck(const uint8_t* desAddr, bool ok) {
   // ── review 第 4 輪：結構性防線 —— job 之外一律拒絕寫入 ──
   // 「只有群組單播才會開閂」原本只是一個**約定**（靠每個開閂點自律）。
-  // 這一行把它變成**結構**：不在 job 內就不可能寫到 groupDelivered[]，
-  // 順帶殺掉「跨 job 的過期回呼」那條理論殘留。
+  // 這一行把它變成**結構**：不在 job 內就不可能寫到 groupDelivered[]。
+  //
+  // ── review N-a：這道守衛今天不擋任何回呼，純屬未來防護。誠實敘述 ──
+  // 上一版寫它「順帶殺掉跨 job 的過期回呼」**是錯的**，那句已刪除：
+  //   - 跨 job 過期回呼的情境是「job A 的回呼延遲到 **job B 已經開閂之後**才到、
+  //     且 MAC 同一台」。此時 phase 是 ARMED／WAIT（非 IDLE），本守衛**放行**，
+  //     groupAckArmed 為 true、MAC 也對得上 → 照樣被記進 job B。**沒有被擋掉。**
+  //   - 反過來，「phase == IDLE 但閂還開著」這個狀態在現行程式**根本不存在** ——
+  //     三個進 IDLE 的出口（groupFinishJob()、groupCmdSnapshot()、sendCmdToAll()
+  //     的空名冊早退）全都同時或先行關閂。
+  // 所以本守衛的價值是「把約定變成結構、擋住未來新增的路徑」，**不是**修掉任何
+  // 現存缺陷。在這個專案裡「宣稱一道其實不存在的防線」與那些假綠燈是同一個形狀，
+  // 不能留。
   //
   // **這一行的位置有陷阱**：groupCmdSnapshot() 曾經把 phase 設成 IDLE，而
   // sendCmdToAll() 要到 inline 第一趟單播跑完才設 WAIT —— 若沿用那個順序，
@@ -1279,7 +1309,7 @@ void groupNoteUnicastAck(const uint8_t* desAddr, bool ok) {
   if (desAddr == nullptr) return;
   // 廣播的送出回呼永遠回報成功，明確排除 —— 把它當送達就是假綠燈
   if (memcmp(desAddr, BROADCAST_MAC, 6) == 0) return;
-  if (memcmp(desAddr, groupAckMac, 6) != 0) return;
+  if (!groupAckMacMatches(desAddr)) return;
 
   int i = groupAckIdx;
   groupAckArmed = false;    // 先關閂，避免同一則回呼被重複歸因
@@ -1292,7 +1322,7 @@ void groupNoteUnicastAck(const uint8_t* desAddr, bool ok) {
 // 先寫 MAC 再開閂：WiFi task 只在閂開著時讀 groupAckMac，順序反過來會讀到舊值。
 void groupSendUnicast(int i) {
   if (i < 0 || i >= groupJob.count) return;
-  memcpy(groupAckMac, groupJob.macs[i], 6);
+  groupAckMacSet(groupJob.macs[i]);
   groupAckIdx = i;
   groupAckArmed = true;
   // review N1 的根因修正：sendCmdToSlaveMac() 在「已不在名冊上」或
@@ -1340,6 +1370,27 @@ void groupCountAll(int& ack, int& noack, int& gone) {
 
 // 收工。**只講可證明的事**：MAC 層送達與否。執行與否一律明講無法證明。
 void groupFinishJob(bool hitTimeCap) {
+  // ── review N1 ＋ N-f：關閂，而且必須是本函式的**第一件事** ──
+  //
+  // N1（為什麼收工一定要關閂）：groupSendUnicast() 是「先開閂再送」，但
+  // sendCmdToSlaveMac() 在 findSlave() 失敗或 esp_now_send() 回錯時**根本不送**，
+  // 那次開的閂沒有回呼來關它，會跨過收工繼續開著。而收工當輪 pollNextSlave()
+  // 立刻恢復，它送的 HO_PKT_STATE_REQ 是單播，命中同一個 MAC 就會把
+  // groupDelivered[] 設成 true —— 而 groupDelivered[] 在 job 結束後**仍持續被
+  // MQTT 讀取**（groupDeliveryFor()／appendGroupResult()）。根因已在
+  // groupSendUnicast() 一併堵掉，這裡是第二道：無論閂為什麼還開著，收工一律關。
+  //
+  // N-f（為什麼要排在最前面）：
+  // 原本這行排在所有 Serial.printf 之後。收工走 wall-clock 上限那條時，最後一次
+  // 單播可能只在 20ms 前送出，而 115200 baud 下那 5~8 行輸出本身就要 10~20ms ——
+  // 那則**遲到的真實 ACK** 會落在「計數已取、序列埠已印」與「關閂」之間的窗口裡，
+  // 把一台剛被印成「未送達」的 slave 在 groupDelivered[] 裡翻成 true。
+  // 這則 ACK 是真的（誤紅修正，不是假綠燈），但它的**外顯症狀與 N1 一模一樣**：
+  // 序列埠說紅、MQTT 說綠。而回歸清單 8a／8d 第 4 步正是拿這個症狀當 FAIL 判準，
+  // 於是會產生假 FAIL；更糟的是一旦被當成「已知雜訊」，真正的 N1 復發就會被
+  // 一起吃掉。移到最前面，序列埠與 MQTT 在收工那一刻就一致。
+  groupAckArmed = false;
+
   int ack, noack, gone;
   groupCountAll(ack, noack, gone);
 
@@ -1373,21 +1424,6 @@ void groupFinishJob(bool hitTimeCap) {
                    "封包到了，一律以現場確認為準，不要當成已關閉");
   }
 
-  // ── review N1：收工一定要關閂 ──
-  // 少了這一行就是第八條假綠燈，機制齊全、只差一個觸發條件：
-  // groupSendUnicast() 是「先開閂再送」，但 sendCmdToSlaveMac() 在 findSlave()
-  // 失敗或 esp_now_send() 回錯時**根本不送**，於是那次開的閂沒有回呼來關它，
-  // 會**跨過收工繼續開著**。而收工當輪 pollNextSlave() 立刻恢復，它送的
-  // HO_PKT_STATE_REQ 是單播，只要命中同一個 MAC 就會把 groupDelivered[] 設成
-  // true —— 而 groupDelivered[] 在 job 結束後**仍持續被 MQTT 讀取**
-  // （groupDeliveryFor()／appendGroupResult()）。結果是序列埠誠實印了「未送達」，
-  // 下一則 status 卻把那台的 "grp" 由 0 翻成 1、"noack" 減成 0。
-  //
-  // 這正是 ACK 歸因閂鎖本來要防的那件事 —— 第一版只防了開閂那一端。
-  // 真正的根因（送不出去卻開了閂）已在 groupSendUnicast() 一併堵掉，這裡是
-  // 第二道：無論閂為什麼還開著，收工一律關閉。
-  groupAckArmed = false;
-
   // 讓 App 收到每一台的真實狀態與本次的送達結果（見 appendSlavesArray()／
   // buildStatusDoc() 的 "grp" 與 "group" 欄位，review M2）
   markAllSlavesDirty();
@@ -1407,13 +1443,19 @@ void processGroupCmd() {
     return;
   }
 
-  // inline 第一趟單播還在跑（sendCmdToAll() 內），loop() 不該插手。
-  // 正常情況下這個分支**進不來** —— espNowDelay() 只跑 maintainEspNow()，
-  // 不跑 loop()，所以 sendCmdToAll() 一定會在下一次 loop() 之前把 phase 推到
-  // WAIT 或 IDLE。留這個分支是為了：萬一未來有人讓 loop() 在那段期間跑起來，
-  // 也不會半途接手一個還沒送完的 job；而真的卡住時，上面的 wall-clock 上限
-  // 會在 6 秒後把它收掉（那個檢查排在本分支之前，刻意的）。
-  if (groupJob.phase == GROUP_JOB_ARMED) return;
+  // inline 第一趟單播還在跑（sendCmdToAll() 內），loop() 不該半途接手一個
+  // 還沒送完的 job。這個分支**進不來**：espNowDelay() 只跑 maintainEspNow()、
+  // 不跑 loop()，而 GroupArmScope 的解構子保證 sendCmdToAll() 一離開就不可能
+  // 留下 ARMED。留著是第三道防線。
+  //
+  // 若真的看到 ARMED，代表 inline 段已經失控 —— 此時繼續等 6 秒毫無價值，
+  // 直接升級成 WAIT 讓補送機制接手（未送出的那幾台會在第 2、3 趟補回來），
+  // 比「乾等 6 秒然後宣告收工」誠實也安全。
+  if (groupJob.phase == GROUP_JOB_ARMED) {
+    groupJob.phase = GROUP_JOB_WAIT;
+    groupJob.waitUntil = now + GROUP_ACK_WAIT_MS;
+    return;
+  }
 
   groupRefreshRoster();
 
@@ -1500,6 +1542,27 @@ void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
   // 這行也該遵守，否則現場除錯會拿到一個對不上的數字。
   // 輸出格式一字未動：docs/phase1-regression-checklist.md 第 8 項拿它當判準。
   groupCmdSnapshot((uint8_t)cmd, pulseMs);
+
+  // ── review N-c：讓「不會卡在 ARMED」變成結構保證，而不是靠作者記得 ──
+  // GROUP_JOB_ARMED 只在本函式內存在，而本函式**目前**只有一個 return
+  //（空名冊早退，且它明確設 IDLE），所以卡住是不可達的。
+  // 但那是「今天的程式碼剛好如此」，不是保證 —— 任何未來新增的 return
+  //（例如在 inline 單播迴圈中間加一個錯誤處理）都會讓 job 永遠停在 ARMED，
+  // 而 ARMED 期間 pollNextSlave() 是讓開的，只能等 6 秒 wall-clock 上限收拾。
+  // 解構子必然執行，把出口責任從「作者記得寫」改成「離開作用域就會做」。
+  // 正常路徑進到這裡時 phase 已是 WAIT 或 IDLE，解構子什麼都不做（零行為改變）。
+  struct GroupArmScope {
+    ~GroupArmScope() {
+      if (groupJob.phase == GROUP_JOB_ARMED) {
+        // 有人中途 return 才會成立：不留半成品，直接交給 loop() 的補送段。
+        // 沒送出去的那幾台會在第 2、3 趟被補回來，比乾等 6 秒誠實也安全。
+        Serial.println("⚠ [群組] inline 段未正常結束，直接交給補送段接手");
+        groupJob.phase = GROUP_JOB_WAIT;
+        groupJob.waitUntil = millis() + GROUP_ACK_WAIT_MS;
+      }
+    }
+  } groupArmScope;
+
   Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, groupJob.count);
 
   HoCmdPayload payload;
@@ -1824,6 +1887,9 @@ void printHelp() {
   Serial.println("  unpair <n>    解除第 n 台配對");
   Serial.println("  unpairall     清空整份名冊（分批執行，每輪 loop 拆一台，心跳不中斷）");
   Serial.println("  ch <n>        測試用：切換 master 的 channel（1~13）");
+  Serial.println("  droppeer <n>  測試用：刪掉第 n 台的 ESP-NOW peer 但保留名冊條目，");
+  Serial.println("                 讓它「在名冊上卻送不出單播」（回歸清單 8e 用）；");
+  Serial.println("                 不寫 NVS、不動名冊內容，重開機或重新配對即恢復");
   Serial.println("  fakeslaves <n> 測試用：把名冊灌成 n 台假 slave，實測容量（不寫 NVS；");
   Serial.println("                 灌入後到重開機前，pair／unpair 會被擋下，避免假 MAC 寫進 NVS）");
   Serial.println("  jsonsize      測試用：印出目前狀態 JSON 的實際大小");
@@ -1858,7 +1924,7 @@ void handleSerialCommand(const String& line) {
   // 對非數字輸入靜默回傳 0（例如 ch abc 誤觸發切到 channel 0）
   bool needsArg = (verb == "on" || verb == "off" || verb == "pulse" ||
                    verb == "state" || verb == "unpair" || verb == "ch" ||
-                   verb == "fakeslaves");
+                   verb == "fakeslaves" || verb == "droppeer");
   int arg = -1;
   if (needsArg && !parseIndexArg(argStr, arg)) {
     Serial.println("[指令] 參數必須是數字，例如：on 0（輸入 help 看說明）");
@@ -1918,6 +1984,31 @@ void handleSerialCommand(const String& line) {
     } else {
       Serial.println("channel 需在 1~13 之間");
     }
+  } else if (verb == "droppeer") {
+    // ── 測試專用（回歸清單 8e）：刪掉 ESP-NOW peer，但**保留名冊條目** ──
+    // 這是唯一能用人手製造 N1 觸發前提的方法：該台仍在名冊上（findSlave() 成功、
+    // 不會被標成 gone），但 esp_now_send() 會回 ESP_ERR_ESPNOW_NOT_FOUND，
+    // 於是 sendCmdToSlaveMac() 回 false —— 正是 N1 需要的「送不出去卻開了閂」。
+    // 之後在配對模式下短按該台按鈕，master 的 HO_PKT_PAIR_REQ 分支會無條件
+    // registerPeer() 把 peer 補回來，隨後的單播就通了，N1 的症狀（grp 由 0 翻 1）
+    // 才有機會現形。完整步驟見 docs/phase1-regression-checklist.md 的 8e。
+    //
+    // 與 fakeslaves 同一類：危險、只給實測用。但兩者有一個重要差別 ——
+    // **droppeer 不動名冊內容**（不寫 slaves[]、不改 slaveCount、不碰 NVS，
+    // 也不設 fakeSlavesActive），所以名冊的真相沒有被汙染，pair／unpair 照常可用。
+    // 恢復方式：重新開機（setup() 的 registerAllPeers() 會從 NVS 名冊重建 peer 表），
+    // 或在配對模式下重新短按該台的按鈕。
+    if (arg < 0 || arg >= slaveCount) {
+      Serial.println("[控制] 編號超出範圍");
+    } else {
+      char id[20];
+      hoFormatDeviceId(slaves[arg].mac, id);
+      esp_err_t res = esp_now_del_peer(slaves[arg].mac);
+      Serial.printf("[測試] 已刪除 %s 的 ESP-NOW peer（名冊條目保留，未寫 NVS），"
+                    "回傳 %d\n", id, res);
+      Serial.println("⚠ [測試] 該台在重新配對或重開機之前收不到任何單播"
+                     "（廣播仍收得到）；名冊真相未被更動，pair／unpair 照常可用");
+    }
   } else if (verb == "fakeslaves") {
     fakeSlavesForCapacityTest(arg);
   } else if (verb == "jsonsize") {
@@ -1970,6 +2061,17 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     // PAIR_REQ（例如剛好 master 不在配對模式），會被誤刪 peer 而收不到後續指令。
     bool wasPeer = esp_now_is_peer_exist(info->src_addr);
     registerPeer(info->src_addr);
+    // ── review N-b：PAIR_ACK 是同 MAC 單播，送之前先關 ACK 歸因閂鎖 ──
+    // 上一版把這條列為「擋不掉也不該擋」，那個結論**前提就錯了**：擋不掉的是
+    // 「回覆配對請求」，但**歸因閂鎖是關得掉的**。少了這行，一台已配對的 slave
+    // 在群組單播的 1~2ms 窗口內送 PAIR_REQ（ho_slave1 的 requestPairing() 沒有
+    // 「已配對就不送」守衛），PAIR_ACK 的 MAC 層 ACK 就會被記成「群組指令已送達」。
+    // 那台可能三趟 CMD 單播全掉卻顯示 "grp":1 —— 而「CMD 掉、其他單播通」正是
+    // 訊號邊界的典型情境，不是憑空假設。
+    // 方向安全：最壞只是把一台其實已送達的誤判成未送達（誤紅），補送會再試一次。
+    // context 安全：本分支跑在 WiFi task，而 groupAckArmed 本來就是 volatile bool、
+    // 本來就由 WiFi task 的 groupNoteUnicastAck() 寫，不新增競態面。
+    groupAckArmed = false;
     espNowSendTo(info->src_addr, HO_PKT_PAIR_ACK, &ack, sizeof(ack));
     if (!ack.accepted && !wasPeer) {
       // 被拒絕又不是原本就存在的 peer：這只是為了送出 ACK 而暫時註冊，

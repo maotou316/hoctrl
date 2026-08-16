@@ -51,6 +51,7 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 | `unpair <n>` | 解除第 n 台配對 |
 | `unpairall` | 清空整份名冊（分批執行，每輪 `loop()` 拆一台，心跳不中斷） |
 | `ch <n>` | 測試用：切換 channel，驗證 slave 重掃 |
+| `droppeer <n>` | **測試用**：刪掉第 n 台的 ESP-NOW peer 但**保留名冊條目**，製造「在名冊上卻送不出單播」。回歸清單 8e 專用。不寫 NVS、不動名冊內容，重開機或重新配對即恢復 |
 | `help` | 顯示說明 |
 
 ## 配對
@@ -427,20 +428,40 @@ slave 的**靜止預設值**（開機、點動結束、`loadSlaves()`、`addSlav
 | `pollNextSlave()` 的 `HO_PKT_STATE_REQ` | 守住了 —— `loop()` 用 `groupCmdActive()` 整個讓開 |
 | `handleSlaveCommand()` 的 `status` 分支 | 守住了 —— 跳過 `requestSlaveStateIndex()`，`publishSlaveStatus()` 照發，App 不空等 |
 | **序列埠 `state <n>`** | 上一版**漏了**。特別諷刺：回歸清單 8a 的校準步驟正好教操作者用它 ——**驗收程序自己製造危害**。**第 4 輪已補上同樣的 `groupCmdActive()` 守衛** |
-| **`HO_PKT_PAIR_ACK`**（`onEspNowRecv()` 的 `HO_PKT_PAIR_REQ` 分支） | **擋不掉也不該擋**：配對請求必須回覆，且它跑在 WiFi task。`ho_slave1` 的 `requestPairing()` 沒有「已配對就不送」守衛，所以已配對的 slave 理論上能在那 1~2ms 內送 `PAIR_REQ` 進來 |
+| **`HO_PKT_PAIR_ACK`**（`onEspNowRecv()` 的 `HO_PKT_PAIR_REQ` 分支） | **第 5 輪已守住** —— 送 `PAIR_ACK` 之前先 `groupAckArmed = false`（見下） |
 
-最後那條的誠實評估：它會讓證據的**指向性**變差（拿 `PAIR_ACK` 的 ACK 去認 `CMD`
-的送達），但**不是 C1 那種自製證據** —— MAC 層 ACK 仍由對方射頻產生、master 造不
-出來，所以那台當下確實可達。量級上需要同一台、在同一個 1~2ms、剛好送出
-`PAIR_REQ`。**沒有實機驗證過。**
+**`PAIR_ACK` 那條原本被判為「擋不掉也不該擋」，第 5 輪 review 推翻了那個結論。**
+擋不掉的是「回覆配對請求」（配對必須回、且它跑在 WiFi task），
+但**歸因閂鎖是關得掉的** —— 送 `PAIR_ACK` 之前加一行 `groupAckArmed = false;` 即可：
+
+- **不影響配對**：`PAIR_ACK` 照送，語義零改變。
+- **方向安全**：最壞是把一台其實已送達的誤判成未送達 → 多補送一趟（誤紅）。
+- **context 安全**：該分支跑在 WiFi task，而 `groupAckArmed` 本來就是
+  `volatile bool`、本來就由 WiFi task 的 `groupNoteUnicastAck()` 寫，不新增競態面。
+
+為什麼非守不可（嚴重性不因「不是自製證據」而降級）：系統對 `grp: 1` 的定義是
+「**這次群組指令**的單播對這台拿到了 MAC 層 ACK」。拿 `PAIR_ACK` 的 ACK 去填它，
+產出的仍然是一個**與事實不符的綠燈** —— 那台可能三趟 CMD 單播全掉卻顯示已送達，
+而「CMD 掉、其他單播通」正是訊號邊界的典型情境，不是憑空假設。
+（觸發需要人為動作：`ho_slave1` 的 `requestPairing()` 有 `masterInPairingMode`
+前置條件，所以 master 必須正在配對模式、且有人短按該台按鈕。這讓量級小得多，
+但不改變方向。）
 
 歸因失敗一律往**誤紅**方向掉（回呼太晚到 → 這台被當成未送達 → 多補送一次），
 不會往誤綠掉。
 
 **「job 之外一律拒絕寫入」是結構而不是約定（第 4 輪 review）。**
 `groupNoteUnicastAck()` 開頭多一道 `if (!groupCmdActive()) return;`，
-把「只有群組單播才會開閂」從每個開閂點的自律變成結構保證，順帶殺掉「跨 job 的
-過期回呼」那條理論殘留。
+把「只有群組單播才會開閂」從每個開閂點的自律變成**結構保證**。
+
+> **這道守衛今天不擋任何回呼，純屬未來防護（第 5 輪 review N-a 更正）。**
+> 上一版寫它「順帶殺掉跨 job 的過期回呼」**是錯的**：
+> 跨 job 過期回呼的情境是「job A 的回呼延遲到 **job B 已經開閂之後**才到、且 MAC
+> 同一台」，此時 `phase` 是 `ARMED`／`WAIT`（非 `IDLE`），守衛**放行** —— 照樣被
+> 記進 job B，**完全沒被擋掉**。而「`phase == IDLE` 但閂還開著」在現行程式
+> **根本不存在**（三個進 `IDLE` 的出口全都同時或先行關閂）。
+> 守衛的價值是「把約定變成結構、擋住未來新增的路徑」，**不是**修掉任何現存缺陷。
+> 在這個專案裡，「宣稱一道其實不存在的防線」與那些假綠燈是同一個形狀，不能留。
 
 > **這一行的位置有陷阱。** `groupCmdSnapshot()` 原本把 phase 設成 `IDLE`，而
 > `sendCmdToAll()` 要到 inline 第一趟單播跑完才設 `WAIT` —— 照抄會讓**第一趟
