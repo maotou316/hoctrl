@@ -48,7 +48,7 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 | Long Range（`LR:*` 指令、`esp_wifi_set_protocol()`） | **完全未實作**。原 Task 6 已依 Ruling 整個移到 Phase 5，`LR:` 分支目前只印一行「尚未實作」；`long_range` 欄位恆為 `false` |
 | ESP-NOW 轉送 OTA（`update:{JSON}`） | 未實作，Phase 4 |
 | App 端的樹狀 UI、讀 `grp`／`group.noack` | 未做，Phase 3 |
-| 指令歸因欄位（讓「已執行」可證明） | 未做，**技術債已具名登記給 Phase 4 Task 1** |
+| 指令歸因欄位（讓「韌體層已執行」可證明） | **Phase 4 Task 1 已做**（協定版本 2）。見 `docs/phase4-flag-day-upgrade.md` |
 
 > **⚠ 整個 Phase 2b（Task 1~5、7）至今零實機回歸。**
 > 所有結論——包含本文件的每一段推論、`docs/phase2b-regression-checklist.md`
@@ -469,19 +469,27 @@ slave 的**靜止預設值**（開機、點動結束、`loadSlaves()`、`addSlav
 判成「已確認」，而且確認是 sticky 的，假確認一旦成立就再也不會補送。
 「收不到廣播、卻收得到單播」正是邊界訊號那台的典型表現。
 
-**根因是結構性的：`HoStatePayload` 沒有任何指令歸因欄位**（沒有「我剛執行了哪一則
-指令」的 seq／echo），所以現行協定下「指令有被執行」**原理上無法證明**。
+**當時的根因是結構性的：協定版本 1 的 `HoStatePayload` 沒有任何指令歸因欄位**
+（沒有「我剛執行了哪一則指令」的 seq／echo），所以在那一版協定下
+「指令有被執行」**原理上無法證明**。
 
-因此現在只區分兩件事：
+**Phase 4 Task 1 已把那筆技術債還掉**（協定版本 2：`HoCmdPayload` 帶 `cmdId`、
+`HoStatePayload` 帶 `lastCmdId`／`lastCmdKind`／`lastCmdCount`），現在的分類是：
 
 | 事實 | 可否證明 | 依據 |
 |---|---|---|
 | **已送達** | ✅ 可證明 | 單播有 MAC 層 ACK。`esp_now_send()` 的送出回呼 `onEspNowSent()` 逐幀回報成功／失敗，`wifi_tx_info_t::des_addr` 帶目的 MAC，可逐台歸因 |
-| **已執行** | ❌ 不可證明 | 協定沒有指令歸因欄位。**不准用任何自製證據去宣稱它** |
+| **韌體層已執行** | ✅ 可證明（版本 2 起） | slave 回報的 `lastCmdId` 等於本次指令的 `cmdId`、種類相符、且回報晚於指令送出（`groupExecutedIdx()`）。證據由 slave 產生，master 造不出來 |
+| **繼電器硬體動作** | ❌ 不可證明 | `setRelayPins()` 只寫 GPIO。MOS 燒毀、線路脫落、觸點黏死都照樣回報「已執行」 |
+| **籠門關上了** | ❌ 不可證明 | 同上，再加上機構本身。**現場確認是唯一方法** |
 | 廣播是否被收到 | ❌ 不可證明 | 廣播沒有 ACK，`esp_now_send()` 永遠回報成功 |
 
-> **技術債：指令歸因欄位交 Phase 4 Task 1** 一併處理。那個 Task 本來就要動協定
-> （CRC 涵蓋標頭），是已排定的 flag-day、兩端同時重燒。在那之前不為此單獨改協定。
+> **「沒有執行證明」不等於「沒執行」**：回報可能還在路上、可能掉了。
+> 所以它只能**維持紅色**，不能宣稱「已確認未執行」。誤紅可接受、誤綠不可接受。
+>
+> **執行證明刻意不進入控制決策** —— 它只進入回報（序列埠收工訊息、MQTT 的
+> `exed`／`exe`）。廣播 ＋ 全台單播 ＋ 補送的流程一行都沒改，理由見
+> `sendCmdToAll()` 上方的註釋與 `docs/phase4-flag-day-upgrade.md` 第 3.2 節。
 
 #### ACK 歸因閂鎖
 
@@ -583,15 +591,18 @@ publish 最壞是 10 秒級黑箱（**App 端依賴那則 `publishStatus()`，�
 
 #### 收工輸出
 
-序列埠一定看得見，且**任何情況都會印**「不能證明已執行」那兩行：
+序列埠一定看得見，且**任何情況都會印**最後那三行說明：
 
 ```
 [群組] 指令 <N> 收工：單播 MAC 層已送達 X／Y 台
 ⚠ [群組] Z 台連「送達」都沒有（單播沒拿到 MAC 層 ACK）
 ⚠ [群組]   未送達：hoban-xxxxxxxxxxxx
 ⚠ [群組] W 台在執行期間離開名冊，同樣未送達
+[群組] 韌體層已執行 X／Y 台（slave 回報 cmdId=<數字>）
+⚠ [群組]   無執行證明：hoban-xxxxxxxxxxxx
 [群組] 注意：MAC 層 ACK 只證明「封包已送達」，不能證明繼電器真的動作
-[群組] 現行 HoStatePayload 沒有指令歸因欄位，「已執行」在本版協定下無法證明（技術債：Phase 4 Task 1 補）
+[群組] 執行證明只到韌體層：證明 slave 走完了繼電器動作那段程式，不證明繼電器硬體動作，更不證明籠門關上
+[群組] 沒有執行證明不等於沒執行 —— 回報可能還在路上；它只能維持紅色，不能宣稱已確認未執行
 ⚠ [群組] 這是關門路徑：未送達的籠門必然沒關；已送達的也只代表封包到了，一律以現場確認為準，不要當成已關閉
 ```
 
@@ -607,8 +618,8 @@ publish 最壞是 10 秒級黑箱（**App 端依賴那則 `publishStatus()`，�
 - master 狀態多一個 **`"group"`** 摘要物件：
 
 ```json
-"group": {"cmd":2,"age_s":2,"busy":0,"n":20,"ack":18,"noack":2,"gone":0,
-          "exec":"unprovable"}
+"group": {"cmd":2,"cid":41234,"age_s":2,"busy":0,"n":20,"ack":18,"noack":2,"gone":0,
+          "exed":18,"exec":"attributed"}
 ```
 
 **`cmd` 的合法值只有 `0`／`1`／`2`**（`HO_CMD_OFF = 0`、`HO_CMD_ON = 1`、
@@ -616,8 +627,10 @@ publish 最壞是 10 秒級黑箱（**App 端依賴那則 `publishStatus()`，�
 上面舉的 `2` 就是 `ALL:ON`（＝廣播 `HO_CMD_PULSE`）的實際值。
 **這個範例原本寫 `"cmd":3`，那是一個不存在的值**，Task 7 review 抓到後更正。
 
-`noack` 就是 App 該顯示紅色的依據。`exec` 固定 `"unprovable"`，用來擋掉
-「App 把 `ack` 當成關門成功」這條誤讀路徑。
+`noack` 就是 App 該顯示紅色的依據。`exec` 自協定版本 2 起是 `"attributed"`
+（Phase 4 Task 1 之前固定 `"unprovable"`），並多了 `exed`（有執行證明的台數）
+與逐台的 `slaves[].exe`。**`"attributed"` 仍然不等於「門關了」** ——
+它只到韌體層，完整的「擋不住什麼」見 `docs/phase4-flag-day-upgrade.md` 第 3.2 節。
 
 > **舊版 App 相容**：`SlaveStatus.fromJson()` 只挑它認得的 key，多出來的欄位會被
 > 忽略、不會解析失敗（hoctrl 的 `lib/models/slave_status.dart`）。
@@ -656,7 +669,7 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
 > **這句宣稱擋得住什麼、擋不住什麼（Task 7 review C1 的教訓）**：
 > 它擋的是「**欄位名稱**與程式碼不符」——每個 key 都能在上述三支函式裡 grep 到。
 > **它擋不住「範例值」寫錯**：底下那些數字是為了讓範例好讀而編的，
-> 只有 `"exec": "unprovable"` 是程式寫死的常數。
+> 只有 `"exec": "attributed"` 是程式寫死的常數。
 > **這不是假設性的**：本範例的 `"cmd"` 原本寫成 `3`，而 `3` 是一個
 > **不存在的 `HoRelayCmd` 值**，review 才抓到。
 > **值的合法範圍一律以本節下方的欄位表為準，不要照抄範例的數字。**
@@ -685,13 +698,13 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
     "free_heap": 123456
   },
   "group": {
-    "cmd": 2, "age_s": 2, "busy": 0,
+    "cmd": 2, "cid": 41234, "age_s": 2, "busy": 0,
     "n": 2, "ack": 1, "noack": 1, "gone": 0,
-    "exec": "unprovable"
+    "exed": 1, "exec": "attributed"
   },
   "slaves": [
-    {"id":"hoban-aabbccddeeff","relay":0,"online":true,"rssi":-72,"version":"1.0.0","grp":1},
-    {"id":"hoban-112233445566","relay":0,"online":false,"rssi":-100,"version":"0.0.0","grp":0}
+    {"id":"hoban-aabbccddeeff","relay":0,"online":true,"rssi":-72,"version":"1.0.0","grp":1,"exe":1},
+    {"id":"hoban-112233445566","relay":0,"online":false,"rssi":-100,"version":"0.0.0","grp":0,"exe":0}
   ]
 }
 ```
@@ -702,10 +715,12 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
 |---|---|
 | `group` | **開機以來下過至少一次群組指令**才有（`if (!groupJob.everRan) return;`）。冷開機後第一則 status 沒有這個物件 |
 | `slaves[i].grp` | 該台**在最近一次群組指令的快照裡**才有（`groupDeliveryFor()` 回 −1 就整個不帶）。指令之後才配對進來的 slave 沒有 |
-| `slaves_truncated` / `slaves_shown` | 名冊台數超過執行期上限才有。**照現行常數（3072／640／11／104）算出的 `maxEntries` 是 23，而名冊上限 `HO_ESPNOW_MAX_SLAVES` 是 20，所以這兩個欄位在正常情況下永遠不會出現**。它們存在的意義是：萬一有人改小 buf 又繞過 `static_assert`，App 與序列埠都看得見，而不是靜默給出一份不完整的清單 |
+| `slaves[i].exe` | 同 `grp` 的出現條件（`groupExecutedFor()` 回 −1 就整個不帶）。`1` ＝ 有執行證明；`0` ＝ **沒有證據**，不是「已確認沒執行」 |
+| `slaves_truncated` / `slaves_shown` | 名冊台數超過執行期上限才有。**照現行常數（3072／640／11／112）算出的 `maxEntries` 是 21，而名冊上限 `HO_ESPNOW_MAX_SLAVES` 是 20，所以這兩個欄位在正常情況下永遠不會出現**。它們存在的意義是：萬一有人改小 buf 又繞過 `static_assert`，App 與序列埠都看得見，而不是靜默給出一份不完整的清單 |
 | `long_range` | **一定有，而且恆為 `false`** —— `longRangeEnabled` 全檔沒有任何寫入 `true` 的路徑（Long Range 在 Phase 5 才做） |
 
-`group` 摘要每個欄位的語義（全部嚴格限定在「送達」，**沒有任何一個宣稱「已執行」**）：
+`group` 摘要每個欄位的語義。**`ack`／`noack`／`gone` 嚴格限定在「送達」；
+`exed`／`exec` 講的是「韌體層已執行」，仍然沒有任何一個宣稱「門關了」**：
 
 | 欄位 | 語義 |
 |---|---|
@@ -716,7 +731,9 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
 | `ack` | 單播拿到 MAC 層 ACK 的台數（**只是送達**） |
 | `noack` | 沒拿到的台數 —— **這就是 App 該顯示紅色的依據** |
 | `gone` | 指令期間離開名冊的台數（同樣未送達） |
-| `exec` | **固定寫死 `"unprovable"`**，用來擋掉「App 把 `ack` 當成關門成功」這條誤讀路徑 |
+| `cid` | 這道邏輯指令的 `cmdId`。**每次開機從亂數起算**，只在同一次開機內可比較，不能拿來排序或推算「下過幾道指令」 |
+| `exed` | 有執行證明的台數（`groupExecutedIdx()`）。**可能在收工之後才變大** —— slave 的回報是非同步的 |
+| `exec` | **固定寫死 `"attributed"`**（版本 2 起；之前是 `"unprovable"`）。它宣稱的是「有 `exed` 台拿到韌體層的執行證明」，**不是**「門關了」。舊 App 把任何非 `"unprovable"` 的值歸成 `unrecognized`，仍然不會轉綠 —— 誤紅方向，安全 |
 
 ### 代發的 slave 狀態 JSON（`hoban/<slaveId>/status`，retain）
 
@@ -992,11 +1009,13 @@ Phase 2a 的 `mqttCallback()` 是把 topic 與自己的 control topic 做完整�
 - **廣播沒有 ACK**：`esp_now_send()` 對廣播位址**永遠回報成功**，
   不代表任何一台收到了。可靠性全押在第 2、3 段（逐台單播 → 對未取得 MAC 層 ACK 的補送）。
   **廣播命中率至今沒有任何數據支撐**，第一次實測要記錄「第 1 趟就全部確認的比例」。
-- **「已執行」在現行協定下原理上無法證明**：`HoStatePayload` 沒有任何指令歸因欄位
-  （沒有「我剛執行了哪一則指令」的 seq／echo），所以韌體**只有失敗證明，沒有成功證明**。
-  MQTT 的 `group.exec` 因此固定寫死 `"unprovable"`。
-  **這筆技術債已具名登記給 Phase 4 Task 1**（那個 Task 本來就要動協定、是已排定的
-  flag-day、兩端同時重燒）。完整論證見「只宣稱可證明的事」那一節。
+- **「韌體層已執行」自協定版本 2 起可證明**（Phase 4 Task 1 已還這筆技術債）：
+  slave 在 `HoStatePayload` 帶回 `lastCmdId`，master 比對本次指令的 `cmdId`。
+  MQTT 的 `group.exec` 因此由 `"unprovable"` 改成 `"attributed"`，並新增
+  `group.exed`（有證明的台數）與 `slaves[].exe`（逐台）。
+  **但它只到韌體層** —— 不證明繼電器硬體動作、更不證明籠門關上，
+  且「沒有證明」不等於「沒執行」。完整論證見「只宣稱可證明的事」那一節與
+  `docs/phase4-flag-day-upgrade.md`。
 - **關門的實際路徑是 `ALL:ON` → `HO_CMD_PULSE`，不是 `ALL:OFF`**。
   App 全 repo 送 `ALL:OFF` 的地方是 **0 處**，而且
   `lib/pages/device_detail_page.dart` 有具名註釋寫著「不要因為按鈕寫『關門』
@@ -1067,7 +1086,7 @@ Phase 2a 的狀態最壞 317 bytes，對 `char buf[512]` 只剩約 195 bytes 餘
 | 層 | 位置 | 擋什麼 |
 |---|---|---|
 | **1. 編譯期 `static_assert`** | 常數宣告區 | 有人把 `STATUS_BUF_SIZE` 改小、或把 `STATUS_BASE_MAX_BYTES` 改大到放不下 20 台 → **編譯直接失敗**，而不是上線後才靜默截斷 |
-| **2. 執行期上限 ＋ `slaves_truncated` 標記** | `appendSlavesArray()` | 名冊台數超過 `maxEntries` 時只放前 N 台，並在 JSON 帶 `slaves_truncated`／`slaves_shown`、序列埠印 `⚠ [MQTT] slaves 陣列被截斷：…`。**照現行常數這條路永遠走不到**（`maxEntries` 23 > 名冊上限 20），留著是為了「萬一走到，看得見」 |
+| **2. 執行期上限 ＋ `slaves_truncated` 標記** | `appendSlavesArray()` | 名冊台數超過 `maxEntries` 時只放前 N 台，並在 JSON 帶 `slaves_truncated`／`slaves_shown`、序列埠印 `⚠ [MQTT] slaves 陣列被截斷：…`。**照現行常數這條路永遠走不到**（`maxEntries` 21 > 名冊上限 20），留著是為了「萬一走到，看得見」 |
 | **3. 發布出口先量再發** | `publishJsonDoc()` | `measureJson()` 量出實際需求，放不下 `statusBuf` 或放不下 mqtt buffer 就**整包不發**並印出實際需求。加上序列化後的 `n >= sizeof(statusBuf) - 1` 兜底。**寧可不發，也絕不發半截 JSON** |
 
 **第 3 層是物理保證，不是紀律**：全檔只有**一處** `mqttClient.publish(`，

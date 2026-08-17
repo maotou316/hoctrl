@@ -64,6 +64,30 @@ Master 換路由器導致 channel 改變時的恢復時間：
 
 失去 master 連線時會強制關閉繼電器，避免長時間通電。
 
+精確一點（`startChannelScan()`）：**只有繼電器當下是 ON 才會被關掉**，
+並印 `[安全] 失去 master，繼電器已關閉`；本來就是 OFF 的話什麼都不做、也不印。
+觸發點是 `loop()` 裡的 `now - lastHeartbeatTime > HEARTBEAT_TIMEOUT`（30 秒），
+它同時也是進入 channel 輪掃的入口。
+
+> **在本系統的語義下，這個「安全預設」等於籠門被打開。**
+> 因此協定升級（flag-day）時它是最主要的風險 —— 見
+> `docs/phase4-flag-day-upgrade.md` 第 2 節。
+
+## 指令歸因（協定版本 2）
+
+slave 在**實際走完**繼電器動作之後（`switch` 的 `default` 分支不算），
+把該指令的 `cmdId` 記進 `lastCmdId`／`lastCmdKind`，並累加 `lastCmdCount`，
+之後每一則 `HO_PKT_STATE` 都帶著這三個值回去。master 據此判斷
+「這個狀態是哪一道指令造成的」。
+
+**這證明什麼**：slave 的韌體確實走完了 `setRelayPins()`／`pulseRelay()` 那段程式。
+
+**擋不住什麼**：不證明繼電器硬體動作、不證明籠門關上、不擋重放。
+完整清單寫在 `libraries/HoEspNow/src/HoEspNowProtocol.h` 的 `HoStatePayload` 上方。
+
+`lastCmdCount` 通常會大於 1（群組指令會廣播 3 次再加至少一次單播），
+**這是設計行為不是異常** —— master 只比對 `cmdId`，不看次數。
+
 ## EEPROM 佈局（32 bytes）
 
 | 位址 | 長度 | 內容 |

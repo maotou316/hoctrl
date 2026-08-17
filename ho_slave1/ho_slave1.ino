@@ -35,6 +35,15 @@ uint8_t lockedChannel = 0;        // 已鎖定的 channel，0 = 未鎖定
 unsigned long lastHeartbeatTime = 0;
 uint16_t txSeq = 0;
 
+// ── 指令歸因（協定版本 2）──
+// 只有**實際走完**繼電器動作的那一次才更新，未知指令碼（switch 的 default）不算。
+// 這三個值原樣進 HoStatePayload，讓 master 能把「這個 relay 值」歸因到某一道指令。
+// **它們不證明繼電器硬體動作、也不證明籠門關上**，完整的「擋不住什麼」清單
+// 寫在 HoEspNowProtocol.h 的 HoStatePayload 上方。
+uint16_t lastCmdId = HO_CMD_ID_NONE;   // 最後一次實際執行的 HoCmdPayload::cmdId
+uint8_t  lastCmdKind = 0;              // 那道指令的 HoRelayCmd
+uint8_t  lastCmdCount = 0;             // 同一個 cmdId 被執行的次數，飽和於 255
+
 bool waitingPairAck = false;
 unsigned long pairReqTime = 0;
 const unsigned long PAIR_ACK_TIMEOUT = 5000;
@@ -122,6 +131,9 @@ void sendState() {
   st.fwMinor = 0;
   st.fwPatch = 0;
   st.uptimeSec = millis() / 1000;
+  st.lastCmdId = lastCmdId;
+  st.lastCmdKind = lastCmdKind;
+  st.lastCmdCount = lastCmdCount;
 
   uint8_t buf[250];
   size_t total = hoPackPacket(buf, sizeof(buf), HO_PKT_STATE, txSeq++, &st, sizeof(st));
@@ -385,6 +397,24 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
   const uint8_t* payload = nullptr;
   size_t payloadLen = 0;
   if (!hoUnpackPacket(data, (size_t)len, &header, &payload, &payloadLen)) {
+    // ── flag-day 告警：讓「協定版本不相容」看得見 ──
+    // 沒有這一段，v1 master 配 v2 slave 的現場症狀是「兩邊都在跑、就是完全不通、
+    // 30 秒後 [失聯] 然後 [安全] 失去 master，繼電器已關閉」，而原因不顯示。
+    // 節流成每 10 秒最多一行：master 每秒廣播一次心跳，不節流會直接洗版。
+    //
+    // **它擋不住什麼**：只是回報，不做任何補救。封包照樣被丟棄、心跳照樣中斷、
+    // 30 秒失聯保護照樣觸發。它也偵測不到「版本相同但欄位語義改了」的不相容。
+    uint8_t theirVersion = 0;
+    if (hoPeekVersionMismatch(data, (size_t)len, &theirVersion)) {
+      static unsigned long lastVerWarn = 0;
+      unsigned long now = millis();
+      if (lastVerWarn == 0 || (now - lastVerWarn) >= 10000) {
+        lastVerWarn = now;
+        Serial.printf("⚠ [協定] 收到版本 %u 的封包，本機是版本 %u，全部丟棄；"
+                      "master 與所有 slave 必須一起重燒\n",
+                      theirVersion, (unsigned)HO_ESPNOW_VERSION);
+      }
+    }
     return;
   }
 
@@ -488,6 +518,23 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
       default:
         Serial.printf("[繼電器] 未知指令 %u\n", cmd.cmd);
         return;
+    }
+
+    // ── 指令歸因：只有真的走完上面某一個 case 才會執行到這裡 ──
+    // default 分支已經 return，所以「未知指令」不會被記成執行過 ——
+    // 那正是誤綠方向，必須擋住。
+    //
+    // 同一個 cmdId 再次進來就累加次數，不重置。群組指令會廣播 3 次再加至少一次
+    // 單播（見 master 的 sendCmdToAll()），所以 lastCmdCount 通常是 4，
+    // 補送還會更多。**這是設計行為，不是異常**：master 只比對 cmdId，不看次數。
+    if (cmd.cmdId != HO_CMD_ID_NONE) {
+      if (cmd.cmdId == lastCmdId && lastCmdCount < 255) {
+        lastCmdCount++;
+      } else if (cmd.cmdId != lastCmdId) {
+        lastCmdId = cmd.cmdId;
+        lastCmdCount = 1;
+      }
+      lastCmdKind = cmd.cmd;
     }
     sendState();
     return;

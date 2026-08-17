@@ -61,6 +61,30 @@ bool longRangeEnabled = false;
 String deviceIdString;
 uint16_t txSeq = 0;
 
+// ── 指令識別碼配發（協定版本 2 的指令歸因）──
+//
+// 一道**邏輯指令**一個 cmdId。同一道指令的 3 次廣播、每台的單播、以及第 2、3 趟
+// 補送全部共用同一個值（見 sendCmdToAll()），slave 執行後原樣回填到 HoStatePayload，
+// master 才能把「那台的 relay 值」歸因回「我下的那一道」。
+//
+// **為什麼開機初值是亂數而不是 0**：master 重開機後 cmdId 會從頭再來一遍。
+// 若固定從 1 起算，一則重開機前送出、重開機後才被 master 收到的舊 HO_PKT_STATE
+// （或被錄下來重播的），就可能帶著與新指令相同的 cmdId 而被誤認成執行證明 ——
+// 誤綠方向。亂數初值把它變成 1/65535 的巧合，再加上 groupExecutedIdx() 的
+// 「回報時間必須晚於指令送出時間」，兩個條件要同時成立才會出錯。
+// **它擋不住什麼**：擋不住指令送出後才被重播的那則舊回報（時間條件會成立），
+// 也擋不住 65535 道指令之後的自然繞回。要真正擋住得上 nonce／簽章，不在本階段範圍。
+uint16_t nextCmdId = HO_CMD_ID_NONE;
+
+// 配發下一個 cmdId。**必定跳過 HO_CMD_ID_NONE（0）** ——
+// 0 在協定裡的語義是「slave 開機以來沒執行過任何指令」，配發出去就會讓
+// 「沒執行過」與「執行過這一道」分不出來。
+uint16_t allocCmdId() {
+  nextCmdId++;
+  if (nextCmdId == HO_CMD_ID_NONE) nextCmdId = 1;
+  return nextCmdId;
+}
+
 // ── Slave 名冊 ──
 struct SlaveEntry {
   uint8_t mac[6];
@@ -76,6 +100,14 @@ struct SlaveEntry {
   uint8_t fwMajor;
   uint8_t fwMinor;
   uint8_t fwPatch;
+  // ── Phase 4 Task 1 新增：指令歸因（協定版本 2）──
+  // 由 onEspNowRecv() 的 HO_PKT_STATE 分支填入（WiFi task），loop() 讀。
+  // lastCmdAt 是「master 收到這則回報的本機時刻」，不是 slave 的時刻 ——
+  // 兩顆板子的 millis() 沒有共同時基，只有本機時刻能拿來跟 groupJob.startedAt 比。
+  uint16_t lastCmdId;         // slave 回報的 HoStatePayload::lastCmdId
+  uint8_t  lastCmdKind;       // 那道指令的 HoRelayCmd
+  uint8_t  lastCmdCount;      // slave 執行同一個 cmdId 的次數
+  unsigned long lastCmdAt;    // 收到「帶著這個 lastCmdId 的第一則回報」的本機時刻
   // 有變化就代發，不必等輪播輪到它（見 Task 3 的排程器）
   bool dirty;
   // ── Task 3 review 修正：dirty 連續發布失敗要退避 ──
@@ -247,28 +279,33 @@ PubSubClient mqttClient(espClient);
 
 // 單筆 slave 條目的位元組上界。最壞情況實算：
 //   {"id":"hoban-aabbccddeeff","relay":1,"online":false,"rssi":-100,"version":"255.255.255",
-//    "grp":0},
-//   = 89 ＋ 8（Task 5 review M2 新增的 "grp" 欄位，`,"grp":0`）＝ 97 bytes（含尾端逗號）。
-//   取 104 留餘裕，並讓除法算式仍是整數。
-//   （原本是 96；新增 "grp" 後 97 已經超過，這正是下方註釋警告過的情況，故一併調高。）
+//    "grp":0,"exe":0},
+//   = 89 ＋ 8（Task 5 review M2 的 "grp"，`,"grp":0`）
+//        ＋ 8（Phase 4 Task 1 的 "exe"，`,"exe":0`）＝ 105 bytes（含尾端逗號）。
+//   取 112 留餘裕，並讓除法算式仍是整數。
+//   （沿革：512／96 → 640／104（"grp"）→ 640／112（"exe"）。
+//    每一次都是「加了欄位就把常數重算」，這是下方註釋要求的動作。）
 //
 // review 補充（實測數字比對）：實機用 fakeslaves 20 量到的「餘裕 971 bytes」是樂觀值——
 // 那台測試板 SSID 短、沒設自訂 MQTT 伺服器，基礎欄位只吃了 310 bytes，遠低於
 // STATUS_BASE_MAX_BYTES 的預算。static_assert 真正依賴、且必須成立的是用這個
 // 常數乘上 HO_ESPNOW_MAX_SLAVES 算出的悲觀上界。
 //
-// **Task 7 更新（原本這段寫的是 512／96／26 那組舊數字，已隨 "grp" 欄位改動）：**
-// 現行常數是 STATUS_BASE_MAX_BYTES=640、SLAVE_ENTRY_MAX_BYTES=104，
-// 執行期上限 maxEntries = (3072-1-640-11)/104 = **23**（不是舊註釋寫的 26）。
-//   - 規格上限 20 台的悲觀值：640+11+20×104 = 2731，對 statusBuf[3072] 餘裕 341
-//   - 23 台（極限）：640+11+23×104 = 3043，餘裕只剩 29
-//   - 24 台：3147 > 3071，static_assert 會直接編譯失敗
+// **Phase 4 Task 1 更新（"exe" 欄位）：**
+// 現行常數是 STATUS_BASE_MAX_BYTES=640、SLAVE_ENTRY_MAX_BYTES=112，
+// 執行期上限 maxEntries = (3072-1-640-11)/112 = **21**（Task 7 時是 23）。
+//   - 規格上限 20 台的悲觀值：640+11+20×112 = 2891，對 statusBuf[3072] 餘裕 180
+//   - 21 台（極限）：640+11+21×112 = 3003，餘裕只剩 68
+//   - 22 台：3115 > 3071，static_assert 會直接編譯失敗
+// **餘裕只剩 1 台，這是刻意記下來的警訊**：下一個想在 slave 條目加欄位的人，
+// 必須先放大 STATUS_BUF_SIZE（連帶 MQTT_BUFFER_SIZE），不能再靠壓縮餘裕。
+//
 // **日後若在 SlaveEntry／appendSlavesArray() 新增欄位，務必重新實算這個上界並
 // 更新這個常數**——static_assert 比較的只是這個常數本身，常數沒跟著新欄位變大，
-// 編譯期完全檢查不出「單筆條目其實已經超過 104 bytes」，那點邊際
+// 編譯期完全檢查不出「單筆條目其實已經超過 112 bytes」，那點邊際
 // 會在不知不覺間被吃光，直到現場真的湊到極限台數才會發布時被 publishJsonDoc()
 // 的防線 1 擋下（不是編譯期，是執行期放棄發布 —— 會印一行，不是靜默）。
-const size_t SLAVE_ENTRY_MAX_BYTES = 104;
+const size_t SLAVE_ENTRY_MAX_BYTES = 112;
 
 // slaves 陣列以外所有欄位的位元組上界。實算：
 //   Phase 2a 的既有欄位最壞 317
@@ -276,13 +313,17 @@ const size_t SLAVE_ENTRY_MAX_BYTES = 104;
 //   + "free_heap":123456,                     = 19
 //   + "slaves_truncated":true,"slaves_shown":20, = 42
 //   + "long_range_pending":true,               = 27（Task 6 加）
-//   + "group":{...}                            = 96（Task 5 review M2 加，見下）
-//   ≈ 576，取 640。
+//   + "group":{...}                            = 128（見下）
+//   ≈ 608，取 640。
 //
-// "group" 物件的最壞實算（appendGroupResult()）：
-//   "group":{"cmd":255,"age_s":4294967,"n":20,"ack":20,"noack":20,"gone":20,
-//            "exec":"unprovable"},
-//   = 94 bytes，取 96。
+// "group" 物件的最壞實算（appendGroupResult()），逐欄位相加：
+//   `"group":{` 9 ＋ `"cmd":255,` 10 ＋ `"cid":65535,` 12 ＋ `"age_s":4294967,` 16
+//   ＋ `"busy":1,` 9 ＋ `"n":20,` 7 ＋ `"ack":20,` 9 ＋ `"noack":20,` 11
+//   ＋ `"gone":20,` 10 ＋ `"exed":20,` 10 ＋ `"exec":"attributed"` 19 ＋ `},` 2
+//   = 124 bytes，取 128。
+//   （Task 5 review M2 這段寫「94，取 96」時**漏算了 busy 欄位**，實際已是 102，
+//    早就超過自己寫的 96。整包沒爆是因為 640 的總預算本身有餘裕，
+//    但那是運氣不是設計 —— 本次一併算對。）
 const size_t STATUS_BASE_MAX_BYTES = 640;
 
 // "slaves":[] 這個 key 與中括號本身
@@ -970,6 +1011,10 @@ void loadSlaves() {
         slaves[i].lastSeen = 0;
         slaves[i].relay = 0;
         slaves[i].fwMajor = slaves[i].fwMinor = slaves[i].fwPatch = 0;
+        slaves[i].lastCmdId = HO_CMD_ID_NONE;
+        slaves[i].lastCmdKind = 0;
+        slaves[i].lastCmdCount = 0;
+        slaves[i].lastCmdAt = 0;
         slaves[i].dirty = false;
         slaves[i].dirtyFailCount = 0;
         slaves[i].dirtyBackoffUntil = 0;
@@ -1034,6 +1079,10 @@ bool addSlave(const uint8_t mac[6]) {
   slaves[slaveCount].lastSeen = millis();
   slaves[slaveCount].relay = 0;
   slaves[slaveCount].fwMajor = slaves[slaveCount].fwMinor = slaves[slaveCount].fwPatch = 0;
+  slaves[slaveCount].lastCmdId = HO_CMD_ID_NONE;
+  slaves[slaveCount].lastCmdKind = 0;
+  slaves[slaveCount].lastCmdCount = 0;
+  slaves[slaveCount].lastCmdAt = 0;
   slaves[slaveCount].dirty = true;   // 新加入的直接代發一次，不必等輪播輪到它
   slaves[slaveCount].dirtyFailCount = 0;
   slaves[slaveCount].dirtyBackoffUntil = 0;
@@ -1086,7 +1135,13 @@ void exitPairingMode() {
 // 群組指令的 ACK 歸因閂鎖靠它判斷「這次會不會有送出回呼」——不會有回呼就必須
 // 立刻關閂，否則閂會一直開著，把後續任何一則送往同一 MAC 的 ACK 誤記成
 // 「群組指令已送達」。既有呼叫端忽略回傳值不受影響。
-bool sendCmdToSlaveMac(const uint8_t mac[6], HoRelayCmd cmd, uint16_t pulseMs) {
+//
+// cmdId（Phase 4 Task 1 新增）：**一道邏輯指令**的識別碼，不是一幀的識別碼。
+// 群組指令的所有廣播、單播與補送都要傳同一個值進來，slave 才會把它們算成同一道；
+// 單台控制則每次呼叫 allocCmdId() 取一個新的。傳 HO_CMD_ID_NONE 進來是明確的
+// 程式錯誤（slave 會照做但不記歸因），所以這裡沒有預設值，強迫呼叫端表態。
+bool sendCmdToSlaveMac(const uint8_t mac[6], HoRelayCmd cmd, uint16_t pulseMs,
+                       uint16_t cmdId) {
   char id[20];
   hoFormatDeviceId(mac, id);
   if (findSlave(mac) < 0) {
@@ -1096,6 +1151,7 @@ bool sendCmdToSlaveMac(const uint8_t mac[6], HoRelayCmd cmd, uint16_t pulseMs) {
   HoCmdPayload payload;
   payload.cmd = (uint8_t)cmd;
   payload.pulseMs = pulseMs;
+  payload.cmdId = cmdId;
   Serial.printf("[控制] 送指令 %u 給 %s\n", (uint8_t)cmd, id);
   return espNowSendTo(mac, HO_PKT_CMD, &payload, sizeof(payload));
 }
@@ -1119,7 +1175,8 @@ void sendCmdToSlaveIndex(int idx, HoRelayCmd cmd, uint16_t pulseMs) {
   }
   uint8_t mac[6];
   memcpy(mac, slaves[idx].mac, 6);   // 先取值，之後不再依賴 idx
-  sendCmdToSlaveMac(mac, cmd, pulseMs);
+  // 單台控制：每次都是一道新的邏輯指令，配一個新的 cmdId
+  sendCmdToSlaveMac(mac, cmd, pulseMs, allocCmdId());
 }
 
 // 用 MAC 要求回報狀態（理由同 sendCmdToSlaveMac()：索引隨時可能失效）。
@@ -1168,22 +1225,33 @@ void requestSlaveStateIndex(int idx) {
 // 假確認一旦成立就再也不會補送，而「收不到廣播、卻收得到單播」正是邊界訊號
 // 那台的典型表現（廣播沒有 MAC 層 ACK 與重傳，單播有）。
 //
-// **根因是結構性的**：`HoStatePayload` 沒有任何指令歸因欄位（沒有「我剛執行了
-// 哪一則指令」的 seq／echo），所以在現行協定下「指令有被執行」**原理上無法證明**。
-// 裁決：這一輪不試圖證明「已執行」，改成誠實區分兩件事 ——
+// **當時的根因是結構性的**：協定版本 1 的 `HoStatePayload` 沒有任何指令歸因欄位
+//（沒有「我剛執行了哪一則指令」的 seq／echo），所以在那一版協定下「指令有被執行」
+// **原理上無法證明**。Task 5 的裁決是不試圖證明「已執行」，只誠實區分兩件事 ——
 //
 //   1. **「已送達」是可證明的**：單播有 MAC 層 ACK，esp_now_send() 的送出回呼
 //      （onEspNowSent()）會逐幀回報成功／失敗，且 wifi_tx_info_t::des_addr
 //      帶著目的 MAC，可以逐台歸因。**廣播沒有 ACK**，永遠回報成功，不算證據。
-//   2. **「已執行」不可證明**：不准用任何自製證據去宣稱它。收工訊息與 MQTT 狀態
-//      都明講這一點。
+//   2. **「已執行」不可證明**：不准用任何自製證據去宣稱它。
 //
-// 因此流程改成：**廣播 3 次（同時性）＋ 對每一台都送一次單播（可證明的送達）**，
+// 因此流程是：**廣播 3 次（同時性）＋ 對每一台都送一次單播（可證明的送達）**，
 // 未取得 ACK 的再補送。**誤紅可接受、誤綠不可接受** —— 寧可每次都補送，
 // 也不要用假證據省下那幾個封包。20 台的單播不貴。
 //
-// 指令歸因欄位是已登記的技術債，**交 Phase 4 Task 1**（那個 Task 本來就要動協定、
-// 是已排定的 flag-day、兩端同時重燒），在那之前不為此單獨改協定。
+// ── Phase 4 Task 1：那筆技術債已還，但流程刻意**不改** ──
+//
+// 協定版本 2 的 HoCmdPayload 帶 cmdId、HoStatePayload 帶 lastCmdId，
+// master 因此第一次有了**由 slave 產生、master 造不出來**的執行證據
+//（見 groupExecutedIdx()）。上面第 2 點的「不可證明」到此為止。
+//
+// **但廣播 ＋ 全台單播 ＋ 補送的流程一行都不動**，理由有三：
+//   - 執行證明是**非同步**的：它可能在收工之後才到，不能拿來當「可以不用補送了」
+//     的即時依據。拿它提前結束補送就是用一個晚到的證據去省掉一次真實的重送。
+//   - 沒有執行證明**不等於沒執行**（回報可能掉了），所以它也不能當成「要多補幾趟」
+//     的依據 —— 兩個方向都不該讓它介入送出決策。
+//   - 送達證明與執行證明**互補**：只收到廣播的那台會是「送達紅、執行綠」。
+//     兩者都保留，才看得出是哪一段出問題。
+// 於是執行證明只進入**回報**（序列埠收工訊息、MQTT 的 exed／exe），不進入**控制**。
 const int GROUP_BROADCAST_REPEAT = 3;             // 廣播連送次數（無 ACK，靠重送提高命中）
 const unsigned long GROUP_BROADCAST_GAP = 20;     // 每次廣播之間的間隔（ms）
 const unsigned long GROUP_STEP_GAP = 20;          // 逐台單播時每台之間的間隔（ms）
@@ -1217,6 +1285,10 @@ struct GroupCmdJob {
   volatile uint8_t phase;
   uint8_t cmd;              // HoRelayCmd
   uint16_t pulseMs;
+  // 本次群組指令的邏輯識別碼。3 次廣播、每台的單播、以及第 2、3 趟補送全部共用它。
+  // 收工後**不清掉**：執行證明可能在收工之後才到（slave 的回報要經過 master 的
+  // WiFi task），留著才能讓 groupExecutedIdx() 繼續把紅的翻成綠的。
+  uint16_t cmdId;
   int count;                // 快照下來的台數
   uint8_t macs[HO_ESPNOW_MAX_SLAVES][6];
   bool gone[HO_ESPNOW_MAX_SLAVES];   // 執行期間離開名冊（**不是**「已送達」）
@@ -1343,9 +1415,56 @@ void groupSendUnicast(int i) {
   // 閂若留著開，下一則送往同一 MAC 的封包（收工後恢復的 pollNextSlave()
   // 所送的 HO_PKT_STATE_REQ 最典型）會被誤記成「群組指令已送達」，
   // 讓序列埠已經印過的「未送達」在 MQTT 上被翻成綠的。送不出去就當場關閂。
-  if (!sendCmdToSlaveMac(groupJob.macs[i], (HoRelayCmd)groupJob.cmd, groupJob.pulseMs)) {
+  if (!sendCmdToSlaveMac(groupJob.macs[i], (HoRelayCmd)groupJob.cmd, groupJob.pulseMs,
+                         groupJob.cmdId)) {
     groupAckArmed = false;
   }
+}
+
+// ── 執行證明（Phase 4 Task 1：還 Phase 2b Task 5 登記的技術債）──
+//
+// 回傳 true 的**唯一**含意：快照第 i 台回報過「我執行的是 groupJob.cmdId 這道指令」，
+// 而且那則回報是在本次指令送出**之後**才收到的。
+//
+// **這證明什麼**：那台的韌體確實走完了 HO_PKT_CMD 分支的
+// setRelayPins()／pulseRelay() 呼叫，而且那一次帶的就是本次的 cmdId。
+// 證據是 slave 產生的，master 造不出來 —— 這正是 Task 5 的 C1 缺的那一半
+//（當時 master 用自己送的 STATE_REQ 去「製造」新回報，那是自製證據）。
+//
+// **它擋不住什麼（三項，必須連著讀）**：
+//   1. **不證明繼電器硬體動作**，更不證明籠門關上了。setRelayPins() 只寫 GPIO；
+//      MOS 燒毀、線路脫落、觸點黏死一律照樣回報「已執行」。
+//      HO_CMD_PULSE 只證明點動計時器被啟動，不證明門真的落下。
+//      **現場確認仍然是唯一能證明門關上的方法。**
+//   2. **不擋重放**。協定沒有加密也沒有 nonce。時間條件（回報晚於指令送出）擋得住
+//      **跨指令**的舊回報，擋不住「指令送出後才被重播」的那則。
+//   3. **回 false 不等於「沒執行」**。回報可能還在路上、可能掉了、那台可能剛好離線。
+//      所以 false 只能拿來**維持紅色**，不能拿來宣稱「已確認未執行」。
+//      誤紅可接受、誤綠不可接受 —— 這個不對稱是刻意的。
+//
+// 只在 loop() context 呼叫（appendGroupResult()／groupFinishJob()／
+// appendSlavesArray()），會讀 slaves[] 與 slaveCount，不從 WiFi task 呼叫。
+bool groupExecutedIdx(int i) {
+  if (!groupJob.everRan) return false;
+  if (i < 0 || i >= groupJob.count) return false;
+  if (groupJob.cmdId == HO_CMD_ID_NONE) return false;
+  int s = findSlave(groupJob.macs[i]);
+  if (s < 0) return false;   // 已離開名冊：沒有證據，維持紅色
+  if (slaves[s].lastCmdId != groupJob.cmdId) return false;
+  // 種類也要對。cmdId 本身已足以識別，這一項是縱深防禦：萬一 cmdId 撞號，
+  // 種類不同就不會被誤認。多擋一種誤綠，代價是零。
+  if (slaves[s].lastCmdKind != groupJob.cmd) return false;
+  // 回報必須晚於指令送出。用無號數減法轉有號比較，millis() 迴繞時仍正確。
+  if ((long)(slaves[s].lastCmdAt - groupJob.startedAt) < 0) return false;
+  return true;
+}
+
+int groupCountExecuted() {
+  int n = 0;
+  for (int i = 0; i < groupJob.count; i++) {
+    if (groupExecutedIdx(i)) n++;
+  }
+  return n;
 }
 
 // 把「執行期間離開名冊」的標記更新一次。這些台**不計為已送達**。
@@ -1423,11 +1542,28 @@ void groupFinishJob(bool hitTimeCap) {
     Serial.printf("⚠ [群組] %d 台在執行期間離開名冊，同樣未送達\n", gone);
   }
 
-  // 這兩行是本 Task 最重要的輸出，**任何情況都要印**（包含全部送達時）。
+  // ── Phase 4 Task 1：執行證明（Task 5 登記的技術債已還）──
+  // 協定版本 2 起，slave 在 HoStatePayload 帶回 lastCmdId，master 才第一次
+  // 有辦法把「那台的 relay 值」歸因到「我下的這一道指令」。
+  int executed = groupCountExecuted();
+  Serial.printf("[群組] 韌體層已執行 %d／%d 台（slave 回報 cmdId=%u）\n",
+                executed, groupJob.count, groupJob.cmdId);
+  if (executed < groupJob.count) {
+    for (int i = 0; i < groupJob.count; i++) {
+      if (groupExecutedIdx(i)) continue;
+      char id[20];
+      hoFormatDeviceId(groupJob.macs[i], id);
+      Serial.printf("⚠ [群組]   無執行證明：%s\n", id);
+    }
+  }
+
+  // 這三行是本 Task 最重要的輸出，**任何情況都要印**（包含全部送達時）。
   Serial.println("[群組] 注意：MAC 層 ACK 只證明「封包已送達」，"
                  "不能證明繼電器真的動作");
-  Serial.println("[群組] 現行 HoStatePayload 沒有指令歸因欄位，"
-                 "「已執行」在本版協定下無法證明（技術債：Phase 4 Task 1 補）");
+  Serial.println("[群組] 執行證明只到韌體層：證明 slave 走完了繼電器動作那段程式，"
+                 "不證明繼電器硬體動作，更不證明籠門關上");
+  Serial.println("[群組] 沒有執行證明不等於沒執行 —— 回報可能還在路上；"
+                 "它只能維持紅色，不能宣稱已確認未執行");
 
   // 關門路徑要額外點名。App 的「全部關門」按鈕送的是 **ALL:ON**（＝廣播 PULSE，
   // 見 hoctrl 的 device_detail_page.dart `_sendGroupCloseCommand()`），
@@ -1529,6 +1665,10 @@ void groupCmdSnapshot(uint8_t cmd, uint16_t pulseMs) {
   }
   groupJob.cmd = cmd;
   groupJob.pulseMs = pulseMs;
+  // 一道邏輯指令一個 cmdId。**必須在這裡配、不能在每次送出時配**，
+  // 否則 3 次廣播 ＋ 每台單播 ＋ 兩趟補送會變成幾十道不同的指令，
+  // slave 回報的 lastCmdId 永遠對不上最後一次送出的那個 —— 歸因整個失效。
+  groupJob.cmdId = allocCmdId();
   groupJob.sweep = 1;          // 第 1 趟就是下面那段 inline 的「對每一台都送」
   groupJob.cursor = 0;
   groupJob.startedAt = millis();
@@ -1581,6 +1721,11 @@ void sendCmdToAll(HoRelayCmd cmd, uint16_t pulseMs) {
   HoCmdPayload payload;
   payload.cmd = (uint8_t)cmd;
   payload.pulseMs = pulseMs;
+  // 廣播與後面每一次單播、補送都用同一個 cmdId（見 groupCmdSnapshot()）。
+  // 因此一台 slave 就算「只收到廣播、單播全丟」，它回報的 lastCmdId 仍然對得上 ——
+  // 這正是本次歸因最有價值的一種情形：**送達證明是紅的、執行證明卻是綠的**，
+  // 代表廣播有效而單播的 ACK 掉了。兩種證據互補，不能互相取代。
+  payload.cmdId = groupJob.cmdId;
 
   // ── 第 1 段：廣播（同時性）──
   // 連送 GROUP_BROADCAST_REPEAT 次、間隔 GROUP_BROADCAST_GAP：廣播沒有 ACK
@@ -1788,16 +1933,24 @@ void formatSlaveVersion(int idx, char* out, size_t outSize) {
 // 把 slaves 陣列加進 master 的狀態 doc。
 // 條目數量以 Task 1 的容量常數推算的上界為準；照**現行**數值
 // （STATUS_BUF_SIZE=3072／STATUS_BASE_MAX_BYTES=640／SLAVES_KEY_OVERHEAD=11／
-// SLAVE_ENTRY_MAX_BYTES=104）算出 maxEntries = (3072-1-640-11)/104 = 23
-// （Task 5 review M2 加了 "grp" 欄位後，常數由 512／96 調成 640／104，
-// 上限也從 26 降到 23；這段註釋原本還寫著舊的 3072/512/96 與 26，已更正）。
-// 23 ≥ HO_ESPNOW_MAX_SLAVES = 20，這條截斷路徑永遠走不到，
+// SLAVE_ENTRY_MAX_BYTES=112）算出 maxEntries = (3072-1-640-11)/112 = 21
+// （沿革：512／96 → 26；Task 5 review M2 的 "grp" → 640／104 → 23；
+// Phase 4 Task 1 的 "exe" → 640／112 → 21）。
+// 21 ≥ HO_ESPNOW_MAX_SLAVES = 20，這條截斷路徑永遠走不到，
 // 且已有 static_assert 在編譯期擋住「有人把 statusBuf 改小」。
 // 保留執行期截斷的意義是：萬一真的走到，App 看得到 slaves_truncated、
 // 序列埠也會告警，而不是靜默給出一份不完整的清單。
 // 最近一次群組指令的摘要（review M2）。開機以來沒下過群組指令就整個不帶。
 //
-// 每一個欄位的語義都嚴格限定在「送達」，沒有任何一個欄位宣稱「已執行」：
+// ── 欄位語義的分界（Phase 4 Task 1 更新）──
+// ack／noack／gone **嚴格限定在「送達」**；exed／exec 講的是「**韌體層**已執行」。
+// 沒有任何一個欄位宣稱「門關了」—— 那在本協定下仍然無法證明。
+// （這段原本寫「每一個欄位的語義都嚴格限定在『送達』」，加了 exed／exec 之後那句
+//   已經不成立，一併改對。宣稱與事實不符是本專案的 A 族病灶，不能留。）
+//   cid    這道邏輯指令的 cmdId（HoCmdPayload::cmdId）。**每次開機從亂數起算**，
+//          所以它只在同一次開機內可比較，不能拿來排序或推算「下過幾道指令」。
+//   exed   有執行證明的台數（見 groupExecutedIdx()）。**這個數字可能在收工之後
+//          才變大** —— slave 的回報是非同步的，晚到的證據會把紅的翻成綠的。
 //   cmd    最近一次群組指令的 HoRelayCmd。**實際數值是 0=OFF 1=ON 2=PULSE**
 //          （見 libraries/HoEspNow/src/HoEspNowProtocol.h 的 enum HoRelayCmd）。
 //          這行原本寫「1=ON 2=OFF 3=PULSE」，三個都錯，Task 7 逐一對照 enum 後更正。
@@ -1810,9 +1963,18 @@ void formatSlaveVersion(int idx, char* out, size_t outSize) {
 //   ack    單播拿到 MAC 層 ACK 的台數（**只是送達**）
 //   noack  沒拿到的台數 —— 這就是 App 該顯示紅色的依據
 //   gone   指令期間離開名冊的台數（同樣未送達）
-//   exec   固定 "unprovable"：現行 HoStatePayload 沒有指令歸因欄位，
-//          「已執行」原理上無法證明。這個欄位是刻意寫死的，用來擋掉
-//          「App 把 ack 當成關門成功」這條誤讀路徑。
+//   exec   證據等級。Task 5 時固定 "unprovable"（協定版本 1 沒有歸因欄位，
+//          「已執行」原理上無法證明）。**協定版本 2 起改成 "attributed"**：
+//          exed 那幾台有 slave 自己產生的執行證明。
+//
+//          ⚠ **"attributed" 仍然不是「門關了」。** 它只到韌體層：
+//          證明 slave 走完了 setRelayPins()／pulseRelay()，
+//          不證明繼電器硬體動作、不證明籠門落下。
+//
+//          **舊 App 的相容性是安全的**：hoctrl 的 GroupExecEvidence.fromWire()
+//          把任何非 "unprovable" 的值歸成 unrecognized，而那個列舉刻意沒有
+//          「已證明」那一態 —— 所以舊 App 收到 "attributed" 只會繼續維持
+//          「無法證明已執行」，是誤紅方向。**不會憑空長出綠燈路徑。**
 void appendGroupResult(JsonDocument& doc) {
   if (!groupJob.everRan) return;
   int ack, noack, gone;
@@ -1820,13 +1982,15 @@ void appendGroupResult(JsonDocument& doc) {
 
   JsonObject g = doc["group"].to<JsonObject>();
   g["cmd"] = groupJob.cmd;
+  g["cid"] = groupJob.cmdId;
   g["age_s"] = (uint32_t)((millis() - groupJob.startedAt) / 1000);
   g["busy"] = groupCmdActive() ? 1 : 0;
   g["n"] = groupJob.count;
   g["ack"] = ack;
   g["noack"] = noack;
   g["gone"] = gone;
-  g["exec"] = "unprovable";
+  g["exed"] = groupCountExecuted();
+  g["exec"] = "attributed";
 }
 
 // 查出某台 slave 在**最近一次**群組指令中的送達結果。
@@ -1843,6 +2007,21 @@ int groupDeliveryFor(const uint8_t mac[6]) {
   return -1;
 }
 
+// 查出某台 slave 在**最近一次**群組指令中有沒有執行證明。
+// 回傳 -1 = 這台不在最近一次群組指令的快照裡（欄位就不帶），
+//        0 = **沒有證據**（不是「已確認沒執行」！回報可能還在路上），
+//        1 = 有執行證明（slave 回報的 cmdId／種類對得上，且回報晚於指令送出）。
+//
+// 0 與 1 的不對稱是刻意的，語義寫在 groupExecutedIdx() 上方的「擋不住什麼」三項。
+int groupExecutedFor(const uint8_t mac[6]) {
+  if (!groupJob.everRan) return -1;
+  for (int i = 0; i < groupJob.count; i++) {
+    if (memcmp(groupJob.macs[i], mac, 6) != 0) continue;
+    return groupExecutedIdx(i) ? 1 : 0;
+  }
+  return -1;
+}
+
 // ── review M2：把「未送達」帶進 MQTT ──
 // 收工判定原本只存在於序列埠，App 沒有任何依據可以顯示紅色。
 // 這裡在 master 狀態的 slaves 陣列每一筆加上 "grp"，並在 buildStatusDoc()
@@ -1853,9 +2032,20 @@ int groupDeliveryFor(const uint8_t mac[6]) {
 //   "grp": 0 → 沒拿到（未送達；或它在指令期間離開了名冊）
 //   欄位不存在 → 這台不在最近一次群組指令的快照裡，或開機以來還沒下過群組指令
 //
-// **"grp": 1 不等於「門關了」。** 現行協定證明不了執行（見 sendCmdToAll() 上方
-// C1 的說明），所以 "group" 摘要固定帶 "exec":"unprovable"，讓 App 端不可能
-// 把送達誤讀成執行。
+// **"grp": 1 不等於「門關了」。** 它只講封包送達。
+//
+// ── Phase 4 Task 1 新增 "exe"：執行證明（協定版本 2）──
+//   "exe": 1 → 這台回報過「我執行的是本次群組指令的 cmdId」（見 groupExecutedIdx()）
+//   "exe": 0 → **沒有證據**。不是「已確認沒執行」—— 回報可能還在路上、可能掉了
+//   欄位不存在 → 這台不在最近一次群組指令的快照裡，或開機以來沒下過群組指令
+//
+// **"exe": 1 也不等於「門關了」。** 它證明的是「slave 的韌體走完了繼電器動作那段
+// 程式」，不證明繼電器硬體動作，更不證明籠門落下。完整的「擋不住什麼」清單寫在
+// groupExecutedIdx() 上方，三項，請連著讀。
+//
+// **兩個欄位互補、不能互相取代**：一台只收到廣播、單播 ACK 全掉的 slave 會是
+// `"grp":0,"exe":1`（送達沒證明、執行有證明）；反過來 `"grp":1,"exe":0` 代表
+// 封包到了它的射頻但沒回報執行 —— 那才是最該現場去看的一台。
 //
 // 舊版 App 的相容性：`SlaveStatus.fromJson()` 只挑它認得的 key，多出來的
 // 欄位會被忽略，不會解析失敗（hoctrl 的 lib/models/slave_status.dart）。
@@ -1884,6 +2074,8 @@ void appendSlavesArray(JsonDocument& doc) {
     o["version"] = ver;
     int grp = groupDeliveryFor(slaves[i].mac);
     if (grp >= 0) o["grp"] = grp;
+    int exe = groupExecutedFor(slaves[i].mac);
+    if (exe >= 0) o["exe"] = exe;
   }
 
   if (shown < slaveCount) {
@@ -2059,6 +2251,23 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
   const uint8_t* payload = nullptr;
   size_t payloadLen = 0;
   if (!hoUnpackPacket(data, (size_t)len, &header, &payload, &payloadLen)) {
+    // ── flag-day 告警：讓「協定版本不相容」看得見 ──
+    // 不是這一段的話，v2 master 配 v1 slave 的現場症狀是「slave 全部離線、
+    // 而且完全不知道為什麼」。節流成每 10 秒最多一行，避免洗版。
+    //
+    // **它擋不住什麼**：只是回報，不做任何補救 —— 那些 slave 照樣收不到心跳、
+    // 30 秒後照樣觸發 setRelayPins(false)。也偵測不到「版本相同但欄位語義改了」。
+    uint8_t theirVersion = 0;
+    if (hoPeekVersionMismatch(data, (size_t)len, &theirVersion)) {
+      static unsigned long lastVerWarn = 0;
+      unsigned long nowWarn = millis();
+      if (lastVerWarn == 0 || (nowWarn - lastVerWarn) >= 10000) {
+        lastVerWarn = nowWarn;
+        Serial.printf("⚠ [協定] 收到版本 %u 的封包，本機是版本 %u，全部丟棄；"
+                      "master 與所有 slave 必須一起重燒\n",
+                      theirVersion, (unsigned)HO_ESPNOW_VERSION);
+      }
+    }
     return;  // 非本系統封包或 CRC 不符，靜默丟棄
   }
 
@@ -2149,11 +2358,27 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
 
     // 只有「內容真的變了」才設 dirty，避免每 15 秒的例行輪詢回報都觸發一次
     // 額外代發（例行輪播本來就會發，重複發是浪費頻寬）。
+    // 歸因換了一道指令也算變化：那是 App 端「這扇門動了沒」的依據，
+    // 不設 dirty 的話最壞要等下一輪輪播（最長 15 秒）才會出現在 MQTT 上。
+    bool cmdIdChanged = (slaves[idx].lastCmdId != st.lastCmdId);
+
     bool changed = (!slaves[idx].online) ||
                    (slaves[idx].relay != st.relay) ||
                    (slaves[idx].fwMajor != st.fwMajor) ||
                    (slaves[idx].fwMinor != st.fwMinor) ||
-                   (slaves[idx].fwPatch != st.fwPatch);
+                   (slaves[idx].fwPatch != st.fwPatch) ||
+                   cmdIdChanged;
+
+    // lastCmdAt 只在 lastCmdId **換值**時更新，記的是「帶著這個 cmdId 的第一則回報
+    // 何時到」。若每則回報都更新，一台在群組指令之前就執行過同一個 cmdId 的 slave
+    // （只有 cmdId 撞號才可能）會被之後任何一則例行輪詢回報把時間推到指令之後，
+    // 讓 groupExecutedIdx() 的時間條件失效 —— 那是誤綠方向。
+    if (cmdIdChanged) {
+      slaves[idx].lastCmdAt = millis();
+    }
+    slaves[idx].lastCmdId = st.lastCmdId;
+    slaves[idx].lastCmdKind = st.lastCmdKind;
+    slaves[idx].lastCmdCount = st.lastCmdCount;
 
     slaves[idx].online = true;
     slaves[idx].rssi = info->rx_ctrl->rssi;
@@ -2170,6 +2395,12 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     Serial.printf("[狀態] %s relay=%u 版本=%u.%u.%u 運行=%lus rssi=%d\n",
                   senderId, st.relay, st.fwMajor, st.fwMinor, st.fwPatch,
                   (unsigned long)st.uptimeSec, info->rx_ctrl->rssi);
+    // 指令歸因（協定版本 2）。只在 cmdId **換值**時印，例行輪詢的回報不會洗版。
+    // 這行證明的是「那台的韌體走完了繼電器動作那段程式」，**不是**「門關了」。
+    if (st.lastCmdId != HO_CMD_ID_NONE && cmdIdChanged) {
+      Serial.printf("[歸因] %s 回報已執行 cmdId=%u 種類=%u 次數=%u\n",
+                    senderId, st.lastCmdId, st.lastCmdKind, st.lastCmdCount);
+    }
     return;
   }
 }
@@ -3245,9 +3476,9 @@ void handleSlaveCommand(const uint8_t mac[6], const String& message) {
   Serial.printf("[代理] %s 收到指令: %s\n", id, message.c_str());
 
   if (message == "ON") {
-    sendCmdToSlaveMac(mac, HO_CMD_PULSE, 2000);
+    sendCmdToSlaveMac(mac, HO_CMD_PULSE, 2000, allocCmdId());
   } else if (message == "OFF") {
-    sendCmdToSlaveMac(mac, HO_CMD_OFF, 0);
+    sendCmdToSlaveMac(mac, HO_CMD_OFF, 0, allocCmdId());
   } else if (message == "status") {
     // 先用目前已知的狀態立刻回一則，App 不必空等；
     // 同時向 slave 要一次最新狀態，回來時 dirty 會觸發第二則代發。
@@ -3471,6 +3702,12 @@ void setup() {
   delay(50);  // 等內部提升電阻把腳位拉穩再取樣
 
   checkStuckButtons();  // 必須早於任何按鈕流程，卡住的腳會在此被排除
+
+  // 指令識別碼的開機初值取亂數（理由見 nextCmdId 宣告處）。
+  // esp_random() 在 RF 未啟動時品質較差，但這裡要的只是「重開機前後不容易撞到同一串」，
+  // 不是密碼學等級的隨機性。0 是保留值，撞到就改成 1。
+  nextCmdId = (uint16_t)esp_random();
+  if (nextCmdId == HO_CMD_ID_NONE) nextCmdId = 1;
 
   loadNetConfig();  // 載入網路設定，Task 2~7 會用到
   loadSlaves();     // 只讀 NVS，可以在 ESP-NOW 初始化之前

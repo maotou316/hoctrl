@@ -25,6 +25,11 @@
 協定摘要：封包 7 bytes 標頭（magic/version/type/seq/crc），
 CRC 混入共享密鑰過濾誤觸發，不使用 ESP-NOW 原生加密（原生加密 peer 上限只有 6 台）。
 
+**協定版本 2（Phase 4 Task 1）起，CRC 涵蓋標頭前 6 bytes ＋ payload ＋ 共享密鑰**
+（版本 1 只算 payload，type 欄位的位元翻轉不會被偵測）。這是 flag-day 改動，
+master 與所有 slave 必須一起重燒 —— 升級程序與新增的指令歸因欄位見
+`docs/phase4-flag-day-upgrade.md`。
+
 各 sketch 的詳細說明見 `ho_master1/readme.md` 與 `ho_slave1/readme.md`。
 ```
 

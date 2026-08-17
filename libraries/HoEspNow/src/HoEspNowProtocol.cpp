@@ -12,9 +12,8 @@ uint8_t hoCrc8(const uint8_t* data, size_t len) {
   return crc;
 }
 
-uint8_t hoPayloadCrc(const uint8_t* payload, size_t len) {
-  // 先跑 payload，再把共享密鑰接著跑，讓沒有密鑰的封包算不出正確 CRC
-  uint8_t crc = hoCrc8(payload, len);
+// 把共享密鑰接在資料後面一起跑進 CRC，讓沒有密鑰的封包算不出正確值
+static uint8_t hoCrcAppendKey(uint8_t crc) {
   const char* key = HO_ESPNOW_SHARED_KEY;
   for (size_t i = 0; key[i] != '\0'; i++) {
     crc ^= (uint8_t)key[i];
@@ -23,6 +22,25 @@ uint8_t hoPayloadCrc(const uint8_t* payload, size_t len) {
     }
   }
   return crc;
+}
+
+// 以既有 crc 為初值繼續跑一段資料（hoCrc8 的初值固定為 0，不能直接串接）
+static uint8_t hoCrcContinue(uint8_t crc, const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+uint8_t hoFrameCrc(const uint8_t* headerFirst6, const uint8_t* payload, size_t payloadLen) {
+  uint8_t crc = hoCrcContinue(0x00, headerFirst6, 6);
+  if (payloadLen > 0 && payload != nullptr) {
+    crc = hoCrcContinue(crc, payload, payloadLen);
+  }
+  return hoCrcAppendKey(crc);
 }
 
 size_t hoPackPacket(uint8_t* out, size_t outSize, HoPacketType type,
@@ -37,7 +55,8 @@ size_t hoPackPacket(uint8_t* out, size_t outSize, HoPacketType type,
   header.version = HO_ESPNOW_VERSION;
   header.type    = (uint8_t)type;
   header.seq     = seq;
-  header.crc     = hoPayloadCrc((const uint8_t*)payload, payloadLen);
+  header.crc     = 0;   // 先填 0，下一行才算得出真值（crc 欄位本身不列入計算）
+  header.crc     = hoFrameCrc((const uint8_t*)&header, (const uint8_t*)payload, payloadLen);
 
   memcpy(out, &header, sizeof(header));
   if (payloadLen > 0) {
@@ -58,11 +77,30 @@ bool hoUnpackPacket(const uint8_t* data, size_t len, HoPacketHeader* outHeader,
 
   size_t payloadLen = len - sizeof(HoPacketHeader);
   const uint8_t* payload = data + sizeof(HoPacketHeader);
-  if (header.crc != hoPayloadCrc(payload, payloadLen)) return false;
+  // data 的前 6 bytes 就是標頭的前 6 bytes，直接傳原始緩衝區即可，不必複製
+  if (header.crc != hoFrameCrc(data, payload, payloadLen)) return false;
 
   if (outHeader)     *outHeader = header;
   if (outPayload)    *outPayload = payload;
   if (outPayloadLen) *outPayloadLen = payloadLen;
+  return true;
+}
+
+bool hoPeekVersionMismatch(const uint8_t* data, size_t len, uint8_t* outVersion) {
+  if (data == nullptr || len < sizeof(HoPacketHeader)) return false;
+
+  HoPacketHeader header;
+  memcpy(&header, data, sizeof(header));
+
+  // magic 不對就不是本系統的封包（鄰居的 ESP-NOW 流量），不該報成「版本不符」
+  if (header.magic != HO_ESPNOW_MAGIC) return false;
+  if (header.version == HO_ESPNOW_VERSION) return false;
+
+  // 刻意**不驗 CRC**：對方若是舊版，它的 CRC 只算 payload，用本版的 hoFrameCrc()
+  // 一定對不起來 —— 先驗 CRC 就永遠報不出版本不符，這個函式也就失去意義。
+  // 代價：一封 magic 剛好撞上、內容全是雜訊的封包也會被報成版本不符。
+  // 那只是序列埠上多一行告警（而且節流過），不影響任何動作。
+  if (outVersion) *outVersion = header.version;
   return true;
 }
 
