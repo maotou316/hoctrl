@@ -254,14 +254,20 @@ PubSubClient mqttClient(espClient);
 //
 // review 補充（實測數字比對）：實機用 fakeslaves 20 量到的「餘裕 971 bytes」是樂觀值——
 // 那台測試板 SSID 短、沒設自訂 MQTT 伺服器，基礎欄位只吃了 310 bytes，遠低於
-// STATUS_BASE_MAX_BYTES=512 的預算。static_assert 真正依賴、且必須成立的是用這個
-// 常數乘上 HO_ESPNOW_MAX_SLAVES 算出的悲觀上界：26 台＝512+11+26×96=3019，
-// 對 statusBuf[3072] 只剩 52 bytes 餘裕；27 台（3115）就會超出。
+// STATUS_BASE_MAX_BYTES 的預算。static_assert 真正依賴、且必須成立的是用這個
+// 常數乘上 HO_ESPNOW_MAX_SLAVES 算出的悲觀上界。
+//
+// **Task 7 更新（原本這段寫的是 512／96／26 那組舊數字，已隨 "grp" 欄位改動）：**
+// 現行常數是 STATUS_BASE_MAX_BYTES=640、SLAVE_ENTRY_MAX_BYTES=104，
+// 執行期上限 maxEntries = (3072-1-640-11)/104 = **23**（不是舊註釋寫的 26）。
+//   - 規格上限 20 台的悲觀值：640+11+20×104 = 2731，對 statusBuf[3072] 餘裕 341
+//   - 23 台（極限）：640+11+23×104 = 3043，餘裕只剩 29
+//   - 24 台：3147 > 3071，static_assert 會直接編譯失敗
 // **日後若在 SlaveEntry／appendSlavesArray() 新增欄位，務必重新實算這個上界並
 // 更新這個常數**——static_assert 比較的只是這個常數本身，常數沒跟著新欄位變大，
-// 編譯期完全檢查不出「單筆條目其實已經超過 96 bytes」，那 52 bytes 的邊際
-// 會在不知不覺間被吃光，直到現場真的湊到 27 台才會發布時被 publishJsonDoc()
-// 的防線 1 擋下（不是編譯期，是執行期靜默放棄發布）。
+// 編譯期完全檢查不出「單筆條目其實已經超過 104 bytes」，那點邊際
+// 會在不知不覺間被吃光，直到現場真的湊到極限台數才會發布時被 publishJsonDoc()
+// 的防線 1 擋下（不是編譯期，是執行期放棄發布 —— 會印一行，不是靜默）。
 const size_t SLAVE_ENTRY_MAX_BYTES = 104;
 
 // slaves 陣列以外所有欄位的位元組上界。實算：
@@ -1780,15 +1786,24 @@ void formatSlaveVersion(int idx, char* out, size_t outSize) {
 }
 
 // 把 slaves 陣列加進 master 的狀態 doc。
-// 條目數量以 Task 1 的容量常數推算的上界為準；照現行數值（3072/512/96）
-// maxEntries = 26 ≥ HO_ESPNOW_MAX_SLAVES = 20，這條截斷路徑永遠走不到，
+// 條目數量以 Task 1 的容量常數推算的上界為準；照**現行**數值
+// （STATUS_BUF_SIZE=3072／STATUS_BASE_MAX_BYTES=640／SLAVES_KEY_OVERHEAD=11／
+// SLAVE_ENTRY_MAX_BYTES=104）算出 maxEntries = (3072-1-640-11)/104 = 23
+// （Task 5 review M2 加了 "grp" 欄位後，常數由 512／96 調成 640／104，
+// 上限也從 26 降到 23；這段註釋原本還寫著舊的 3072/512/96 與 26，已更正）。
+// 23 ≥ HO_ESPNOW_MAX_SLAVES = 20，這條截斷路徑永遠走不到，
 // 且已有 static_assert 在編譯期擋住「有人把 statusBuf 改小」。
 // 保留執行期截斷的意義是：萬一真的走到，App 看得到 slaves_truncated、
 // 序列埠也會告警，而不是靜默給出一份不完整的清單。
 // 最近一次群組指令的摘要（review M2）。開機以來沒下過群組指令就整個不帶。
 //
 // 每一個欄位的語義都嚴格限定在「送達」，沒有任何一個欄位宣稱「已執行」：
-//   cmd    最近一次群組指令的 HoRelayCmd（1=ON 2=OFF 3=PULSE）
+//   cmd    最近一次群組指令的 HoRelayCmd。**實際數值是 0=OFF 1=ON 2=PULSE**
+//          （見 libraries/HoEspNow/src/HoEspNowProtocol.h 的 enum HoRelayCmd）。
+//          這行原本寫「1=ON 2=OFF 3=PULSE」，三個都錯，Task 7 逐一對照 enum 後更正。
+//          序列埠的 `[控制] 廣播指令 %u …`／`[群組] 指令 %u 收工…`／
+//          `[控制] 送指令 %u 給 …` 印的都是同一組數值，所以 `alloff` 印的是
+//          **0** 不是 2 —— 回歸清單引用這些字串時務必用對數字。
 //   age_s  距離指令送出的秒數
 //   busy   1 = 補送還在進行中，0 = 已收工（收工的數字才是定案）
 //   n      快照台數
@@ -3258,7 +3273,18 @@ void handleSlaveCommand(const uint8_t mac[6], const String& message) {
 }
 
 // master 自己的指令分派（Phase 2a 的 mqttCallback() 內容原樣搬過來）。
-// ALL:*、PAIR:*、UNPAIR:* 等群組／配對指令由 Task 5、6 往這裡加分支。
+//
+// 分支現況（Task 7 更新，原註釋寫「由 Task 5、6 往這裡加分支」已過時）：
+// Task 5 已把 ALL:ON／ALL:OFF／SLAVES／PAIR:START／PAIR:STOP／UNPAIR:<id>／
+// UNPAIRALL 全部長出來，就在下面。**唯一還沒長的是 LR:**，它落在最後一個
+// else-if，只印一行「尚未實作」而不掉進「未知指令」——因為 Task 6（Long Range）
+// 已依 Phase 2b 的 Ruling 整個移到 Phase 5 執行，本階段不做。
+//
+// 這裡不擋任何未來分支，但**新增時務必同步 ho_master1/readme.md 的「控制指令表」
+// 與 docs/phase2b-regression-checklist.md**：本專案已經有**四次**「回歸清單的判準
+// 字串與程式碼不符，導致實測者把正確行為判成 FAIL」——第四次就是 Task 7 在
+// phase1 清單的 8e 抓到的（`alloff` 的指令碼被寫成 2，實際 HO_CMD_OFF = 0）。
+// 最終 else 的探針字串 `[MQTT] 未知指令: %s` 是 App 端驗證程序依賴的，不要改。
 void handleMasterCommand(const String& message) {
   if (message == "status") {
     publishStatus();

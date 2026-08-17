@@ -20,11 +20,12 @@ C3 版 GPIO 對齊 `ho_slave1.ino`（同一塊硬體）。
 1. **CPU**：C3 是單核 RISC-V，WROOM 是雙核。Phase 1（純 ESP-NOW 序列埠操作）沒差，
    但 Phase 2 的 master 要同時跑 WiFi + MQTT（5 台 broker）+ BLE + ESP-NOW，
    單核的 C3 壓力明顯較大，目前尚未實測，屆時若效能不足應優先選 WROOM。
-2. **Flash 空間**：Task 6 起 WROOM 版也改用 `PartitionScheme=custom`（與 C3 共用
+2. **Flash 空間**：Phase 2a Task 6（BLE 配網）起 WROOM 版也改用
+   `PartitionScheme=custom`（與 C3 共用
    `ho_master1/partitions.csv`，app0/app1 各 `0x1F0000` = 2,031,616 bytes），
-   兩者 app0 分區大小**相同**，差異只在實際用量：
-   - WROOM：實測約 1,680,595 bytes（**82.7%**），餘裕僅約 343KB
-   - C3：實測約 1,296,709 bytes（約 63.8%），餘裕約 718KB
+   兩者 app0 分區大小**相同**，差異只在實際用量（Phase 2b Task 7 收尾實測）：
+   - WROOM：**1,698,515 bytes（83.60%）**，餘裕約 325KB
+   - C3：**1,318,241 bytes（64.89%）**，餘裕約 696KB
    BLE（Bluedroid）在 WROOM 上占用明顯較多 flash，是兩者差距的主因。
    詳見文末「已知風險」第一項。
 3. **C3 版若要接繼電器，有硬體限制**：GPIO 4/7 是 ESP32-C3 的 JTAG 腳（MTMS/MTDO），
@@ -35,8 +36,26 @@ C3 版 GPIO 對齊 `ho_slave1.ino`（同一塊硬體）。
 ## 角色
 
 Phase 1 階段是純 ESP-NOW 主控，用序列埠指令操作。
-Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間的唯一對外窗口
-（但**尚未**代發代訂閱 slave 的訊息，那是 Phase 2b）。
+Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間的唯一對外窗口。
+**Phase 2b 完成後，master 是 20 台 slave 的完整 MQTT 代理**：代每台 slave 發布
+`hoban/<slaveId>/status`、代每台 slave 訂閱 `hoban/<slaveId>/control`，
+所以 slave 在 App 眼裡就是一台普通設備。
+
+**Phase 2b 沒有做的事**（不要從上面那句推論成「都好了」）：
+
+| 項目 | 狀態 |
+|---|---|
+| Long Range（`LR:*` 指令、`esp_wifi_set_protocol()`） | **完全未實作**。原 Task 6 已依 Ruling 整個移到 Phase 5，`LR:` 分支目前只印一行「尚未實作」；`long_range` 欄位恆為 `false` |
+| ESP-NOW 轉送 OTA（`update:{JSON}`） | 未實作，Phase 4 |
+| App 端的樹狀 UI、讀 `grp`／`group.noack` | 未做，Phase 3 |
+| 指令歸因欄位（讓「已執行」可證明） | 未做，**技術債已具名登記給 Phase 4 Task 1** |
+
+> **⚠ 整個 Phase 2b（Task 1~5、7）至今零實機回歸。**
+> 所有結論——包含本文件的每一段推論、`docs/phase2b-regression-checklist.md`
+> 的每一條預期輸出——都是**靜態推演**，唯一真正跑過硬體的只有 Task 2 的
+> `fakeslaves 20` + `jsonsize`（實測 2100 bytes）。
+> Phase 2b 的 review 過程中出現過一次「靜態推演錯到連『新測試抓不抓得到目標缺陷』
+> 都推錯」，所以請不要把本文件的任何一句當成實測結論。
 
 ## 序列埠指令
 
@@ -52,7 +71,16 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 | `unpairall` | 清空整份名冊（分批執行，每輪 `loop()` 拆一台，心跳不中斷） |
 | `ch <n>` | 測試用：切換 channel，驗證 slave 重掃 |
 | `droppeer <n>` | **測試用**：刪掉第 n 台的 ESP-NOW peer 但**保留名冊條目**，製造「在名冊上卻送不出單播」。回歸清單 8e 專用。不寫 NVS、不動名冊內容，重開機或重新配對即恢復。**傷害面**：App 對那台的個別開／關會**靜默失敗**到重開機為止；群組關門仍有效（主指令走廣播×3），但它會被誠實記成未送達 |
+| `fakeslaves <n>` | **測試用**：把名冊灌成 n 台假 slave（MAC 固定為 `AA:BB:CC:DD:EE:<n>`），量狀態 JSON 容量用。**不寫 NVS**、**不註冊 ESP-NOW peer**。灌入後 `fakeSlavesActive` 會鎖住 `saveSlaves()` 直到重開機，避免假 MAC 經由後續的 pair／unpair 流程寫進 NVS 汙染真實名冊 |
+| `jsonsize` | **測試用**：用 `buildStatusDoc()` + `measureJson()` 印出「實際會發布的那份 JSON」的大小，與 `statusBuf`／mqtt buffer 對照。不需連上 MQTT |
 | `help` | 顯示說明 |
+
+**沒有 `lr on｜off` 這條序列埠指令。** Long Range 的原 Task 6 已整個移到 Phase 5，
+兩端都還沒有任何 LR 開關（`longRangeEnabled` 全檔只有讀取點、沒有寫入 `true` 的路徑）。
+
+`fakeslaves` 與 `droppeer` 兩條是**破壞性測試工具**，只在序列埠可達（需要實體 USB），
+沒有 MQTT 入口。差別是：`fakeslaves` **會覆蓋整份名冊**（真實 slave 這次開機不再被追蹤），
+`droppeer` **完全不動名冊內容**（只刪 ESP-NOW peer 表這份 RAM 資料）。
 
 ## 配對
 
@@ -337,24 +365,68 @@ ESP-NOW peer 用 `channel = 0`（跟隨當前實體 channel），master 的 STA 
 
 `<deviceId>` 格式為 `hoban-<MAC位址>`，與 BLE 裝置名稱相同；`<slaveDeviceId>` 同格式，用 slave 自己的 MAC。
 
-### 控制指令表（master 自己的 `hoban/<masterId>/control`）
+**topic 總數 ＝ (1 + slave 台數) × 2。** 名冊滿 20 台時是 **21 組、42 條 topic**：
 
-| 指令 | 行為 |
-|---|---|
-| `status` | 立即 `publishStatus()` 回報一次 |
-| `ON` | `pulseRelay(2000)` 點動 master 自己的繼電器 2 秒，並回報狀態 |
-| `OFF` | `setRelayPins(false)` 關閉 master 自己的繼電器，並回報狀態 |
-| `reset` | 清除 NVS 網路設定並重啟，回到 BLE 配網模式 |
-| `FIND_BEST_SERVER` | 主動斷開目前 MQTT 連線，把輪詢游標歸零（`resetMqttProbe()`）後重新走 `smartConnect()`。注意：`smartConnect()` 一次只試一台，第一台連不上時會由 `loop()` 每 10 秒推進一台，不會在單次呼叫裡試完全部 |
-| `HASRELAY:ON` / `HASRELAY:OFF` | 設定「本機是否有接繼電器」並存 NVS，回報狀態 |
-| `ALL:ON` | `sendCmdToAll(HO_CMD_PULSE, 2000)` —— **廣播點動 2 秒，不是持續 ON**，語義與單台 `ON` 一致；含 master 自己的繼電器。**這就是 App「全部關門」按鈕實際送的指令** |
-| `ALL:OFF` | `sendCmdToAll(HO_CMD_OFF, 0)` —— 把所有繼電器**持續斷開**，含 master 自己的。**App 不送這條**（全 repo 的 `lib/`／`test/` 沒有任何一處），目前只有序列埠 `alloff` 會走到 |
-| `SLAVES` | `markAllSlavesDirty()` ＋ 一次 `publishStatus()`。名冊會在接下來一輪內逐台重壓保留訊息，不在這裡連發 20 則 |
-| `PAIR:START` | `enterPairingMode()`，開一個 60 秒配對視窗（`PAIRING_TIMEOUT`，與 App 的 60 秒倒數對齊）。**期間可連續配對多台，配對成功不會自動退出** |
-| `PAIR:STOP` | `exitPairingMode()` |
-| `UNPAIR:<deviceId>` | 解除指定 slave（`hoban-xxxxxxxxxxxx`）。ID 格式錯誤或不在名冊上都只印一行，不動作 |
-| `UNPAIRALL` | 清空整份名冊。**只插旗，實際拆除由 `loop()` 的 `processUnpairAll()` 每輪拆一台**（理由見下方「UNPAIRALL 為什麼必須分批」） |
-| `LR:*` | 尚未實作（Phase 2b Task 6），印一行明確回應而不是掉進「未知指令」 |
+| 誰 | status（發布，retain） | control（訂閱） | 由誰負責 |
+|---|---|---|---|
+| master 自己 | `hoban/hoban-<masterMac>/status` | `hoban/hoban-<masterMac>/control` | 自己；**LWT 名額也在這一條 status 上** |
+| slave #0 | `hoban/hoban-<slave0Mac>/status` | `hoban/hoban-<slave0Mac>/control` | master 代發／代訂閱 |
+| … | … | … | … |
+| slave #19 | `hoban/hoban-<slave19Mac>/status` | `hoban/hoban-<slave19Mac>/control` | master 代發／代訂閱 |
+
+- **topic 用的是 slave 自己的 MAC，不是 master 的**，所以 App 眼裡它就是一台獨立設備。
+- 代發的 payload 多一個 `via` 欄位指回 master（一般設備沒有這個欄位）。
+- **代訂閱不用萬用字元 `hoban/+/control`**：預設清單裡有三台公用 broker
+  （emqx.io、hivemq.com、eclipseprojects.io），萬用字元會收到全世界所有 hoban 設備的
+  控制訊息。逐台訂閱。
+- 訂閱是**游標式、每輪 `loop()` 最多一格**（`controlSubscribeScheduler()`），
+  不是一口氣訂完 21 條（理由見「代訂閱與指令轉發」）。
+
+### 完整 MQTT 指令表（Phase 2a + 2b，含「送到哪個 topic」）
+
+**只有兩種 control topic**，指令送錯 topic 一律不會有作用：
+
+- `hoban/<masterId>/control` —— master 自己的。`<masterId>` ＝ master 的
+  `hoban-<自己的 MAC>`。**下表 A 區的所有指令都送這裡**。
+- `hoban/<slaveId>/control` —— **每台 slave 各一條**，由 master 代訂閱。
+  `<slaveId>` ＝ 該 slave 的 `hoban-<它自己的 MAC>`。**下表 B 區只有 3 條指令**。
+
+判斷路徑是 `mqttCallback()`：先 `parseControlTopic()` 解析出 MAC，
+與自己的 MAC 相同 → `handleMasterCommand()`；否則 `findSlave()` 查名冊，
+在名冊上 → `handleSlaveCommand()`，不在 → 印
+`[MQTT] 指令的目標不在名冊上，忽略: <topic>` 並丟棄。
+
+#### A 區：送到 `hoban/<masterId>/control`
+
+| 指令 | 送到的 topic | 行為 |
+|---|---|---|
+| `status` | master | 立即 `publishStatus()` 回報一次（含 `slaves` 陣列與 `group` 摘要） |
+| `ON` | master | `pulseRelay(2000)` 點動 **master 自己**的繼電器 2 秒，並回報狀態 |
+| `OFF` | master | `setRelayPins(false)` 關閉 **master 自己**的繼電器，並回報狀態 |
+| `reset` | master | `clearNetConfig()` 清 NVS 的 **`hoban` 命名空間**（WiFi／MQTT 設定）後 `ESP.restart()`，回到 BLE 配網模式。**不清 `homaster` 命名空間**（slave 名冊與 `espch`） |
+| `FIND_BEST_SERVER` | master | 主動斷開目前 MQTT 連線，把輪詢游標歸零（`resetMqttProbe()`）後重新走 `smartConnect()`。注意：`smartConnect()` 一次只試一台，第一台連不上時會由 `loop()` 每 10 秒推進一台，不會在單次呼叫裡試完全部 |
+| `HASRELAY:ON` / `HASRELAY:OFF` | master | 設定「本機是否有接繼電器」並存 NVS，回報狀態 |
+| `ALL:ON` | master | `sendCmdToAll(HO_CMD_PULSE, 2000)` —— **廣播點動 2 秒，不是持續 ON**，語義與單台 `ON` 一致；含 master 自己的繼電器。**這就是 App「全部關門」按鈕實際送的指令** |
+| `ALL:OFF` | master | `sendCmdToAll(HO_CMD_OFF, 0)` —— 把所有繼電器**持續斷開**，含 master 自己的。**App 不送這條**（全 repo 的 `lib/`／`test/` 沒有任何一處），目前只有序列埠 `alloff` 會走到 |
+| `SLAVES` | master | `markAllSlavesDirty()` ＋ 一次 `publishStatus()`。名冊會在接下來一輪內逐台重壓保留訊息，不在這裡連發 20 則 |
+| `PAIR:START` | master | `enterPairingMode()`，開一個 60 秒配對視窗（`PAIRING_TIMEOUT`，與 App 的 60 秒倒數對齊）。**期間可連續配對多台，配對成功不會自動退出** |
+| `PAIR:STOP` | master | `exitPairingMode()` |
+| `UNPAIR:<deviceId>` | master | 解除指定 slave（`hoban-xxxxxxxxxxxx`）。**注意是送到 master 的 topic，不是那台 slave 的 topic**。ID 格式錯誤或不在名冊上都只印一行，不動作 |
+| `UNPAIRALL` | master | 清空整份名冊。**只插旗，實際拆除由 `loop()` 的 `processUnpairAll()` 每輪拆一台**（理由見下方「UNPAIRALL 為什麼必須分批」） |
+| `LR:*` | master | **尚未實作。** 分支只印一行 `[LR] 指令尚未實作（Task 6）`，讓它不掉進「未知指令」。字串裡的「Task 6」是**寫於移轉之前的舊編號**——該 Task 已依 Phase 2b 的 Ruling 整個移到 **Phase 5**。`LR:` 開頭的任何字串（`LR:ON`／`LR:OFF`／`LR:whatever`）都走這一條，**沒有任何實際效果** |
+| 其他任何字串 | master | 印 `[MQTT] 未知指令: <字串>`（App 的驗證程序依賴這行探針字串） |
+
+#### B 區：送到 `hoban/<slaveId>/control`（master 代訂閱後轉成 ESP-NOW）
+
+| 指令 | 送到的 topic | 行為 |
+|---|---|---|
+| `ON` | 該 slave | `sendCmdToSlaveMac(mac, HO_CMD_PULSE, 2000)` —— **點動 2 秒，不是持續開啟** |
+| `OFF` | 該 slave | `sendCmdToSlaveMac(mac, HO_CMD_OFF, 0)` |
+| `status` | 該 slave | 先用名冊上目前已知的狀態立刻代發一則（`publishSlaveStatus()`），再 `requestSlaveStateIndex()` 向 slave 要一次最新狀態，回來時 `dirty` 會觸發第二則代發。**群組指令進行中時第二步會讓開**（印 `[代理] <id> 群組指令進行中，稍後再向它要最新狀態`），第一步照做，App 不空等 |
+| 其他 | 該 slave | 印 `[代理] <slaveId> 不支援的指令: …`，不做任何動作 |
+
+**B 區沒有 `reset`／`ALL:*`／`PAIR:*`／`HASRELAY:*`／`FIND_BEST_SERVER`。**
+往 slave 的 topic 送這些只會得到「不支援的指令」，不會被轉去 master 執行。
 
 目前**尚未支援** `update:{JSON}` OTA 指令 —— 那是 Phase 4 才加。
 
@@ -563,12 +635,7 @@ publish 最壞是 10 秒級黑箱 —— 20 台合計最壞**超過 60 秒沒有
 
 ### 代理指令表（slave 的 `hoban/<slaveId>/control`，Phase 2b Task 4）
 
-| 指令 | 行為 |
-|---|---|
-| `ON` | `sendCmdToSlaveMac(mac, HO_CMD_PULSE, 2000)` —— **點動 2 秒，不是持續開啟** |
-| `OFF` | `sendCmdToSlaveMac(mac, HO_CMD_OFF, 0)` |
-| `status` | 先用名冊上目前已知的狀態立刻代發一則（`publishSlaveStatus()`），同時 `requestSlaveState()` 向 slave 要一次最新狀態，回來時 `dirty` 會觸發第二則代發 |
-| 其他 | 序列埠印 `[代理] <slaveId> 不支援的指令: …`，不做任何動作 |
+指令清單見上方「完整 MQTT 指令表」的 **B 區**，這裡只記語義選擇的理由。
 
 `ON` 送 `HO_CMD_PULSE` 而不是 `HO_CMD_ON` 是刻意的：App 對一般 hoRelay 設備送的
 `ON` 語義是「開門」＝點動一次，master 自己的 `ON` 分支也是 `pulseRelay(2000)`。
@@ -576,7 +643,10 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
 「開保險 → 關門 → 關保險」三段鎖流程對 slave 的行為會與其他設備不同。
 **持續開啟只保留給序列埠的 `on <n>`**（現場除錯用）。
 
-### 狀態 JSON 範例
+### master 自身狀態 JSON（`hoban/<masterId>/status`，retain）
+
+**以下欄位逐一取自 `buildStatusDoc()` ＋ `appendGroupResult()` ＋
+`appendSlavesArray()` 的實際程式碼，不是從規格抄的。**
 
 ```json
 {
@@ -584,6 +654,7 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
   "status": "online",
   "version": "1.0.0",
   "model": "hoMaster1",
+  "server": "mqttgo.io",
   "timestamp": 123456,
   "wifi": {
     "connected": true,
@@ -597,21 +668,46 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
     "pairing": false,
     "slave_count": 2,
     "channel": 6,
-    "long_range": false
-  }
+    "long_range": false,
+    "free_heap": 123456
+  },
+  "group": {
+    "cmd": 3, "age_s": 2, "busy": 0,
+    "n": 2, "ack": 1, "noack": 1, "gone": 0,
+    "exec": "unprovable"
+  },
+  "slaves": [
+    {"id":"hoban-aabbccddeeff","relay":0,"online":true,"rssi":-72,"version":"1.0.0","grp":1},
+    {"id":"hoban-112233445566","relay":0,"online":false,"rssi":-100,"version":"0.0.0","grp":0}
+  ]
 }
 ```
 
-Phase 2a 尚未包含 `slaves` 陣列（各 slave 的個別狀態）；Phase 2b Task 1/2 已補上
-（`appendSlavesArray()`），容量瓶頸細節見文末「已知風險」第三項。
+**條件出現的欄位**（不是每一則都有）：
 
-### 代發 slave 狀態（Phase 2b Task 3）
+| 欄位 | 何時出現 |
+|---|---|
+| `group` | **開機以來下過至少一次群組指令**才有（`if (!groupJob.everRan) return;`）。冷開機後第一則 status 沒有這個物件 |
+| `slaves[i].grp` | 該台**在最近一次群組指令的快照裡**才有（`groupDeliveryFor()` 回 −1 就整個不帶）。指令之後才配對進來的 slave 沒有 |
+| `slaves_truncated` / `slaves_shown` | 名冊台數超過執行期上限才有。**照現行常數（3072／640／11／104）算出的 `maxEntries` 是 23，而名冊上限 `HO_ESPNOW_MAX_SLAVES` 是 20，所以這兩個欄位在正常情況下永遠不會出現**。它們存在的意義是：萬一有人改小 buf 又繞過 `static_assert`，App 與序列埠都看得見，而不是靜默給出一份不完整的清單 |
+| `long_range` | **一定有，而且恆為 `false`** —— `longRangeEnabled` 全檔沒有任何寫入 `true` 的路徑（Long Range 在 Phase 5 才做） |
 
-master 除了自己的 `hoban/<deviceId>/status`，還會用**每台 slave 的 MAC** 代發一份
-`hoban/hoban-<slaveMac>/status`，讓 slave 在 App 眼裡就是一台普通設備 —— App 現有
-的設備卡片、詳情頁、「開保險→關門→關保險」三段鎖幾乎零改動就能個別控制每台 slave。
+`group` 摘要每個欄位的語義（全部嚴格限定在「送達」，**沒有任何一個宣稱「已執行」**）：
 
-**payload 格式**（由 `publishSlaveStatus()` 組出）：
+| 欄位 | 語義 |
+|---|---|
+| `cmd` | 最近一次群組指令的 `HoRelayCmd`。**實際數值是 `0 = OFF`、`1 = ON`、`2 = PULSE`**（`libraries/HoEspNow/src/HoEspNowProtocol.h`）。`appendGroupResult()` 上方的註釋原本寫成「1=ON 2=OFF 3=PULSE」，三個都錯，Task 7 已更正。**`ALL:ON` 送的是 `HO_CMD_PULSE`，所以它的 `cmd` 是 `2` 不是 `1`** |
+| `age_s` | 距離該次指令送出的秒數 |
+| `busy` | `1` ＝ 補送還在進行中，`0` ＝ 已收工。**只有 `busy: 0` 的數字才是定案** |
+| `n` | 快照台數 |
+| `ack` | 單播拿到 MAC 層 ACK 的台數（**只是送達**） |
+| `noack` | 沒拿到的台數 —— **這就是 App 該顯示紅色的依據** |
+| `gone` | 指令期間離開名冊的台數（同樣未送達） |
+| `exec` | **固定寫死 `"unprovable"`**，用來擋掉「App 把 `ack` 當成關門成功」這條誤讀路徑 |
+
+### 代發的 slave 狀態 JSON（`hoban/<slaveId>/status`，retain）
+
+由 `publishSlaveStatus()` 組出，**每台 slave 各一個 topic**：
 
 ```json
 {
@@ -619,16 +715,34 @@ master 除了自己的 `hoban/<deviceId>/status`，還會用**每台 slave 的 M
   "status": "online",
   "version": "1.0.0",
   "model": "hoSlave1",
-  "via": "hoban-<masterMac>",
+  "via": "hoban-a0b1c2d3e4f5",
   "timestamp": 12345,
   "wifi": { "connected": true, "ssid": "ESP-NOW", "rssi": -72, "ip": "N/A" },
-  "device": { "relay": 0 }
+  "device": { "relay": 0, "grp": 1 }
 }
 ```
 
-`wifi` 區塊刻意填成與一般設備相同的形狀，讓 App **兩個頁面（設備卡片／詳情頁）
-各自的 `_handleMqttMessage` 手動解析**不用改就能吃下同一份 payload；`rssi` 借來
-顯示 ESP-NOW 訊號強度；`via` 是新欄位，標示這台是被哪一台 master 代發的。
+- `status` 與 `wifi.connected` 都跟著 `slaves[i].online`（規格範例把 `wifi.connected`
+  寫死 `true`，這裡**刻意偏離**：寫死 true 會讓離線的 slave 在 App 上永遠顯示在線）。
+- `version` 是 slave 回報過的韌體版本；**還沒回報過任何狀態時 `formatSlaveVersion()`
+  給的是 `"0.0.0"`**（`addSlave()`／`loadSlaves()` 把 `fwMajor/Minor/Patch` 都初始化成 0），
+  不是空字串也不是 `null` —— 剛從 NVS 載入、還沒被輪詢到的 slave 就是這個值。
+- `via` 標示這台是被哪一台 master 代發的（**Phase 3 的 App 要靠它處理「master 離線」**，
+  見「代發 slave 狀態」一節的 LWT 缺口）。
+- `device.grp` 與 master 狀態的 `slaves[].grp` 是同一個值、同一個語義，
+  **不在最近一次群組指令的快照裡就整個不帶**。
+- `wifi.ssid` 固定字串 `"ESP-NOW"`、`wifi.ip` 固定字串 `"N/A"`、`rssi` 借來顯示
+  ESP-NOW 訊號強度 —— 這個形狀是刻意跟一般設備對齊的，App 兩個頁面各自的
+  `_handleMqttMessage` 手動解析不用改就吃得下。
+
+### 代發 slave 狀態（Phase 2b Task 3）
+
+master 除了自己的 `hoban/<deviceId>/status`，還會用**每台 slave 的 MAC** 代發一份
+`hoban/hoban-<slaveMac>/status`，讓 slave 在 App 眼裡就是一台普通設備 —— App 現有
+的設備卡片、詳情頁、「開保險→關門→關保險」三段鎖幾乎零改動就能個別控制每台 slave。
+
+**payload 格式**見上方「代發的 slave 狀態 JSON」一節（逐欄位取自
+`publishSlaveStatus()` 的實際程式碼）。
 
 **review 更正**：這裡原本引用 `Device.updateFromMqttMessage()`，但那支函式在
 `lib/` 沒有生產呼叫點，實際解析路徑是上述兩個頁面各自的手動解析，已更正。
@@ -815,21 +929,74 @@ Phase 2a 的 `mqttCallback()` 是把 topic 與自己的 control topic 做完整�
 | 網路設定儲存 | EEPROM 128 bytes，`mqttPassword` 與 `mqttPort` 位址重疊，MQTT 密碼實際只能 12 字元 | NVS（`Preferences`），各欄位獨立，密碼上限 64 字元 |
 | WiFi 連線 | 掃描＋多段 auth mode 退避重試 | 不掃描、記住 channel/BSSID 直接關聯、無 auth mode 退避（見已知風險） |
 | WiFi 中斷 WiFi 驅動 | `WiFi.disconnect(true)`／關閉驅動 | `WiFi.disconnect(false)`，驅動保持存活供 ESP-NOW 使用 |
-| MQTT buffer / timeout | 未設定（256 bytes／15 秒逾時） | `setBufferSize(1024)` / `setSocketTimeout(3)` |
+| MQTT buffer / timeout | 未設定（256 bytes／15 秒逾時） | `setBufferSize(3328)` / `setSocketTimeout(3)`（Phase 2b Task 1 從 1024 放大到 3328，因為狀態 JSON 要塞 20 台 slave；**`setSocketTimeout()` 對 `publish()` 無效**，見上方殘存風險） |
 | LED | 恆亮／閃爍幾種簡單狀態 | 一次性事件閃爍 ＋ 持續式狀態機（見上方「LED 狀態指示」） |
 | 韌體更新（OTA） | MQTT `update:{JSON}` 指令 | 尚未支援，留給 Phase 4 |
 
 ## 已知風險
 
-### 1. WROOM flash 用量偏緊（83.3%）
+> **這一節是索引，不是全部。** 幾條最重要的風險的完整論證寫在各自的章節裡，
+> 這裡只給一句話與連結 —— 因為之前有人直接跳來看這一節，第一眼看到的是 flash 用量，
+> 而**排在第 0 項的那條才是最嚴重的**。
 
-Phase 2b Task 4（含 review 修正）後實測 1,692,467 / 2,031,616 bytes
-（app0 分區，**83.30%**），餘裕約 331KB。**注意 `arduino-cli` 印的百分比（10%）分母是 16MB 的預設值，
+### 0. 【最嚴重】MQTT socket 寫入的阻塞**沒有硬上限，可以超過 slave 的 30 秒失聯門檻，而且目前無防護**
+
+**後果是籠門被打開**（slave 超過 30 秒沒收到心跳就強制關閉繼電器）。
+機制、後果與「為什麼現行的名額守衛擋不住」的完整說明在
+**「ESP-NOW 心跳的實際保證」→「已知殘存風險」**那一節，請務必讀過。
+
+一句話版本：`PubSubClient::publish()`／`subscribe()` 走
+`NetworkClient::write()`，**部分寫入成功時會把重試計數器重置回 10**，
+所以常被引用的「10 秒」是**名目值不是硬上限**；病態 socket（例如對端 TCP 視窗
+趨近於零）可以無限期地反覆重置。現行的
+`mqttPublishBudgetUsed` 名額守衛只保證**「每輪 `loop()` 最多發生一次」**，
+**完全不保證「單次有多長」**。
+
+**處置：無。** 要封死只能 fork `PubSubClient`（在它的 `write()` 內部插心跳）
+或換成非阻塞的 MQTT 客戶端，兩者都超出 Phase 2b 範圍。
+
+> **它擋不住什麼，也要一起寫**：本節下方的所有其他防線（三／四層防護、
+> 群組指令的 6 秒 wall-clock 上限、`unpairall` 分批）擋的都是**「多次阻塞疊加」**，
+> 沒有任何一條擋得住**「單次阻塞過長」**。**別把它們讀成已經解決了第 0 項。**
+
+### 0-b. 群組廣播沒有 ack，「已送達」不等於「已關門」
+
+- **廣播沒有 ACK**：`esp_now_send()` 對廣播位址**永遠回報成功**，
+  不代表任何一台收到了。可靠性全押在第 2、3 段（逐台單播 → 對未取得 MAC 層 ACK 的補送）。
+  **廣播命中率至今沒有任何數據支撐**，第一次實測要記錄「第 1 趟就全部確認的比例」。
+- **「已執行」在現行協定下原理上無法證明**：`HoStatePayload` 沒有任何指令歸因欄位
+  （沒有「我剛執行了哪一則指令」的 seq／echo），所以韌體**只有失敗證明，沒有成功證明**。
+  MQTT 的 `group.exec` 因此固定寫死 `"unprovable"`。
+  **這筆技術債已具名登記給 Phase 4 Task 1**（那個 Task 本來就要動協定、是已排定的
+  flag-day、兩端同時重燒）。完整論證見「只宣稱可證明的事」那一節。
+- **關門的實際路徑是 `ALL:ON` → `HO_CMD_PULSE`，不是 `ALL:OFF`**。
+  App 全 repo 送 `ALL:OFF` 的地方是 **0 處**，而且
+  `lib/pages/device_detail_page.dart` 有具名註釋寫著「不要因為按鈕寫『關門』
+  就改成 `ALL:OFF`，那是把所有繼電器持續斷開」。
+
+### 0-c. 代發的 slave topic 沒有 LWT：master 斷電時 20 台 slave 會停在最後一則 `online`
+
+PubSubClient **一條連線只有一個 will（遺囑）名額**，已經給了 master 自己的
+`hoban/<masterId>/status`。所以代發機制只涵蓋「master 活著、slave 失聯」，
+**master 自己斷電或失去網路時做不到**（沒有 `loop()` 可以跑）。
+
+處置：發 `via` 欄位，**由 Phase 3 的 App 用「master 離線 → 其底下所有 slave 一律
+視為狀態不明」處理**。韌體端無解，除非改成每台 slave 一條 MQTT 連線（不可能，slave 沒有 WiFi）。
+
+### 0-d. 整個 Phase 2b 零實機回歸
+
+見文件開頭「角色」一節的警告框。`docs/phase2b-regression-checklist.md`
+的每一項都還沒有人跑過。
+
+### 1. WROOM flash 用量偏緊（83.60%）
+
+Phase 2b 收尾實測 **1,698,515 / 2,031,616 bytes（app0 分區，83.60%）**，
+餘裕約 325KB。**注意 `arduino-cli` 印的百分比（10%）分母是 16MB 的預設值，
 不是本 sketch 實際使用的 `partitions.csv` 的 app0（2,031,616 bytes），
 要自己換算。**
 Phase 4 要加轉送 OTA 的程式碼前，務必先跑 `.\flash.ps1 -Model master` 確認還編得過；
 若餘裕不足，需考慮用 NimBLE 取代目前的 Bluedroid（BLE stack 是兩板差距的主因，
-C3 同一份 `partitions.csv` 下用量僅約 64.5%）。
+C3 同一份 `partitions.csv` 下用量僅約 64.9%）。
 
 ### 2. WiFi 連線沒有 auth mode 退避
 
@@ -844,28 +1011,97 @@ master 只會用預設方式嘗試一次、失敗就等下一輪重連（見 `lo
 若之後遇到真的連不上的路由器，屆時再針對該款 AP 補特定的重試模式，
 比現在盲目加五段退避更務實。
 
-### 3. 狀態 JSON 的真正容量瓶頸是 `char buf[512]`
+### 3. 狀態 JSON 的容量：三層防線（Phase 2b Task 1／2）
 
-不是 `mqttClient` 的 1024 buffer。`publishStatus()` 目前實測最壞情況約 317 bytes，
-餘裕僅約 195 bytes。真正會**截斷**輸出的邊界是 `char buf[512]`：`serializeJson()`
-寫入固定大小 buffer 時確實會截斷，且截斷後的長度仍小於 `mqttClient` 的 1024
-buffer，`publish()` 因此仍會回傳 `true`。`publishStatus()` 的 `if (!res)` 診斷
-只抓得到「連 1024 都塞不下」的極端案例，所以另外補了 `n >= sizeof(buf) - 1`
-這道有效的截斷偵測。
+**Phase 2a 的血淚背景**：`serializeJson(doc, buf)` 寫進固定大小的 `char buf` 時會
+**靜默截斷** —— 截斷後的長度仍小於 `mqttClient` 的 buffer，`publish()` 照樣回傳
+`true`，於是 broker 收到語法殘缺的 JSON、App 解析失敗，而序列埠上什麼異常都看不到。
+Phase 2a 的狀態最壞 317 bytes，對 `char buf[512]` 只剩約 195 bytes 餘裕，
+而 Phase 2b 要加的 20 台 `slaves` 陣列需要 1900+ bytes，必定超過。
 
-**`doc.overflowed()` 在本專案的 ArduinoJson 7.4.3 抓不到「超過 512 bytes」**：
-這個版本的 `StaticJsonDocument<512>` 只是 `compatibility.hpp` 提供的相容殼
-（`class StaticJsonDocument : public JsonDocument`），`512` 這個 N 完全被忽略、
-底層一律動態配置記憶體。所以 `doc.overflowed()` 量的是「記憶體配置失敗」，
-不是「內容超過容量」——正常情況下不會因為 JSON 內容大小觸發，只有 heap 真的
-配置不出來時才會回 `true`。仍保留這道檢查（配置失敗本身值得知道），但序列埠
-警告訊息已改用「記憶體配置失敗」的措辭，不再說「超出 512 容量」。
+#### 為什麼放大 `StaticJsonDocument<N>` 完全沒有用
 
-Phase 2b 加入 `slaves` 陣列（每台 slave 的個別狀態）時，**必須同時放大兩處**：
-`char buf[512]`、以及 `mqttClient.setBufferSize(1024)`，兩者任一沒跟著放大都會讓
-新加的欄位被靜默截斷或整包發布失敗。`StaticJsonDocument<512>` 的 `512` 在
-ArduinoJson 7.x 已無容量作用（見上段說明），要改的話純粹是為了可讀性、
-讓數字與 `buf`/`setBufferSize` 對齊，不是為了擴充容量，不改也不影響功能。
+本專案的 ArduinoJson 是 **7.4.3**。這個版本的 `StaticJsonDocument<N>` 只是
+`compatibility.hpp` 提供的相容殼（`class StaticJsonDocument : public JsonDocument`），
+**`N` 完全被忽略，底層一律動態配置**。連帶的結論有兩個，兩個都很違反直覺：
+
+1. **把 `<512>` 改成 `<3072>` 不會多出任何容量**，那個數字自始至終沒有作用。
+   （現行程式已全面改用 `JsonDocument`，只剩 BLE `onWrite()` 三處固定內容的回應
+   還留著 `StaticJsonDocument<200>/<350>`，那三處永遠不會變大、功能零風險。）
+2. **`doc.overflowed()` 量的是「記憶體配置失敗」，不是「內容超過容量」** ——
+   正常情況下不會因為 JSON 變大而觸發，只有 heap 真的配置不出來才回 `true`。
+
+**所以容量控制不能依賴任何宣告容量，只能依賴 `measureJson()` 的實測值。**
+這就是三層防線的設計前提。
+
+#### 三層防線
+
+| 層 | 位置 | 擋什麼 |
+|---|---|---|
+| **1. 編譯期 `static_assert`** | 常數宣告區 | 有人把 `STATUS_BUF_SIZE` 改小、或把 `STATUS_BASE_MAX_BYTES` 改大到放不下 20 台 → **編譯直接失敗**，而不是上線後才靜默截斷 |
+| **2. 執行期上限 ＋ `slaves_truncated` 標記** | `appendSlavesArray()` | 名冊台數超過 `maxEntries` 時只放前 N 台，並在 JSON 帶 `slaves_truncated`／`slaves_shown`、序列埠印 `⚠ [MQTT] slaves 陣列被截斷：…`。**照現行常數這條路永遠走不到**（`maxEntries` 23 > 名冊上限 20），留著是為了「萬一走到，看得見」 |
+| **3. 發布出口先量再發** | `publishJsonDoc()` | `measureJson()` 量出實際需求，放不下 `statusBuf` 或放不下 mqtt buffer 就**整包不發**並印出實際需求。加上序列化後的 `n >= sizeof(statusBuf) - 1` 兜底。**寧可不發，也絕不發半截 JSON** |
+
+**第 3 層是物理保證，不是紀律**：全檔只有**一處** `mqttClient.publish(`，
+就在 `publishJsonDoc()` 內部，三層檢查都在它之前 `return`。
+
+#### `static_assert` 的算式與現行數字
+
+```
+(STATUS_BUF_SIZE - 1 - STATUS_BASE_MAX_BYTES - SLAVES_KEY_OVERHEAD)
+    / SLAVE_ENTRY_MAX_BYTES  >=  HO_ESPNOW_MAX_SLAVES
+(3072 - 1 - 640 - 11) / 104 = 2420 / 104 = 23  >=  20   ✔
+```
+
+| 項 | 值 | 來源 |
+|---|---|---|
+| `STATUS_BUF_SIZE` | 3072 | 序列化用的共用緩衝區，放 `.bss` 不放堆疊（loopTask 只有 8192） |
+| `-1` | | `serializeJson()` 的字串結尾安全邊界 |
+| `STATUS_BASE_MAX_BYTES` | 640 | `slaves` 以外所有欄位的**悲觀**上界（實算約 576） |
+| `SLAVES_KEY_OVERHEAD` | 11 | `"slaves":[]` 剛好的字元數 |
+| `SLAVE_ENTRY_MAX_BYTES` | 104 | 單筆條目的悲觀上界（逐字元實算最壞 **97**，含 Task 5 加的 `"grp"`） |
+| `MQTT_BUFFER_SIZE` | 3328 | 3072 + 固定標頭 5 + 長度欄位 2 + topic 31 = 3110，取 3328 留餘裕 |
+
+**它保證什麼**：常數被改壞時編譯失敗。
+**它擋不住什麼**（同樣重要）：`static_assert` **比較的只是 `SLAVE_ENTRY_MAX_BYTES`
+這個常數本身**。若有人在 `SlaveEntry`／`appendSlavesArray()` 新增欄位卻沒把常數
+調大，編譯期**完全檢查不出來**「單筆其實已經超過 104 bytes」——
+Task 5 加 `"grp"` 時就是這樣把 96 撐到 97 的。新增欄位時必須**手動重算**。
+
+**現行餘裕**：20 台的悲觀值 640+11+20×104 = 2731，餘裕 341；
+23 台（執行期極限）3043，餘裕只剩 29；24 台就編不過。
+
+#### 實測數字（Phase 2b 唯一真正跑過硬體的一項）
+
+序列埠 `fakeslaves 20` ＋ `jsonsize`，實測 **2100 bytes**，對 3072 餘裕 971。
+但這是**樂觀值**：那台測試板 SSID 短、沒設自訂 MQTT 伺服器，基礎欄位只吃了
+310 bytes，遠低於 640 的預算。**要用來判斷安全與否的是上面那組悲觀值，不是 2100。**
+
+#### 若日後要放寬 20 台上限
+
+必須**同時**做三件事，少一件就會有靜默失效：
+放大 `STATUS_BUF_SIZE`、放大 `mqttClient.setBufferSize()`（且**要檢查回傳值**，
+realloc 失敗會停在舊大小，導致之後全部發布靜默失敗）、重算 `SLAVE_ENTRY_MAX_BYTES`。
+
+### 4. Long Range 完全未實作，且距離效益未經任何驗證
+
+`LR:*` 只有一個印一行的佔位分支；`longRangeEnabled` 全檔沒有寫入 `true` 的路徑；
+`esp_wifi_set_protocol()` 一次都沒有被呼叫過。整個 Long Range（含
+「`esp_wifi_set_protocol()` 在已關聯 AP 的狀態下呼叫會不會造成一次 WiFi 斷線重連」
+這個**未驗證的 IDF 行為**、以及「混合 bitmap 下實際有沒有走到 LR 速率」）
+已依 Phase 2b 的 Ruling **整個移到 Phase 5，與實測綁在一起做**。
+
+裁決理由（記在這裡免得未來有人以為是漏做）：它是唯一「本階段做完也無法驗收」的
+Task，同時動 master + slave + 共用 library 三個編譯目標，而 Phase 2a 已經因為
+「未驗證的 IDF 行為被寫成事實」踩過一次（`WiFi.begin()` 帶 channel 的掃描語義，
+見「WiFi 連線」一節的情境 2）。
+
+### 5. WiFi 連線的兩項沿用自 Phase 2a 的未決事項
+
+- **沒有 auth mode 退避**（同上方第 2 項）。
+- **`WiFi.begin(ssid, pass, ch, nullptr)` 是否真的把掃描限制在該 channel，
+  只有 ESP-IDF 文件推導、未經實機驗證**（見「WiFi 連線（ESP-NOW 友善版）」
+  的關聯方式情境 2）。回歸清單一律把它列為**觀察項，不是失敗判定**。
 
 ## 編譯與燒錄
 

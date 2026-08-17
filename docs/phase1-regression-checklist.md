@@ -249,7 +249,9 @@
 
 - 操作：配對 2 台以上，輸入 `unpairall`。
 - 預期：序列埠印 `[配對] 開始清空名冊，共 <N> 台（每輪 loop 拆一台）`，
-  接著每台各印一次 `[配對] 已移除 hoban-… ，剩 <N> 台`，最後 `[配對] 名冊已清空`。
+  接著每台各印一次 `[配對] 已移除 hoban-…，剩 <N> 台`（格式字串是
+  `[配對] 已移除 %s，剩 %d 台`，`%s` 與全形逗號之間**沒有空格**），
+  最後 `[配對] 名冊已清空`。
   **拆除全程 `[心跳]` 仍持續出現**（心跳 log 有降頻，但不會出現數十秒的空白）。
 - **FAIL 條件**：拆除期間心跳停超過 30 秒，或任何一台 slave 印出
   `[失聯] 超過 30 秒沒收到心跳`。
@@ -327,10 +329,12 @@
   1. 配對 2 台真 slave，`list` 確認兩台都在線。記下 slave#1 的 ID。
   2. `droppeer 1` —— 預期印
      `[測試] 已刪除 hoban-… 的 ESP-NOW peer（名冊條目保留，未寫 NVS），回傳 <碼>`。
-  3. `alloff`。預期：
-     - slave#0 正常：`[控制] 送指令 2 給 hoban-<#0>`，**沒有**緊接的失敗行；
+  3. `alloff`。預期（**指令碼是 `0`，不是 2** —— `HO_CMD_OFF = 0`／`HO_CMD_ON = 1`／
+     `HO_CMD_PULSE = 2`，見 `libraries/HoEspNow/src/HoEspNowProtocol.h`。
+     本行原本寫成 `送指令 2`，是**判準與程式碼矛盾**，Task 7 逐字對照 enum 後更正）：
+     - slave#0 正常：`[控制] 送指令 0 給 hoban-<#0>`，**沒有**緊接的失敗行；
        而且它的繼電器**真的關閉**（廣播與單播都收得到）。
-     - slave#1 每一趟都是成對的兩行：`[控制] 送指令 2 給 hoban-<#1>`
+     - slave#1 每一趟都是成對的兩行：`[控制] 送指令 0 給 hoban-<#1>`
        **緊接** `[ESP-NOW] esp_now_send 失敗: <碼>`。
        但它的繼電器**仍會關閉** —— 主指令走的是廣播，`droppeer` 只斷單播。
      - 收工 `已送達 1／2`，未送達清單**只含** slave#1。
@@ -372,7 +376,9 @@
 
 - 操作：拔掉 slave 電源，等 40 秒（master 判離線門檻 `SLAVE_OFFLINE_TIMEOUT` 是 30 秒，
   40 秒留餘裕確保跨過門檻），觀察 master 序列埠；再重新供電。
-- 預期：master 印 `[離線] hoban-xxxxxxxxxxxx 超過 30 秒沒回應`；
+- 預期：master 印 `[離線] hoban-xxxxxxxxxxxx（超過 30 秒沒回應即判離線）`
+  （`updateSlaveOnlineStatus()` 的格式字串是 `[%s] %s（超過 %lu 秒沒回應即判離線）`，
+  上下線共用同一行、只換前面兩個字；本行原本漏了括號那一段，Task 7 對照後補正）；
   slave 復電並重新鎖定 master 後，master 下一次輪詢（`pollNextSlave()` 發出 `HO_PKT_STATE_REQ`）
   收到該 slave 的狀態回報即自動恢復在線，`list` 顯示回 `在線`。
   （注意：slave 端**不會主動送心跳**，只在收到 `HO_PKT_STATE_REQ` 或執行完指令時才回報狀態，
@@ -435,7 +441,11 @@
 ### 14. `unpair 0` 後 slave 重啟並回到未配對狀態，master 名冊剩 0 台
 
 - 操作：master 輸入 `unpair 0`。
-- 預期：master 印 `[配對] hoban-xxxxxxxxxxxx 已解除配對，剩 0 台`；
+- 預期：master 印 `[配對] 已移除 hoban-xxxxxxxxxxxx，剩 0 台`
+  （**序列埠 `unpair <n>` 走 `unpairSlave()`，印的是「已移除」；
+  第 12 項那個「已解除配對」是 slave 主動送 `HO_PKT_UNPAIR` 時
+  `onEspNowRecv()` 印的，兩條路徑的字串不同。本行原本誤用了第 12 項那句，
+  Task 7 對照後更正**）；
   slave 收到後印 `[配對] master 要求解除配對`，隨後自動重啟，
   重啟後印 `EEPROM 無配對記錄` 並開始輪掃；master 再次 `list` 應顯示 `（空）`。
 - [ ] 通過
