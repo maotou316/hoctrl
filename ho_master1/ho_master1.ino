@@ -283,22 +283,26 @@ PubSubClient mqttClient(espClient);
 //   = 89 ＋ 8（Task 5 review M2 的 "grp"，`,"grp":0`）
 //        ＋ 8（Phase 4 Task 1 的 "exe"，`,"exe":0`）＝ 105 bytes（含尾端逗號）。
 //   取 112 留餘裕，並讓除法算式仍是整數。
-//   （沿革：512／96 → 640／104（"grp"）→ 640／112（"exe"）。
-//    每一次都是「加了欄位就把常數重算」，這是下方註釋要求的動作。）
+//   （沿革：96（Phase 2b Task 1）→ 104（Task 5 的 "grp"）→ 112（Phase 4 的 "exe"）。
+//    每一次都是「加了欄位就把常數重算」，這是下方註釋要求的動作。
+//    ⚠ plan 決定 4.1 原本寫「slaves[] 的欄位在本階段一個字都不准動」，
+//    本 Task 為了讓執行證明能逐台送到 App 而動了它 —— 因此**同一次把預算整個
+//    重排並放大 buf**，而不是把餘裕壓到零留給 Task 5 去撞。）
 //
 // review 補充（實測數字比對）：實機用 fakeslaves 20 量到的「餘裕 971 bytes」是樂觀值——
 // 那台測試板 SSID 短、沒設自訂 MQTT 伺服器，基礎欄位只吃了 310 bytes，遠低於
 // STATUS_BASE_MAX_BYTES 的預算。static_assert 真正依賴、且必須成立的是用這個
 // 常數乘上 HO_ESPNOW_MAX_SLAVES 算出的悲觀上界。
 //
-// **Phase 4 Task 1 更新（"exe" 欄位）：**
-// 現行常數是 STATUS_BASE_MAX_BYTES=640、SLAVE_ENTRY_MAX_BYTES=112，
-// 執行期上限 maxEntries = (3072-1-640-11)/112 = **21**（Task 7 時是 23）。
-//   - 規格上限 20 台的悲觀值：640+11+20×112 = 2891，對 statusBuf[3072] 餘裕 180
-//   - 21 台（極限）：640+11+21×112 = 3003，餘裕只剩 68
-//   - 22 台：3115 > 3071，static_assert 會直接編譯失敗
-// **餘裕只剩 1 台，這是刻意記下來的警訊**：下一個想在 slave 條目加欄位的人，
-// 必須先放大 STATUS_BUF_SIZE（連帶 MQTT_BUFFER_SIZE），不能再靠壓縮餘裕。
+// **Phase 4 Task 1 更新（"exe" 欄位 ＋ ota 預算 ＋ 放大 buf）：**
+// 現行常數是 STATUS_BUF_SIZE=3584、STATUS_BASE_MAX_BYTES=728（480+120+128）、
+// SLAVE_ENTRY_MAX_BYTES=112，
+// 執行期上限 maxEntries = (3584-1-728-11)/112 = 2844/112 = **25**
+//（沿革：512／96 → 26；Task 5 的 "grp" → 640／104 → 23；
+//  Phase 4 的 "exe" → 640／112 → 21；本次把 ota 的 128 誠實列進預算並放大 buf → 25）。
+//   - 規格上限 20 台的悲觀值：728+11+20×112 = 2979，對 statusBuf[3584] 餘裕 604
+//   - 25 台（極限）：728+11+25×112 = 3539，餘裕只剩 44
+//   - 26 台：3651 > 3583，static_assert 會直接編譯失敗
 //
 // **日後若在 SlaveEntry／appendSlavesArray() 新增欄位，務必重新實算這個上界並
 // 更新這個常數**——static_assert 比較的只是這個常數本身，常數沒跟著新欄位變大，
@@ -307,41 +311,87 @@ PubSubClient mqttClient(espClient);
 // 的防線 1 擋下（不是編譯期，是執行期放棄發布 —— 會印一行，不是靜默）。
 const size_t SLAVE_ENTRY_MAX_BYTES = 112;
 
-// slaves 陣列以外所有欄位的位元組上界。實算：
-//   Phase 2a 的既有欄位最壞 317
-//   + "server":"<最長 63 字元的自訂伺服器>",  = 75
-//   + "free_heap":123456,                     = 19
-//   + "slaves_truncated":true,"slaves_shown":20, = 42
-//   + "long_range_pending":true,               = 27（Task 6 加）
-//   + "group":{...}                            = 128（見下）
-//   ≈ 608，取 640。
+// ── slaves 陣列以外所有欄位的位元組上界（Phase 4 Task 1 改成「分項相加」）──
 //
-// "group" 物件的最壞實算（appendGroupResult()），逐欄位相加：
-//   `"group":{` 9 ＋ `"cmd":255,` 10 ＋ `"cid":65535,` 12 ＋ `"age_s":4294967,` 16
-//   ＋ `"busy":1,` 9 ＋ `"n":20,` 7 ＋ `"ack":20,` 9 ＋ `"noack":20,` 11
-//   ＋ `"gone":20,` 10 ＋ `"exed":20,` 10 ＋ `"exec":"attributed"` 19 ＋ `},` 2
-//   = 124 bytes，取 128。
-//   （Task 5 review M2 這段寫「94，取 96」時**漏算了 busy 欄位**，實際已是 102，
-//    早就超過自己寫的 96。整包沒爆是因為 640 的總預算本身有餘裕，
-//    但那是運氣不是設計 —— 本次一併算對。）
-const size_t STATUS_BASE_MAX_BYTES = 640;
+// 改成分項的理由（plan 決定 4.2 明文要求）：舊寫法是一個 640 的魔術數字，
+// 註釋裡的分項只是說明、不是程式碼。於是 Task 5 把 "group" 物件塞進去、
+// Phase 4 又要塞 "ota" 物件時，**沒有任何機制會發現 640 已經被吃光** ——
+// static_assert 照樣通過，保護看起來還在、實際上已經失效。
+// 拆成具名常數之後，未來新增區塊的人被迫也新增一個具名常數並相加。
+//
+// (a) group／ota 以外的既有欄位，逐項實算：
+//   Phase 2a 的既有欄位最壞                        317
+//   + "server":"<最長 63 字元的自訂伺服器>",         75
+//   + "free_heap":123456,                          19
+//   + "slaves_truncated":true,"slaves_shown":20,   42
+//   + "long_range_pending":true,                   27（Task 6 加）
+//   = 480（剛好整數，不再取整）
+const size_t STATUS_BASE_WITHOUT_GROUP_OTA_MAX_BYTES = 480;
+
+// (b) "group" 物件的最壞實算（appendGroupResult()），逐欄位相加：
+//   `"group":{` 9 ＋ `"cmd":255,` 10 ＋ `"age_s":4294967,` 16 ＋ `"busy":1,` 9
+//   ＋ `"n":20,` 7 ＋ `"ack":20,` 9 ＋ `"noack":20,` 11 ＋ `"gone":20,` 10
+//   ＋ `"exed":20,` 10 ＋ `"exec":"attributed"` 19 ＋ `},` 2
+//   = 112 bytes，取 120。
+//
+//   （沿革：Task 5 review M2 這段寫「94，取 96」時**漏算了 busy 欄位**，
+//    實際當時已是 102 > 96。整包沒爆是因為 640 的總預算本身有餘裕 ——
+//    那是運氣不是設計。Phase 4 Task 1 一併算對。
+//    Phase 4 Task 1 曾短暫加過一個 `"cid":65535,`（12 bytes），
+//    後來因為 review M1 又移除，見 appendGroupResult() 上方的說明。）
+const size_t STATUS_GROUP_MAX_BYTES = 120;
+
+// (c) "ota" 物件的上界。**這是預留額度，目前沒有任何程式碼會發出這個物件** ——
+// Task 5 才會實作。預留而不是等到那時再算，是因為「等到那時」正是 (a) 的
+// 640 被吃光卻沒人發現的成因。逐項實算取自 plan 決定 4.2：
+//   `"ota":{` 7 ＋ `"target":"hoban-aabbccddeeff",` 30 ＋ `"phase":"<最長 12 字元>",` 23
+//   ＋ `"progress":100,` 15 ＋ `"size":2031616,` 15 ＋ `"error":"<最長 16 字元>"` 26
+//   ＋ `},` 2 = 118，取 128。
+//
+// **它擋不住什麼**：這只是「預算保留」，不是對 Task 5 實作的檢查。
+// 若 Task 5 的 phase／error 字串超過 12／16 字元，這個常數不會自己變大，
+// static_assert 也抓不到 —— plan 決定 4.2 因此要求那兩個字串必須走查表函式、
+// 不得是自由格式 String，並用 `fakeota` + `jsonsize` 實測。
+const size_t STATUS_OTA_MAX_BYTES = 128;
+
+const size_t STATUS_BASE_MAX_BYTES =
+    STATUS_BASE_WITHOUT_GROUP_OTA_MAX_BYTES + STATUS_GROUP_MAX_BYTES
+    + STATUS_OTA_MAX_BYTES;   // 480 + 120 + 128 = 728
 
 // "slaves":[] 這個 key 與中括號本身
 const size_t SLAVES_KEY_OVERHEAD = 11;
 
-const size_t STATUS_BUF_SIZE = 3072;
+// ── 序列化緩衝區（Phase 4 Task 1 由 3072 放大到 3584）──
+//
+// 為什麼非放大不可：把 ota 的 128 bytes 誠實列進預算之後，
+// (3072-1-728-11)/112 = 2324/112 = 20，**恰好等於 HO_ESPNOW_MAX_SLAVES 而餘裕歸零**。
+// 餘裕歸零代表「下一個欄位、甚至下一次重算發現少估了幾個 byte」就會編不過或截斷，
+// 而在這個檔案的歷史上，少估幾個 byte 已經發生過兩次（Task 5 的 96→97、
+// 以及同一個 commit 漏算 busy）。**靠壓縮餘裕過關正是靜默截斷缺陷回來的路徑。**
+// 3072 → 3584（+512）之後 (3584-1-728-11)/112 = 2844/112 = 25，餘裕回到 5 台，
+// 與 plan 決定 4.2 原本預期的「餘裕 5 台」一致。
+//
+// 代價：statusBuf 是 .bss，+512 bytes；MQTT buffer 是 heap，+512 bytes。
+// master 的 RAM 用量約 20%，這點增量不影響任何既有邊界。
+const size_t STATUS_BUF_SIZE = 3584;
 
 // PubSubClient 的 buffer 要放得下「固定標頭(最多 5) + topic 長度欄位(2) + topic + payload」。
 // topic 最長是 "hoban/hoban-a0b1c2d3e4f5/status" = 31 bytes。
-// 3072 + 5 + 2 + 31 = 3110，取 3328 留餘裕。
-const size_t MQTT_BUFFER_SIZE = 3328;
+// 3584 + 5 + 2 + 31 = 3622，取 3840 留餘裕。
+//
+// ⚠ 這個數字是回歸清單的判準（docs/phase2b-regression-checklist.md 第 3 項），
+// **而且它有兩個合法值**：本次開機沒嘗試過 MQTT 連線時，setBufferSize() 根本
+// 沒被呼叫過，buffer 會停在 PubSubClient 建構子給的 MQTT_MAX_PACKET_SIZE ＝ 256。
+// 改這個常數就必須同步改那份清單的兩種變體。
+const size_t MQTT_BUFFER_SIZE = 3840;
 
 // 編譯期保證：statusBuf 一定放得下 HO_ESPNOW_MAX_SLAVES 台的完整陣列。
 static_assert(
     (STATUS_BUF_SIZE - 1 - STATUS_BASE_MAX_BYTES - SLAVES_KEY_OVERHEAD)
         / SLAVE_ENTRY_MAX_BYTES >= HO_ESPNOW_MAX_SLAVES,
     "STATUS_BUF_SIZE 放不下 HO_ESPNOW_MAX_SLAVES 台 slave 的陣列，"
-    "請放大 STATUS_BUF_SIZE 或縮減 STATUS_BASE_MAX_BYTES");
+    "請放大 STATUS_BUF_SIZE，或縮減 STATUS_BASE 的三個分項之一"
+    "（WITHOUT_GROUP_OTA／GROUP／OTA）");
 
 // 序列化用的共用緩衝區。刻意放在檔案層級（.bss）而非函式內的區域變數：
 // loopTask 的堆疊只有 8192 bytes，在裡面開 3072 bytes 的區域陣列，
@@ -1441,6 +1491,16 @@ void groupSendUnicast(int i) {
 //   3. **回 false 不等於「沒執行」**。回報可能還在路上、可能掉了、那台可能剛好離線。
 //      所以 false 只能拿來**維持紅色**，不能拿來宣稱「已確認未執行」。
 //      誤紅可接受、誤綠不可接受 —— 這個不對稱是刻意的。
+//   4. **完全擋不住偽造，而且這是四項裡最嚴重的一項。**
+//      認證強度只有「CRC-8 ＋ 原始碼裡的共享密鑰字面常數」，ESP-NOW 來源 MAC 可任意填。
+//      射頻範圍內的第三方只要有「目標 MAC ＋ cmdId ＋ 種類」就能組出一封合法的
+//      HO_PKT_STATE，讓一台**沒動作**的 slave 在這裡回 true、在 MQTT 上顯示 "exe":1、
+//      在序列埠印出 [歸因] —— 那是**由攻擊者遞送的假綠燈**：「門關好了」而門是開的。
+//      三個輸入全部可從空中觀測（MAC 與 cmdId 就在 master 廣播的 HO_PKT_CMD 明文裡）。
+//      **能偽造 STATE 的人同樣能偽造 CMD 直接驅動繼電器**，所以本函式新增的不是
+//      「控制面」而是「說謊面」—— 但謊的方向正是誤綠，仍須明列。
+//      **唯一的結構性修法是訊息鑑別（HMAC／nonce），CRC-8 承載不了。**
+//      緩解評估與具名技術債見 docs/phase4-flag-day-upgrade.md 第 3.2 節。
 //
 // 只在 loop() context 呼叫（appendGroupResult()／groupFinishJob()／
 // appendSlavesArray()），會讀 slaves[] 與 slaveCount，不從 WiFi task 呼叫。
@@ -1932,11 +1992,10 @@ void formatSlaveVersion(int idx, char* out, size_t outSize) {
 
 // 把 slaves 陣列加進 master 的狀態 doc。
 // 條目數量以 Task 1 的容量常數推算的上界為準；照**現行**數值
-// （STATUS_BUF_SIZE=3072／STATUS_BASE_MAX_BYTES=640／SLAVES_KEY_OVERHEAD=11／
-// SLAVE_ENTRY_MAX_BYTES=112）算出 maxEntries = (3072-1-640-11)/112 = 21
-// （沿革：512／96 → 26；Task 5 review M2 的 "grp" → 640／104 → 23；
-// Phase 4 Task 1 的 "exe" → 640／112 → 21）。
-// 21 ≥ HO_ESPNOW_MAX_SLAVES = 20，這條截斷路徑永遠走不到，
+// （STATUS_BUF_SIZE=3584／STATUS_BASE_MAX_BYTES=728／SLAVES_KEY_OVERHEAD=11／
+// SLAVE_ENTRY_MAX_BYTES=112）算出 maxEntries = (3584-1-728-11)/112 = 25
+// （沿革見 SLAVE_ENTRY_MAX_BYTES 宣告處）。
+// 25 ≥ HO_ESPNOW_MAX_SLAVES = 20，這條截斷路徑永遠走不到，
 // 且已有 static_assert 在編譯期擋住「有人把 statusBuf 改小」。
 // 保留執行期截斷的意義是：萬一真的走到，App 看得到 slaves_truncated、
 // 序列埠也會告警，而不是靜默給出一份不完整的清單。
@@ -1947,8 +2006,12 @@ void formatSlaveVersion(int idx, char* out, size_t outSize) {
 // 沒有任何一個欄位宣稱「門關了」—— 那在本協定下仍然無法證明。
 // （這段原本寫「每一個欄位的語義都嚴格限定在『送達』」，加了 exed／exec 之後那句
 //   已經不成立，一併改對。宣稱與事實不符是本專案的 A 族病灶，不能留。）
-//   cid    這道邏輯指令的 cmdId（HoCmdPayload::cmdId）。**每次開機從亂數起算**，
-//          所以它只在同一次開機內可比較，不能拿來排序或推算「下過幾道指令」。
+//   （**沒有 cid 欄位**：Phase 4 Task 1 一度把 cmdId 發成 "cid"，review M1 移除。
+//     理由是 cmdId 正是偽造一封 HO_PKT_STATE 所需的 nonce，主動發到無認證的公開
+//     broker 上是**沒有必要的洩漏**。誠實說清楚：**這不是有效的緩解** ——
+//     偽造本來就需要射頻近距離，而近距離的攻擊者直接嗅探 master 廣播的
+//     HO_PKT_CMD 明文就拿得到 cmdId。移除它只是不做白送，成本為零；
+//     真正的緩解只有訊息鑑別。cmdId 仍會印在序列埠收工訊息裡供現場除錯。）
 //   exed   有執行證明的台數（見 groupExecutedIdx()）。**這個數字可能在收工之後
 //          才變大** —— slave 的回報是非同步的，晚到的證據會把紅的翻成綠的。
 //   cmd    最近一次群組指令的 HoRelayCmd。**實際數值是 0=OFF 1=ON 2=PULSE**
@@ -1982,7 +2045,6 @@ void appendGroupResult(JsonDocument& doc) {
 
   JsonObject g = doc["group"].to<JsonObject>();
   g["cmd"] = groupJob.cmd;
-  g["cid"] = groupJob.cmdId;
   g["age_s"] = (uint32_t)((millis() - groupJob.startedAt) / 1000);
   g["busy"] = groupCmdActive() ? 1 : 0;
   g["n"] = groupJob.count;
@@ -2012,7 +2074,16 @@ int groupDeliveryFor(const uint8_t mac[6]) {
 //        0 = **沒有證據**（不是「已確認沒執行」！回報可能還在路上），
 //        1 = 有執行證明（slave 回報的 cmdId／種類對得上，且回報晚於指令送出）。
 //
-// 0 與 1 的不對稱是刻意的，語義寫在 groupExecutedIdx() 上方的「擋不住什麼」三項。
+// 0 與 1 的不對稱是刻意的，語義寫在 groupExecutedIdx() 上方的「擋不住什麼」四項。
+//
+// ⚠ **與 "grp" 的關鍵差異：這個值會由 1 變回 0，"grp" 不會。**
+// groupDelivered[] 是本次 job 的一次性快照旗標，設了就不再改；而執行證明是
+// **即時比對 slaves[] 的目前值**，所以下列兩種情況會讓已經綠的那台翻回紅：
+//   (a) 那台執行了**下一道**指令 → lastCmdId 換成新值 → 與本次 cmdId 不再相符
+//   (b) 那台離開名冊（unpair／UNPAIRALL）→ findSlave() 回 −1
+// 兩者都是**誤紅方向**（把綠翻紅），符合本專案的不對稱原則，但 App 端若拿它
+// 做「一次關門是否成功」的定案判斷，必須以**收工當下**那一則 status 為準，
+// 不能假設它單調遞增 —— exed 同理。
 int groupExecutedFor(const uint8_t mac[6]) {
   if (!groupJob.everRan) return -1;
   for (int i = 0; i < groupJob.count; i++) {
@@ -2038,6 +2109,10 @@ int groupExecutedFor(const uint8_t mac[6]) {
 //   "exe": 1 → 這台回報過「我執行的是本次群組指令的 cmdId」（見 groupExecutedIdx()）
 //   "exe": 0 → **沒有證據**。不是「已確認沒執行」—— 回報可能還在路上、可能掉了
 //   欄位不存在 → 這台不在最近一次群組指令的快照裡，或開機以來沒下過群組指令
+//
+// ⚠ **"exe" 會由 1 翻回 0，"grp" 不會**（那台執行了下一道指令、或離開名冊）。
+// 兩者都是誤紅方向，但代表 "exe" **不是單調的** —— 定案要看收工當下那一則 status。
+// 完整說明見 groupExecutedFor() 上方。
 //
 // **"exe": 1 也不等於「門關了」。** 它證明的是「slave 的韌體走完了繼電器動作那段
 // 程式」，不證明繼電器硬體動作，更不證明籠門落下。完整的「擋不住什麼」清單寫在
@@ -2373,6 +2448,22 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     // 何時到」。若每則回報都更新，一台在群組指令之前就執行過同一個 cmdId 的 slave
     // （只有 cmdId 撞號才可能）會被之後任何一則例行輪詢回報把時間推到指令之後，
     // 讓 groupExecutedIdx() 的時間條件失效 —— 那是誤綠方向。
+    //
+    // ── 下面四行的**寫入順序是刻意的**，不要重排 ──
+    // 這裡是 WiFi task，groupExecutedIdx() 在 loop() 讀，兩者之間沒有鎖也沒有屏障
+    //（沿用 slaves[] 既有的無鎖慣例）。所以必須讓**每一種撕裂讀都落在誤紅方向**：
+    //
+    //   lastCmdAt 先寫 → 等到 lastCmdId 讀起來已經等於本次 cmdId 時，時間戳一定
+    //     已經是新的。反過來寫的話，會出現「id 已經對上、時間戳還是舊的」那一瞬間，
+    //     時間條件反而擋掉一則真實證據（誤紅，安全但會產生假 FAIL 雜訊）。
+    //   lastCmdId 次之 → 讀到舊 id ＝ 不匹配 ＝ 回 false（誤紅）。
+    //   lastCmdKind 最後 → 讀到「新 id ＋ 舊 kind」時：若舊 kind 與本次不同就回
+    //     false（誤紅）；若剛好相同則回 true，而此時 id 已經確實匹配、證據本來就
+    //     成立，所以 true 是對的，不是誤綠。
+    //   lastCmdCount 只是顯示用，不參與任何判斷，排最後。
+    //
+    // **它擋不住什麼**：這個順序只保證「撕裂讀不會誤綠」，**不保證原子性**，
+    // 也完全不處理偽造 —— 一封偽造的 HO_PKT_STATE 走的是正常路徑，順序幫不上忙。
     if (cmdIdChanged) {
       slaves[idx].lastCmdAt = millis();
     }
@@ -3703,16 +3794,23 @@ void setup() {
 
   checkStuckButtons();  // 必須早於任何按鈕流程，卡住的腳會在此被排除
 
-  // 指令識別碼的開機初值取亂數（理由見 nextCmdId 宣告處）。
-  // esp_random() 在 RF 未啟動時品質較差，但這裡要的只是「重開機前後不容易撞到同一串」，
-  // 不是密碼學等級的隨機性。0 是保留值，撞到就改成 1。
-  nextCmdId = (uint16_t)esp_random();
-  if (nextCmdId == HO_CMD_ID_NONE) nextCmdId = 1;
-
   loadNetConfig();  // 載入網路設定，Task 2~7 會用到
   loadSlaves();     // 只讀 NVS，可以在 ESP-NOW 初始化之前
   setupEspNow();
   registerAllPeers();  // 必須在 esp_now_init() 之後，否則名冊上的 slave 全部送不出指令
+
+  // ── 指令識別碼的開機初值（理由見 nextCmdId 宣告處）──
+  // **必須排在 setupEspNow() 之後**：setupEspNow() 裡的 WiFi.mode(WIFI_STA) 才會
+  // 啟動射頻，而 ESP-IDF 明文規定「RF 未啟用時 esp_random() 不得視為真隨機」——
+  // 排在前面等於每次開機都可能拿到同一串固定值，那正好把「重開機後撞到上一輪
+  // 同一個 cmdId」從巧合變成常態，是誤綠方向。
+  // 0 是保留值（HO_CMD_ID_NONE），撞到就改成 1。
+  //
+  // **它擋不住什麼**：即使有真隨機，也只是把撞號機率壓到 1/65535；
+  // 真正擋住舊回報的是 groupExecutedIdx() 的「回報時間 ≥ 指令送出時間」那一條，
+  // 而那一條擋不住「指令送出後才被重播」的舊回報，更擋不住偽造。
+  nextCmdId = (uint16_t)esp_random();
+  if (nextCmdId == HO_CMD_ID_NONE) nextCmdId = 1;
 
   // WiFi 連線必須排在 ESP-NOW 初始化與 peer 註冊之後：
   // 反過來會讓 esp_now_init() 在 STA 已連線的狀態下執行，peer 的 channel 跟隨行為可能不如預期。

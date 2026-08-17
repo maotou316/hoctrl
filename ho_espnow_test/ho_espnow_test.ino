@@ -106,13 +106,17 @@ void testCmdAttribution() {
   check(outCmd.cmdId == 0xBEEF, "cmdId 來回一致");
   check(outCmd.cmd == HO_CMD_OFF && outCmd.pulseMs == 0, "cmd 與 pulseMs 未被 cmdId 擠掉");
 
-  HoStatePayload st = { 1, 1, 0, 0, 12345, 0xBEEF, HO_CMD_OFF, 4 };
+  // lastCmdKind 刻意用 HO_CMD_PULSE（**實際值 2**，回去讀 enum 定義不要憑名稱推）
+  // 而不是 HO_CMD_OFF —— 後者的值是 0，與「欄位根本沒被寫到」的零值無法區分，
+  // 那種斷言即使序列化錯位也會通過。
+  HoStatePayload st = { 1, 1, 0, 0, 12345, 0xBEEF, HO_CMD_PULSE, 4 };
   len = hoPackPacket(buf, sizeof(buf), HO_PKT_STATE, 4, &st, sizeof(st));
   check(hoUnpackPacket(buf, len, nullptr, &payload, &payloadLen), "狀態封包解包成功");
   HoStatePayload outSt;
   memcpy(&outSt, payload, sizeof(outSt));
   check(outSt.lastCmdId == 0xBEEF, "lastCmdId 來回一致");
-  check(outSt.lastCmdKind == HO_CMD_OFF, "lastCmdKind 來回一致");
+  check(outSt.lastCmdKind == HO_CMD_PULSE, "lastCmdKind 來回一致");
+  check(outSt.lastCmdKind != 0, "lastCmdKind 不是零值（排除欄位未被寫到也通過的假 PASS）");
   check(outSt.lastCmdCount == 4, "lastCmdCount 來回一致");
   check(outSt.uptimeSec == 12345, "uptimeSec 未被新欄位擠掉");
 }

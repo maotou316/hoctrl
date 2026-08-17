@@ -131,7 +131,7 @@ struct __attribute__((packed)) HoCmdPayload {
 // **這三個欄位證明什麼**：slave 的韌體確實走完了 HO_PKT_CMD 分支的
 // setRelayPins()／pulseRelay() 呼叫，而且那一次的 cmdId 就是 master 送的那一道。
 //
-// **它們擋不住什麼（務必連著讀）**：
+// **它們擋不住什麼（務必連著讀，這份清單就是完整清單）**：
 //   1. **不證明繼電器硬體真的動作**。setRelayPins() 只寫 GPIO；MOS 燒毀、線路脫落、
 //      繼電器觸點黏死都不會反映在這裡。
 //   2. **不證明籠門關上了**。HO_CMD_PULSE 只證明點動計時器被啟動。
@@ -142,8 +142,21 @@ struct __attribute__((packed)) HoCmdPayload {
 //      才採信（見 ho_master1 的 groupExecutedIdx()），那擋得住**跨指令**的舊回報，
 //      擋不住指令送出後才被重播的那則。
 //   5. **cmdId 只有 16 bits**，master 端每下一道指令 +1，理論上 65535 道之後會繞回。
-//      master 開機時用 esp_random() 取初值，讓「重開機後撞到上一輪同一個 cmdId」
-//      需要同時滿足「值相同」與「舊回報晚於新指令送出時間」兩個條件。
+//      master 開機時用 esp_random() 取初值（**必須在 RF 啟動之後才取**，見 ho_master1
+//      的 setup()），讓「重開機後撞到上一輪同一個 cmdId」需要同時滿足
+//      「值相同」與「舊回報晚於新指令送出時間」兩個條件。
+//   6. **完全擋不住偽造 —— 這一項最嚴重，因為它是「由攻擊者遞送的假綠燈」。**
+//      本協定的認證強度就是「CRC-8 ＋ 共享密鑰」，而密鑰是**原始碼裡的字面常數**、
+//      ESP-NOW 的來源 MAC 可以任意填。射頻範圍內的第三方只要知道
+//      「目標 slave 的 MAC ＋ 本次的 cmdId ＋ 種類」就能自己組一封合法的
+//      HO_PKT_STATE，讓一台**根本沒動作**的 slave 在 master 上顯示成已執行。
+//      三個輸入全部可觀測：MAC 與 cmdId 直接出現在 master 廣播的 HO_PKT_CMD
+//      明文裡（同一支天線就抓得到），種類也是。
+//      **範圍限定（但不減輕嚴重性）**：能偽造 STATE 的人同樣能偽造 CMD 直接驅動
+//      繼電器，所以本次改動新增的不是「控制面」而是「說謊面」—— 偏偏謊的方向
+//      正是誤綠（「門關好了」而門是開的），是本系統最不能接受的失敗型態。
+//      **唯一的結構性修法是訊息鑑別（HMAC／nonce），CRC-8 承載不了**，
+//      不在本階段範圍。完整評估見 docs/phase4-flag-day-upgrade.md 第 3.2 節。
 struct __attribute__((packed)) HoStatePayload {
   uint8_t  relay;      // 0 / 1
   uint8_t  fwMajor;

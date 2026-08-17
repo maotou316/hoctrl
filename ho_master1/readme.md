@@ -618,7 +618,7 @@ publish 最壞是 10 秒級黑箱（**App 端依賴那則 `publishStatus()`，�
 - master 狀態多一個 **`"group"`** 摘要物件：
 
 ```json
-"group": {"cmd":2,"cid":41234,"age_s":2,"busy":0,"n":20,"ack":18,"noack":2,"gone":0,
+"group": {"cmd":2,"age_s":2,"busy":0,"n":20,"ack":18,"noack":2,"gone":0,
           "exed":18,"exec":"attributed"}
 ```
 
@@ -698,7 +698,7 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
     "free_heap": 123456
   },
   "group": {
-    "cmd": 2, "cid": 41234, "age_s": 2, "busy": 0,
+    "cmd": 2, "age_s": 2, "busy": 0,
     "n": 2, "ack": 1, "noack": 1, "gone": 0,
     "exed": 1, "exec": "attributed"
   },
@@ -715,8 +715,8 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
 |---|---|
 | `group` | **開機以來下過至少一次群組指令**才有（`if (!groupJob.everRan) return;`）。冷開機後第一則 status 沒有這個物件 |
 | `slaves[i].grp` | 該台**在最近一次群組指令的快照裡**才有（`groupDeliveryFor()` 回 −1 就整個不帶）。指令之後才配對進來的 slave 沒有 |
-| `slaves[i].exe` | 同 `grp` 的出現條件（`groupExecutedFor()` 回 −1 就整個不帶）。`1` ＝ 有執行證明；`0` ＝ **沒有證據**，不是「已確認沒執行」 |
-| `slaves_truncated` / `slaves_shown` | 名冊台數超過執行期上限才有。**照現行常數（3072／640／11／112）算出的 `maxEntries` 是 21，而名冊上限 `HO_ESPNOW_MAX_SLAVES` 是 20，所以這兩個欄位在正常情況下永遠不會出現**。它們存在的意義是：萬一有人改小 buf 又繞過 `static_assert`，App 與序列埠都看得見，而不是靜默給出一份不完整的清單 |
+| `slaves[i].exe` | 同 `grp` 的出現條件（`groupExecutedFor()` 回 −1 就整個不帶）。`1` ＝ 有執行證明；`0` ＝ **沒有證據**，不是「已確認沒執行」。⚠ **與 `grp` 不同，它會由 1 翻回 0**（那台執行了下一道指令，或離開名冊）—— 誤紅方向，但不可假設單調 |
+| `slaves_truncated` / `slaves_shown` | 名冊台數超過執行期上限才有。**照現行常數（3584／728／11／112）算出的 `maxEntries` 是 25，而名冊上限 `HO_ESPNOW_MAX_SLAVES` 是 20，所以這兩個欄位在正常情況下永遠不會出現**。它們存在的意義是：萬一有人改小 buf 又繞過 `static_assert`，App 與序列埠都看得見，而不是靜默給出一份不完整的清單 |
 | `long_range` | **一定有，而且恆為 `false`** —— `longRangeEnabled` 全檔沒有任何寫入 `true` 的路徑（Long Range 在 Phase 5 才做） |
 
 `group` 摘要每個欄位的語義。**`ack`／`noack`／`gone` 嚴格限定在「送達」；
@@ -731,8 +731,7 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
 | `ack` | 單播拿到 MAC 層 ACK 的台數（**只是送達**） |
 | `noack` | 沒拿到的台數 —— **這就是 App 該顯示紅色的依據** |
 | `gone` | 指令期間離開名冊的台數（同樣未送達） |
-| `cid` | 這道邏輯指令的 `cmdId`。**每次開機從亂數起算**，只在同一次開機內可比較，不能拿來排序或推算「下過幾道指令」 |
-| `exed` | 有執行證明的台數（`groupExecutedIdx()`）。**可能在收工之後才變大** —— slave 的回報是非同步的 |
+| `exed` | 有執行證明的台數（`groupExecutedIdx()`）。**可能在收工之後才變大**（回報是非同步的），**也可能之後變小**（那幾台執行了下一道指令，或離開名冊）。**不是單調的** —— 定案看收工當下那一則 |
 | `exec` | **固定寫死 `"attributed"`**（版本 2 起；之前是 `"unprovable"`）。它宣稱的是「有 `exed` 台拿到韌體層的執行證明」，**不是**「門關了」。舊 App 把任何非 `"unprovable"` 的值歸成 `unrecognized`，仍然不會轉綠 —— 誤紅方向，安全 |
 
 ### 代發的 slave 狀態 JSON（`hoban/<slaveId>/status`，retain）
@@ -959,7 +958,7 @@ Phase 2a 的 `mqttCallback()` 是把 topic 與自己的 control topic 做完整�
 | 網路設定儲存 | EEPROM 128 bytes，`mqttPassword` 與 `mqttPort` 位址重疊，MQTT 密碼實際只能 12 字元 | NVS（`Preferences`），各欄位獨立，密碼上限 64 字元 |
 | WiFi 連線 | 掃描＋多段 auth mode 退避重試 | 不掃描、記住 channel/BSSID 直接關聯、無 auth mode 退避（見已知風險） |
 | WiFi 中斷 WiFi 驅動 | `WiFi.disconnect(true)`／關閉驅動 | `WiFi.disconnect(false)`，驅動保持存活供 ESP-NOW 使用 |
-| MQTT buffer / timeout | 未設定（256 bytes／15 秒逾時） | `setBufferSize(3328)` / `setSocketTimeout(3)`（Phase 2b Task 1 從 1024 放大到 3328，因為狀態 JSON 要塞 20 台 slave；**`setSocketTimeout()` 對 `publish()` 無效**，見上方殘存風險） |
+| MQTT buffer / timeout | 未設定（256 bytes／15 秒逾時） | `setBufferSize(3840)` / `setSocketTimeout(3)`（Phase 2b Task 1 從 1024 放大到 3328，因為狀態 JSON 要塞 20 台 slave；Phase 4 Task 1 再放大到 3840，因為 `statusBuf` 由 3072 放大到 3584；**`setSocketTimeout()` 對 `publish()` 無效**，見上方殘存風險） |
 | LED | 恆亮／閃爍幾種簡單狀態 | 一次性事件閃爍 ＋ 持續式狀態機（見上方「LED 狀態指示」） |
 | 韌體更新（OTA） | MQTT `update:{JSON}` 指令 | 尚未支援，留給 Phase 4 |
 
@@ -1086,7 +1085,7 @@ Phase 2a 的狀態最壞 317 bytes，對 `char buf[512]` 只剩約 195 bytes 餘
 | 層 | 位置 | 擋什麼 |
 |---|---|---|
 | **1. 編譯期 `static_assert`** | 常數宣告區 | 有人把 `STATUS_BUF_SIZE` 改小、或把 `STATUS_BASE_MAX_BYTES` 改大到放不下 20 台 → **編譯直接失敗**，而不是上線後才靜默截斷 |
-| **2. 執行期上限 ＋ `slaves_truncated` 標記** | `appendSlavesArray()` | 名冊台數超過 `maxEntries` 時只放前 N 台，並在 JSON 帶 `slaves_truncated`／`slaves_shown`、序列埠印 `⚠ [MQTT] slaves 陣列被截斷：…`。**照現行常數這條路永遠走不到**（`maxEntries` 21 > 名冊上限 20），留著是為了「萬一走到，看得見」 |
+| **2. 執行期上限 ＋ `slaves_truncated` 標記** | `appendSlavesArray()` | 名冊台數超過 `maxEntries` 時只放前 N 台，並在 JSON 帶 `slaves_truncated`／`slaves_shown`、序列埠印 `⚠ [MQTT] slaves 陣列被截斷：…`。**照現行常數這條路永遠走不到**（`maxEntries` 25 > 名冊上限 20），留著是為了「萬一走到，看得見」 |
 | **3. 發布出口先量再發** | `publishJsonDoc()` | `measureJson()` 量出實際需求，放不下 `statusBuf` 或放不下 mqtt buffer 就**整包不發**並印出實際需求。加上序列化後的 `n >= sizeof(statusBuf) - 1` 兜底。**寧可不發，也絕不發半截 JSON** |
 
 **第 3 層是物理保證，不是紀律**：全檔只有**一處** `mqttClient.publish(`，
@@ -1097,32 +1096,44 @@ Phase 2a 的狀態最壞 317 bytes，對 `char buf[512]` 只剩約 195 bytes 餘
 ```
 (STATUS_BUF_SIZE - 1 - STATUS_BASE_MAX_BYTES - SLAVES_KEY_OVERHEAD)
     / SLAVE_ENTRY_MAX_BYTES  >=  HO_ESPNOW_MAX_SLAVES
-(3072 - 1 - 640 - 11) / 104 = 2420 / 104 = 23  >=  20   ✔
+(3584 - 1 - 728 - 11) / 112 = 2844 / 112 = 25  >=  20   ✔
 ```
+
+> **這一節在 Phase 4 Task 1 曾經整節過期一次，值得記下來。**
+> 當時同一份文件的第 719 與 1089 行都已改成新數字，**唯獨這一節沒改** ——
+> 而這一節正是被指名為權威、且自己寫著「新增欄位時必須手動重算」的那一節。
+> 成因是驗證腳本**只跑了「新字串必須出現」一個方向**，
+> 從來沒跑「**被取代的舊數字必須消失**」。
+> 突變驗證必須跑兩個方向，這是 A 族與 B 族在文件層的同一個形狀。
 
 | 項 | 值 | 來源 |
 |---|---|---|
-| `STATUS_BUF_SIZE` | 3072 | 序列化用的共用緩衝區，放 `.bss` 不放堆疊（loopTask 只有 8192） |
+| `STATUS_BUF_SIZE` | 3584 | 序列化用的共用緩衝區，放 `.bss` 不放堆疊（loopTask 只有 8192）。Phase 4 Task 1 由 3072 放大 |
 | `-1` | | `serializeJson()` 的字串結尾安全邊界 |
-| `STATUS_BASE_MAX_BYTES` | 640 | `slaves` 以外所有欄位的**悲觀**上界（實算約 576） |
+| `STATUS_BASE_MAX_BYTES` | 728 | **分項相加**：`WITHOUT_GROUP_OTA` 480 ＋ `GROUP` 120（實算 112）＋ `OTA` 128（**預留，Task 5 才會真的發出**）。拆成具名常數是 plan 決定 4.2 的要求 —— 舊寫法的 640 是一個魔術數字，被吃光也不會有人發現 |
 | `SLAVES_KEY_OVERHEAD` | 11 | `"slaves":[]` 剛好的字元數 |
-| `SLAVE_ENTRY_MAX_BYTES` | 104 | 單筆條目的悲觀上界（逐字元實算最壞 **97**，含 Task 5 加的 `"grp"`） |
-| `MQTT_BUFFER_SIZE` | 3328 | 3072 + 固定標頭 5 + 長度欄位 2 + topic 31 = 3110，取 3328 留餘裕 |
+| `SLAVE_ENTRY_MAX_BYTES` | 112 | 單筆條目的悲觀上界（逐字元實算最壞 **105**，含 Task 5 的 `"grp"` 與 Phase 4 的 `"exe"`） |
+| `MQTT_BUFFER_SIZE` | 3840 | 3584 + 固定標頭 5 + 長度欄位 2 + topic 31 = 3622，取 3840 留餘裕。**它有兩個合法值** —— 本次開機沒嘗試過 MQTT 連線時 `setBufferSize()` 根本沒被呼叫，會停在 `MQTT_MAX_PACKET_SIZE` ＝ **256** |
 
 **它保證什麼**：常數被改壞時編譯失敗。
 **它擋不住什麼**（同樣重要）：`static_assert` **比較的只是 `SLAVE_ENTRY_MAX_BYTES`
 這個常數本身**。若有人在 `SlaveEntry`／`appendSlavesArray()` 新增欄位卻沒把常數
-調大，編譯期**完全檢查不出來**「單筆其實已經超過 104 bytes」——
+調大，編譯期**完全檢查不出來**「單筆其實已經超過 112 bytes」——
 Task 5 加 `"grp"` 時就是這樣把 96 撐到 97 的。新增欄位時必須**手動重算**。
 
-**現行餘裕**：20 台的悲觀值 640+11+20×104 = 2731，餘裕 341；
-23 台（執行期極限）3043，餘裕只剩 29；24 台就編不過。
+同一個 commit 還把 `group` 物件寫成「94，取 96」卻**漏算了 `busy`**（實際 102）——
+`static_assert` 同樣抓不到，因為它只比對常數本身。
+
+**現行餘裕**：20 台的悲觀值 728+11+20×112 = 2979，對 `statusBuf[3584]` 餘裕 604；
+25 台（執行期極限）3539，餘裕只剩 44；26 台就編不過。
 
 #### 實測數字（Phase 2b 唯一真正跑過硬體的一項）
 
-序列埠 `fakeslaves 20` ＋ `jsonsize`，實測 **2100 bytes**，對 3072 餘裕 971。
+序列埠 `fakeslaves 20` ＋ `jsonsize`，實測 **2100 bytes**（那是 Phase 2b 的韌體，
+沒有 `"exe"` 欄位、`statusBuf` 還是 3072），對 3072 餘裕 971。
 但這是**樂觀值**：那台測試板 SSID 短、沒設自訂 MQTT 伺服器，基礎欄位只吃了
-310 bytes，遠低於 640 的預算。**要用來判斷安全與否的是上面那組悲觀值，不是 2100。**
+310 bytes，遠低於 728 的預算。**要用來判斷安全與否的是上面那組悲觀值，不是 2100。**
+**而且那個 2100 是舊韌體的數字，Phase 4 Task 1 之後尚未重測。**
 
 #### 若日後要放寬 20 台上限
 

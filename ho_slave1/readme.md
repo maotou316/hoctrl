@@ -82,8 +82,11 @@ slave 在**實際走完**繼電器動作之後（`switch` 的 `default` 分支�
 
 **這證明什麼**：slave 的韌體確實走完了 `setRelayPins()`／`pulseRelay()` 那段程式。
 
-**擋不住什麼**：不證明繼電器硬體動作、不證明籠門關上、不擋重放。
-完整清單寫在 `libraries/HoEspNow/src/HoEspNowProtocol.h` 的 `HoStatePayload` 上方。
+**擋不住什麼**：不證明繼電器硬體動作、不證明籠門關上、不擋重放，
+**也完全不擋偽造** —— 射頻範圍內的第三方湊得出「MAC ＋ cmdId ＋ 種類」就能
+組出一封合法的 `HO_PKT_STATE`，讓一台沒動作的 slave 顯示成已執行。
+完整的**四項**清單寫在 `libraries/HoEspNow/src/HoEspNowProtocol.h` 的
+`HoStatePayload` 上方，緩解評估見 `docs/phase4-flag-day-upgrade.md` 第 3.2.1 節。
 
 `lastCmdCount` 通常會大於 1（群組指令會廣播 3 次再加至少一次單播），
 **這是設計行為不是異常** —— master 只比對 `cmdId`，不看次數。

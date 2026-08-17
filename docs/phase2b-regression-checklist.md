@@ -104,8 +104,8 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
   → **一律 FAIL**。**不要因為前一行 `[MQTT] 已連線 …` 成功就判 PASS**
   （這兩件事已刻意拆成兩行，就是為了讓訂閱失敗看得見）。
 - `slaves` 陣列缺少任何一台已配對的 slave。
-- 出現 `⚠ [MQTT] 放棄發布 hoban/<masterId>/status：JSON 需要 <n> bytes，statusBuf 只有 3072`
-  或 `⚠ [MQTT] 放棄發布 …：整包需要 <n> bytes，mqtt buffer 只有 3328`。
+- 出現 `⚠ [MQTT] 放棄發布 hoban/<masterId>/status：JSON 需要 <n> bytes，statusBuf 只有 3584`
+  或 `⚠ [MQTT] 放棄發布 …：整包需要 <n> bytes，mqtt buffer 只有 3840`。
 
 **【觀察項，不是失敗判定】**
 - 偶爾看到 `[MQTT] hoban/<某個 topic>/status 讓位給下一輪（本輪 publish 名額已用掉）`
@@ -176,11 +176,11 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 **預期序列埠輸出（第 3 步）—— `mqtt buffer` 有兩種合法值，看你本次開機有沒有嘗試過 MQTT 連線**：
 
 ```
-[測試] 狀態 JSON 實際 <N> bytes／statusBuf 3072／mqtt buffer 3328（名冊 20 台）
+[測試] 狀態 JSON 實際 <N> bytes／statusBuf 3584／mqtt buffer 3840（名冊 20 台）
 ```
 或
 ```
-[測試] 狀態 JSON 實際 <N> bytes／statusBuf 3072／mqtt buffer 256（名冊 20 台）
+[測試] 狀態 JSON 實際 <N> bytes／statusBuf 3584／mqtt buffer 256（名冊 20 台）
 ```
 
 **`256` 不是失敗**：`setBufferSize(MQTT_BUFFER_SIZE)` **只在
@@ -189,19 +189,21 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256**。
 
 **【失敗判定】**
-- `<N>` **不小於 3072** → 容量防線已被破壞。
-- `statusBuf` 不是 `3072`。
+- `<N>` **不小於 3584** → 容量防線已被破壞。
+- `statusBuf` 不是 `3584`（Phase 4 Task 1 由 3072 放大）。
 - 本次開機**已經連上過** broker（序列埠有 `[MQTT] 已連線 …`），
-  但 `mqtt buffer` 仍不是 `3328`
+  但 `mqtt buffer` 仍不是 `3840`（Phase 4 Task 1 由 3328 放大）
   —— 此時序列埠上方應同時有
-  `⚠ [MQTT] setBufferSize(3328) 失敗，buffer 仍為 <舊值>…`，代表 realloc 失敗。
+  `⚠ [MQTT] setBufferSize(3840) 失敗，buffer 仍為 <舊值>…`，代表 realloc 失敗。
 - 出現 `⚠ [MQTT] slaves 陣列被截斷：名冊 20 台，只放得下 <n> 台`
-  —— 執行期上限 `maxEntries` 算出來是 **23**，20 台不該被截斷。
+  —— 執行期上限 `maxEntries` 算出來是 **25**，20 台不該被截斷。
 
 **【觀察項】**
 - Task 2 在另一台板子上實測到的是 **2100 bytes**。你這台可能不同：
   `<N>` 受 **SSID 長度**與**有沒有設自訂 MQTT 伺服器**影響（那台測試板基礎欄位
-  只吃 310 bytes，遠低於 640 的預算）。**只要 < 3072 就是 PASS，不必等於 2100。**
+  只吃 310 bytes，遠低於 728 的預算）。**只要 < 3584 就是 PASS，不必等於 2100。**
+  **而且 2100 是 Phase 2b 韌體的數字** —— Phase 4 Task 1 每筆 slave 多了 `"exe"`
+  （20 台約 +160 bytes），實測值會比 2100 大，這是預期的。
 - `[群組]` 相關欄位若之前下過群組指令會多出 `"group"` 物件，`<N>` 會再大幾十 bytes，
   正常。
 
@@ -209,7 +211,7 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 >
 > - **擋得住**：20 台的 JSON 在**你這台的實際設定下**放不下 `statusBuf`。
 > - **擋不住悲觀情境。** `<N>` 量的是**當下的**基礎欄位大小，而
->   `STATUS_BASE_MAX_BYTES = 640` 是留給**最壞情況**的：
+>   `STATUS_BASE_MAX_BYTES = 728`（480＋120＋128）是留給**最壞情況**的：
 >   63 字元的自訂 MQTT 伺服器位址（`"server"` 欄位最壞 75 bytes）＋ 長 SSID。
 >   **短 SSID、沒設自訂伺服器的板子量出來會樂觀好幾百 bytes** ——
 >   PASS 只代表「這台這個設定放得下」，**不代表悲觀上界成立**。
@@ -224,7 +226,8 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 > `Serial.printf("[測試] 名冊已灌成 %d 台假 slave（未寫入 NVS，重開機即消失）\n", n)`；
 > `:3209` 的 `⚠ [測試] 重開機前請勿執行 pair／unpair：…`；
 > `:3218` 的 `Serial.printf("[測試] 狀態 JSON 實際 %u bytes／statusBuf %u／mqtt buffer %u（名冊 %d 台）\n", …)`；
-> `:291`／`:296` 的 `STATUS_BUF_SIZE = 3072`／`MQTT_BUFFER_SIZE = 3328`；
+> 常數宣告區的 `STATUS_BUF_SIZE = 3584`／`MQTT_BUFFER_SIZE = 3840`／
+> `STATUS_BASE_MAX_BYTES`（＝ `WITHOUT_GROUP_OTA` 480 ＋ `GROUP` 120 ＋ `OTA` 128）；
 > `:1892` 的 `⚠ [MQTT] slaves 陣列被截斷：名冊 %d 台，只放得下 %d 台`。
 
 ---
@@ -252,10 +255,12 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
   `hoFormatDeviceId()` 用 `%02x` 格式化）
 - 每筆的 `relay` 是 `1`、`online` 是 `false`、`rssi` 是 `-100`、`version` 是 `"255.255.255"`
   （`fakeslaves` 刻意灌最壞值）
+- **Phase 4 Task 1 起**：若開機以來下過群組指令，每筆還會多 `"grp"` 與 `"exe"`；
+  `fakeslaves` 的假 MAC 不在任何群組快照裡，所以**通常兩個都不帶** —— 那是正常的
 - **沒有** `slaves_truncated` 這個 key。
   （**這是本清單唯一一條否定式判準，而它有明確依據**：
   `slaves_truncated` 只在 `shown < slaveCount` 時才被寫入，而
-  `shown = min(slaveCount, maxEntries) = min(20, 23) = 20 = slaveCount`，
+  `shown = min(slaveCount, maxEntries) = min(20, 25) = 20 = slaveCount`，
   程式上沒有任何路徑會在 20 台時寫入它。）
 
 **【失敗判定】**
@@ -272,8 +277,8 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 >
 > - **擋得住**：發布路徑上的靜默截斷（broker 上收到的是完整 20 筆、不是半截）。
 > - **擋不住悲觀情境**（理由與第 2 項完全相同：`<N>` 是這台這個設定的實測值，
->   不是 `STATUS_BASE_MAX_BYTES = 640` 對應的最壞情況）。
-> - **擋不住 21 台以上**：`maxEntries` 是 23，21~23 台仍不會截斷；
+>   不是 `STATUS_BASE_MAX_BYTES = 728` 對應的最壞情況）。
+> - **擋不住 21 台以上**：`maxEntries` 是 25，21~25 台仍不會截斷；
 >   而名冊硬上限 `HO_ESPNOW_MAX_SLAVES` 是 20，所以
 >   **`slaves_truncated` 這條執行期路徑至今零覆蓋，本項也不覆蓋它。**
 
@@ -538,7 +543,7 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 
 **預期（MQTT，收工後的 `hoban/<masterId>/status`）**：
 ```json
-"group": {"cmd":2,"cid":<數字>,"age_s":<秒>,"busy":0,"n":2,"ack":2,"noack":0,"gone":0,"exed":2,"exec":"attributed"}
+"group": {"cmd":2,"age_s":<秒>,"busy":0,"n":2,"ack":2,"noack":0,"gone":0,"exed":2,"exec":"attributed"}
 ```
 且 `slaves[]` 每筆有 `"grp":1` 與 `"exe":1`。
 
@@ -575,7 +580,7 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 > `:1410` 的 `[群組] 指令 %u 收工%s：單播 MAC 層已送達 %d／%d 台`；
 > `:1427`／`:1429` 的兩行「不能證明已執行」；`:1436` 的 `⚠ [群組] 這是關門路徑：…`；
 > `:1187`／`:1201` 的 `GROUP_BROADCAST_REPEAT = 3`／`GROUP_JOB_MAX_MS = 6000`；
-> `appendGroupResult()`（`exec` 固定 `"attributed"`，另有 `cid`／`exed`）；
+> `appendGroupResult()`（`exec` 固定 `"attributed"`，另有 `exed`；**刻意沒有 `cid`**，理由見該函式上方）；
 > `groupExecutedIdx()`／`groupExecutedFor()`（執行證明與它的三項「擋不住什麼」）。
 
 ---

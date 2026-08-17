@@ -459,6 +459,27 @@ OTA 進度改掛在 master 狀態的**單一頂層物件**上 —— 反正一�
 }
 ```
 
+> **⚠ Task 1 執行後的更正（2026-08-17）——「4.1 一個字都不准動」已被打破，本節數字已過時。**
+>
+> Task 1 為了讓執行證明能逐台送到 App，在 `slaves[]` 加了 `"exe"`（+8 bytes/筆），
+> 因此**同一次把整個預算重排並放大 buffer**，而不是把餘裕留給 Task 5 去撞：
+>
+> | 常數 | 本節原本寫的 | **現行實際值** |
+> |---|---|---|
+> | `SLAVE_ENTRY_MAX_BYTES` | 96（不准動） | **112**（單筆最壞實算 105） |
+> | `STATUS_BASE_WITHOUT_OTA_MAX_BYTES` | 512 | 拆成 `WITHOUT_GROUP_OTA` **480** ＋ `GROUP` **120** |
+> | `STATUS_OTA_MAX_BYTES` | 128 | **128（不變，仍是預留額度）** |
+> | `STATUS_BASE_MAX_BYTES` | 640 | **728** |
+> | `STATUS_BUF_SIZE` | 3072 | **3584** |
+> | `MQTT_BUFFER_SIZE` | 3328 | **3840** |
+> | `static_assert` | `2420/96 = 25 ≥ 20` | **`2844/112 = 25 ≥ 20`**（餘裕同樣是 5 台） |
+>
+> 本節其餘內容（`ota` 物件的欄位與 118→128 的實算、`phase`／`error` 必須走查表
+> 函式、`fakeota` ＋ `jsonsize` 實測）**全部仍然有效**，Task 5 照做即可。
+>
+> **另外：Task 2 與 Task 3 各自加上「WROOM flash ≤ 95%（≤ 1,930,035 / 2,031,616）」
+> 的硬門檻**，理由與算法見 `docs/phase4-flag-day-upgrade.md` 第 3.6 節。
+
 #### 4.2 逐項重算常數（Task 5 Step 1 會照這張表寫進註釋）
 
 `ota` 物件的最壞位元組數：

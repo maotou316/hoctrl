@@ -368,7 +368,7 @@
 - **預期（MQTT）**：
   - slave#0 的 `"grp"` 是 `1`、slave#1 的 `"grp"` 是 `0`；
     `"group"` 是 `{"n":2,"ack":1,"noack":1,"gone":0,"busy":0,"exec":"attributed"}`
-    （另有 `"cid"` 與 `"exed"` 兩個 Phase 4 Task 1 新增欄位，值視現場而定）。
+    （另有 `"exed"` 這個 Phase 4 Task 1 新增欄位，值視現場而定）。
   - 第 5 步那 60 秒內這些值**全部不變** —— 即使第 4 步已經把 peer 補回來、
     slave#1 之後的單播都通了，**上一次群組指令的結果不得被事後改寫**。
 - **FAIL 條件**：

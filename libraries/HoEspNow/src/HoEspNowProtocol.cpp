@@ -1,30 +1,12 @@
 #include "HoEspNowProtocol.h"
 #include <ctype.h>
 
-uint8_t hoCrc8(const uint8_t* data, size_t len) {
-  uint8_t crc = 0x00;
-  for (size_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (uint8_t bit = 0; bit < 8; bit++) {
-      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
-    }
-  }
-  return crc;
-}
-
-// 把共享密鑰接在資料後面一起跑進 CRC，讓沒有密鑰的封包算不出正確值
-static uint8_t hoCrcAppendKey(uint8_t crc) {
-  const char* key = HO_ESPNOW_SHARED_KEY;
-  for (size_t i = 0; key[i] != '\0'; i++) {
-    crc ^= (uint8_t)key[i];
-    for (uint8_t bit = 0; bit < 8; bit++) {
-      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
-    }
-  }
-  return crc;
-}
-
-// 以既有 crc 為初值繼續跑一段資料（hoCrc8 的初值固定為 0，不能直接串接）
+// CRC-8 的唯一一份位元迴圈（多項式 0x07）。以既有 crc 為初值繼續跑一段資料，
+// 所以可以串接 —— hoCrc8() 的初值固定為 0，直接串接會把中間結果洗掉。
+//
+// 全檔只留這一份實作：第一版把同一段迴圈抄了三份（hoCrc8／hoCrcAppendKey／
+// hoCrcContinue），任何一次多項式或初值的修改都得同時改三個地方，
+// 漏改一處的症狀是「兩端算出不同的 CRC ＝ 全部封包互相拒收」。
 static uint8_t hoCrcContinue(uint8_t crc, const uint8_t* data, size_t len) {
   for (size_t i = 0; i < len; i++) {
     crc ^= data[i];
@@ -33,6 +15,18 @@ static uint8_t hoCrcContinue(uint8_t crc, const uint8_t* data, size_t len) {
     }
   }
   return crc;
+}
+
+uint8_t hoCrc8(const uint8_t* data, size_t len) {
+  return hoCrcContinue(0x00, data, len);
+}
+
+// 把共享密鑰接在資料後面一起跑進 CRC，讓沒有密鑰的封包算不出正確值。
+// **密鑰是原始碼裡的字面常數**，拿得到韌體或原始碼的人就算得出來 —— 它過濾誤觸，
+// 不是鑑別。詳見 hoFrameCrc() 上方的「擋不住什麼」。
+static uint8_t hoCrcAppendKey(uint8_t crc) {
+  const char* key = HO_ESPNOW_SHARED_KEY;
+  return hoCrcContinue(crc, (const uint8_t*)key, strlen(key));
 }
 
 uint8_t hoFrameCrc(const uint8_t* headerFirst6, const uint8_t* payload, size_t payloadLen) {
