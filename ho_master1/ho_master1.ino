@@ -1292,9 +1292,16 @@ void groupNoteUnicastAck(const uint8_t* desAddr, bool ok) {
   //   - 跨 job 過期回呼的情境是「job A 的回呼延遲到 **job B 已經開閂之後**才到、
   //     且 MAC 同一台」。此時 phase 是 ARMED／WAIT（非 IDLE），本守衛**放行**，
   //     groupAckArmed 為 true、MAC 也對得上 → 照樣被記進 job B。**沒有被擋掉。**
-  //   - 反過來，「phase == IDLE 但閂還開著」這個狀態在現行程式**根本不存在** ——
-  //     三個進 IDLE 的出口（groupFinishJob()、groupCmdSnapshot()、sendCmdToAll()
-  //     的空名冊早退）全都同時或先行關閂。
+  //   - 反過來，「phase == IDLE 且閂還開著」這個狀態在現行程式**觀察不到**。
+  //     但理由不是「每個出口都關閂」（上一版那句字面不精確，這裡改對）——
+  //     三個進 IDLE 的出口實際上是：
+  //       * groupFinishJob()：關閂在**函式第一行**、設 IDLE 在最後 → 先行關閂 ✔
+  //       * groupCmdSnapshot()：設 IDLE 在第一行、關閂在**下一行** → 後關；
+  //         但兩行之間不讓出 CPU，且此刻 phase 已是 IDLE，本守衛照樣擋下
+  //       * sendCmdToAll() 的空名冊早退：**根本沒關閂** ——
+  //         它靠的是「groupCmdSnapshot() 剛剛才關過」這個前置條件
+  //     結論仍然成立（IDLE 時寫不進 groupDelivered[]），但成立的原因是
+  //     **本守衛自己**，不是那三個出口都做了關閂。
   // 所以本守衛的價值是「把約定變成結構、擋住未來新增的路徑」，**不是**修掉任何
   // 現存缺陷。在這個專案裡「宣稱一道其實不存在的防線」與那些假綠燈是同一個形狀，
   // 不能留。
@@ -2001,13 +2008,24 @@ void handleSerialCommand(const String& line) {
     if (arg < 0 || arg >= slaveCount) {
       Serial.println("[控制] 編號超出範圍");
     } else {
+      // 先把 MAC 取值再動作：檢查與使用之間 WiFi task 的 HO_PKT_UNPAIR 可能前移
+      // slaves[]，沿用 arg 會刪到別台的 peer（與全檔「索引隨時可能失效」同一慣例）。
+      uint8_t mac[6];
+      memcpy(mac, slaves[arg].mac, 6);
       char id[20];
-      hoFormatDeviceId(slaves[arg].mac, id);
-      esp_err_t res = esp_now_del_peer(slaves[arg].mac);
+      hoFormatDeviceId(mac, id);
+      esp_err_t res = esp_now_del_peer(mac);
       Serial.printf("[測試] 已刪除 %s 的 ESP-NOW peer（名冊條目保留，未寫 NVS），"
                     "回傳 %d\n", id, res);
       Serial.println("⚠ [測試] 該台在重新配對或重開機之前收不到任何單播"
                      "（廣播仍收得到）；名冊真相未被更動，pair／unpair 照常可用");
+      // 講清楚真正的傷害面：不是「全部關門失效」，而是**單台控制靜默失敗**。
+      // 群組指令的主指令走廣播×3，所以那台的門仍然關得起來（只是不會有
+      // MAC 層送達證明，會被誠實記成未送達）；真正壞掉的是 App 對它的個別
+      // 開／關（handleSlaveCommand() 的單播），而且**不會有任何錯誤回饋**，
+      // 一路靜默到重開機或重新配對為止。
+      Serial.println("⚠ [測試] 傷害面：App 對這台的**個別開／關會靜默失敗**直到重開機；"
+                     "群組關門仍有效（主指令走廣播），但它會被記成未送達");
     }
   } else if (verb == "fakeslaves") {
     fakeSlavesForCapacityTest(arg);
