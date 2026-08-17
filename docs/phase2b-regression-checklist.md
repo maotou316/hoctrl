@@ -22,6 +22,19 @@
 
 1. 每一條「預期序列埠輸出」都**逐字對照過**程式碼的 `Serial.print*` 格式字串，
    每一項結尾用 `> 對照：` 一行寫出對照位置。
+
+   > **這道做法擋得住什麼、擋不住什麼**（本節自己也要守這條規則）
+   >
+   > - **擋得住**：判準字串與程式碼不符（含全形 `／`、`（）`、`⚠`）。
+   > - **擋不住列舉值與數值**。行號對、字串對，**不代表值抄對了** ——
+   >   本清單第一版就把 `alloff` 的指令碼寫成 `2`（實際 `HO_CMD_OFF = 0`），
+   >   readme 的 JSON 範例還寫過一個**根本不存在的 `"cmd": 3`**。
+   >   **列舉值一律回去讀 enum 定義，不要憑名稱推順序。**
+   > - **擋不住順序與時序**。字串比對驗不到「實測時會不會照這個順序、
+   >   在這個時間內印出來」。凡涉及時序的都已標成觀察項並註明「靜態推演、無上界保證」。
+   > - **`> 對照：` 的行號會隨程式碼漂移，判準一律以「字串」為準、不以行號為準。**
+   >   本清單的行號就曾因為「commit 前又多補了一行註釋、補完沒重跑腳本」
+   >   而整批差 1 行。**動過 `.ino` 之後務必重跑一次回讀腳本再交付。**
 2. **凡是「不應該印出某訊息」這類否定式判準一律禁止**，除非能明確指出程式碼
    中沒有任何路徑會印出它。一律改寫成正面判準。
 3. 每一項分成 **【失敗判定】** 與 **【觀察項】**。機制未經實機驗證的
@@ -101,7 +114,7 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
   等一輪（約 15 秒）後應變成 `"1.0.0"`。
 
 > 對照：`ho_master1.ino:2948` 的 `publishStatus()`；`:2919` 的 `buildStatusDoc()`
-> （`doc["server"]`、`dev["free_heap"]`）；`:3663` 的 `if (now - lastStatusPub > 10000)`；
+> （`doc["server"]`、`dev["free_heap"]`）；`:3664` 的 `if (now - lastStatusPub > 10000)`；
 > `:2694` `Serial.printf("[MQTT] 已連線 %s\n", cfg.server)`；
 > `:2631`／`:2633` 的 `[MQTT] 已訂閱 %s`／`⚠ [MQTT] 訂閱失敗 %s（master 自己的 control topic，此時 App 的指令收不到）`；
 > `:2544` 的 `[代理] 已訂閱 %s`；`:2866` 的 `[MQTT] %s 讓位給下一輪（本輪 publish 名額已用掉）`；
@@ -110,6 +123,44 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 ---
 
 ## 2. 🖥 **容量驗證**：`fakeslaves 20` → `jsonsize`（**只要 1 台 master，連 slave 都不用**）
+
+> ## ⚠⚠ 動手前先讀完這一段：`fakeslaves` 會在公用 broker 上留下永久垃圾
+>
+> **只要 master 當下已連上 broker，`fakeslaves 20` 之後約 0.75 秒就會開始
+> 把 20 台假 slave 的狀態以 `retain=true` 發上去**（`slaveStatusScheduler()`
+> 的例行輪播不看 `dirty`，一輪 15 秒把 20 台全發完）。
+> **這不需要你做第 3 項，光下 `fakeslaves` 就會發生。**
+>
+> 後果分兩種，請分開理解（別把兩者混為一談）：
+>
+> | 受影響的 topic | 會不會自己復原 |
+> |---|---|
+> | `hoban/<masterId>/status`（會宣告 `slave_count: 20` ＋ 20 筆假 `slaves`） | **會**。重開機後下一則真實 status 就覆蓋掉了 |
+> | `hoban/hoban-aabbccddee00/status` … `…ee13/status`（20 條） | **不會，永久留著**。重開機後名冊沒有它們，master 再也不會發那些 topic，retained 訊息就一直掛在 broker 上 |
+>
+> 而**預設伺服器清單五台裡有四台是公用的**
+> （`mqttgo.io`／`mqtt.eclipseprojects.io`／`broker.emqx.io`／`broker.hivemq.com`），
+> 留下的垃圾別人也看得到、也清不掉（除了你自己去清）。
+>
+> **這會不會直接讓使用者的 App 冒出 20 台幽靈設備？照實說：不會自動冒出，
+> 但有一條真實路徑。** App 目前是**逐台訂閱** `hoban/<device.mqttTopicId>/status`
+> （`lib/services/multi_mqtt_service.dart`），不是萬用字元，所以那 20 條
+> retained 不會自己變成設備清單上的一列。
+> **但 Phase 3 的樹狀 UI 是要從 master 狀態的 `slaves[]` 展開子節點的** ——
+> 在 master 重開機覆蓋掉那則 status 之前，樹狀 UI 會展出 20 個假子節點、
+> 去訂閱它們，那時就會讀到這 20 則 retained。
+>
+> ### 三個做法，挑一個（**按安全性排序**）
+>
+> 1. **【最安全】在還沒連上 MQTT 時做第 2 項。**
+>    `jsonsize` 走 `buildStatusDoc()` ＋ `measureJson()`，**完全不碰 socket**，
+>    不需要連線。代價是 `mqtt buffer` 那個數字會是 `256`（見下方預期輸出的兩種變體）。
+>    **第 3 項需要 broker，做不到——請改走做法 2 或 3。**
+> 2. **【推薦】把 master 配網到一台私有 broker**（筆電上的 mosquitto、或自架的
+>    `broker.hoban.tw` 以外的任何私有位址），第 2、3 項都在那台上做。
+>    垃圾只留在自己的 broker 上，清不清都無所謂。
+> 3. **在公用 broker 上做，但做完必須自己清乾淨。** 清除步驟見第 3 項結尾，
+>    **不要略過**。
 
 **步驟**：
 1. **先重新開機**（確保這次開機還沒下過 `fakeslaves`）。
@@ -122,16 +173,28 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 ⚠ [測試] 重開機前請勿執行 pair／unpair：名冊混有假 MAC，一旦觸發存檔就會寫進 NVS 汙染真實名冊（已由 saveSlaves() 擋下）
 ```
 
-**預期序列埠輸出（第 3 步）**：
+**預期序列埠輸出（第 3 步）—— `mqtt buffer` 有兩種合法值，看你本次開機有沒有嘗試過 MQTT 連線**：
+
 ```
 [測試] 狀態 JSON 實際 <N> bytes／statusBuf 3072／mqtt buffer 3328（名冊 20 台）
 ```
+或
+```
+[測試] 狀態 JSON 實際 <N> bytes／statusBuf 3072／mqtt buffer 256（名冊 20 台）
+```
+
+**`256` 不是失敗**：`setBufferSize(MQTT_BUFFER_SIZE)` **只在
+`quickConnectToIndex()`／`quickConnectCustom()` 內、真的要連線時才被呼叫**，
+本次開機從未嘗試連線（還在 BLE 配網模式、或 WiFi 連不上）時，
+buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256**。
 
 **【失敗判定】**
 - `<N>` **不小於 3072** → 容量防線已被破壞。
-- `statusBuf` 不是 `3072`、或 `mqtt buffer` 不是 `3328`
-  （後者若顯示 1024，代表 `setBufferSize()` realloc 失敗，序列埠上方應同時有
-  `⚠ [MQTT] setBufferSize(3328) 失敗，buffer 仍為 <舊值>…`）。
+- `statusBuf` 不是 `3072`。
+- 本次開機**已經連上過** broker（序列埠有 `[MQTT] 已連線 …`），
+  但 `mqtt buffer` 仍不是 `3328`
+  —— 此時序列埠上方應同時有
+  `⚠ [MQTT] setBufferSize(3328) 失敗，buffer 仍為 <舊值>…`，代表 realloc 失敗。
 - 出現 `⚠ [MQTT] slaves 陣列被截斷：名冊 20 台，只放得下 <n> 台`
   —— 執行期上限 `maxEntries` 算出來是 **23**，20 台不該被截斷。
 
@@ -142,8 +205,20 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 - `[群組]` 相關欄位若之前下過群組指令會多出 `"group"` 物件，`<N>` 會再大幾十 bytes，
   正常。
 
-**收尾**：做完**重新開機**恢復真實名冊。`fakeslaves` 期間不要下 `pair`／`unpair`
-（韌體會擋，但別去試）。
+> **本項擋得住什麼、擋不住什麼**
+>
+> - **擋得住**：20 台的 JSON 在**你這台的實際設定下**放不下 `statusBuf`。
+> - **擋不住悲觀情境。** `<N>` 量的是**當下的**基礎欄位大小，而
+>   `STATUS_BASE_MAX_BYTES = 640` 是留給**最壞情況**的：
+>   63 字元的自訂 MQTT 伺服器位址（`"server"` 欄位最壞 75 bytes）＋ 長 SSID。
+>   **短 SSID、沒設自訂伺服器的板子量出來會樂觀好幾百 bytes** ——
+>   PASS 只代表「這台這個設定放得下」，**不代表悲觀上界成立**。
+> - 悲觀上界是靠 `static_assert` 在**編譯期**保證的，不是靠本項。
+>   要用實測逼近悲觀值，得配一個接近 63 字元的自訂伺服器位址與長 SSID 再量一次
+>   —— **本清單沒有要求做這件事，所以那條路徑至今零覆蓋。**
+
+**收尾**：`fakeslaves` 期間不要下 `pair`／`unpair`（韌體會擋，但別去試）。
+**先不要重開機** —— 第 3 項要接著在同一個狀態下做（**重開機的時機在第 3 項結尾**）。
 
 > 對照：`ho_master1.ino:3208` 的
 > `Serial.printf("[測試] 名冊已灌成 %d 台假 slave（未寫入 NVS，重開機即消失）\n", n)`；
@@ -158,8 +233,12 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 
 > 這是「靜默截斷」的**正面驗證** —— 第 2 項量的是 `measureJson()`（發布前的預估），
 > 這一項看的是 broker 上真的收到什麼。
+>
+> **前置：本項一定要有 broker，所以第 2 項的「做法 1（不連線）」在這裡不適用。**
+> 請走**做法 2（私有 broker，推薦）**或**做法 3（公用 broker ＋ 做完自己清）**。
+> 走做法 3 的話，**做完務必執行本項結尾的清除步驟**。
 
-**步驟**：接續第 2 項（名冊仍是 20 台假 slave，**不要重開機**），
+**步驟**：接續第 2 項（名冊仍是 20 台假 slave，**第 2 項結束後不要重開機**），
 對 `hoban/<masterId>/control` 送 `status`。
 
 **預期（序列埠）**：`[MQTT] 收到指令: status`
@@ -189,11 +268,39 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
   `[ESP-NOW] esp_now_send 失敗: <碼>`**（`pollNextSlave()` 每輪對假 MAC 送
   `STATE_REQ`）。**這是預期的，不是失敗。**
 
+> **本項擋得住什麼、擋不住什麼**
+>
+> - **擋得住**：發布路徑上的靜默截斷（broker 上收到的是完整 20 筆、不是半截）。
+> - **擋不住悲觀情境**（理由與第 2 項完全相同：`<N>` 是這台這個設定的實測值，
+>   不是 `STATUS_BASE_MAX_BYTES = 640` 對應的最壞情況）。
+> - **擋不住 21 台以上**：`maxEntries` 是 23，21~23 台仍不會截斷；
+>   而名冊硬上限 `HO_ESPNOW_MAX_SLAVES` 是 20，所以
+>   **`slaves_truncated` 這條執行期路徑至今零覆蓋，本項也不覆蓋它。**
+
+### ★ 收尾（走做法 3 ＝ 公用 broker 的人**一定要做**）
+
+1. **先重新開機 master**（恢復真實名冊；同時它會用真實名冊重壓一則
+   `hoban/<masterId>/status`，把「20 台假 slave」那則覆蓋掉）。
+2. **手動刪掉那 20 則永遠不會被覆蓋的 retained 訊息**：
+   `hoban/hoban-aabbccddee00/status` … `hoban/hoban-aabbccddee13/status`
+   （**十六進位，00~13 共 20 條**）。
+   刪法是**對該 topic 發布「零長度 payload ＋ retain=true」**（MQTT 規範裡這代表
+   清除該 topic 的保留訊息）：
+   - MQTT Explorer：選中該 topic → `Delete retained message`
+   - CLI：`mosquitto_pub -h <broker> -t hoban/hoban-aabbccddee00/status -r -n`
+     （20 條各跑一次）
+3. **確認清乾淨**：重新連上 broker、訂閱 `hoban/#`，
+   應該只剩真實設備的 topic，沒有任何 `hoban-aabbccddee??`。
+
+> **韌體幫不上忙**：重開機後名冊裡沒有那些假 MAC，`publishSlaveStatus()`
+> 再也不會碰那 20 條 topic，所以**沒有任何韌體路徑能自動清掉它們**。
+> 這就是為什麼要人工清。
+
 > 對照：`ho_master1.ino:3191-3206` 的 `fakeSlavesForCapacityTest()`
 > （`mac[5] = (uint8_t)i`、`online = false`、`rssi = -100`、`relay = 1`、`fw* = 255`）；
 > `libraries/HoEspNow/src/HoEspNowProtocol.cpp:69-72` 的
 > `snprintf(out, 20, "hoban-%02x%02x%02x%02x%02x%02x", …)`；
-> `ho_master1.ino:1862` 的 `appendSlavesArray()`；`:3409` 的 `[MQTT] 收到指令: %s`；
+> `ho_master1.ino:1862` 的 `appendSlavesArray()`；`:3410` 的 `[MQTT] 收到指令: %s`；
 > `:2201` 的 `[ESP-NOW] esp_now_send 失敗: %d`。
 
 ---
@@ -237,10 +344,22 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
   `[代理] hoban-… 不支援的指令: <字串>` 且**不做任何動作** ——
   **B 區不支援 A 區的指令，這是設計，不是缺陷**。
 
+> **本項擋得住什麼、擋不住什麼**
+>
+> - **擋得住**：轉發路徑整條通（topic 解析 → 查名冊 → ESP-NOW 單播 → slave 執行），
+>   以及「2 台的情況下沒有送錯台」。
+> - **擋不住 20 台規模下的索引錯位。** 本階段最嚴重的缺陷型態是
+>   「`slaves[]` 被 WiFi task 前移 → 索引指到別台 → **開錯門**」，
+>   而那需要「**指令轉發與另一台的解除配對同時發生**」才會觸發。
+>   2 台、手動一次送一條指令的測法**碰不到那個窗口**。
+> - 現行程式是靠**結構**擋掉它的（`handleSlaveCommand()` 收 MAC 不收索引、
+>   `sendCmdToSlaveMac()` 用呼叫方自己那份 MAC 副本），
+>   **不是靠這一項擋的**。本項 PASS 不等於那道結構防線被驗證過。
+
 > 對照：`ho_master1.ino:3245` 的 `Serial.printf("[代理] %s 收到指令: %s\n", id, message.c_str())`；
 > `:3247-3250` 的 `ON` → `sendCmdToSlaveMac(mac, HO_CMD_PULSE, 2000)`；
 > `:1099` 的 `Serial.printf("[控制] 送指令 %u 給 %s\n", (uint8_t)cmd, id)`；
-> `:3271` 的 `[代理] %s 不支援的指令: %s`；`:3416` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
+> `:3271` 的 `[代理] %s 不支援的指令: %s`；`:3417` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
 > `ho_slave1.ino:113` 的 `[繼電器] 點動 %u ms`、`:129` 的 `[狀態] 已回報 relay=%u`、
 > `:661` 的 `[繼電器] 點動結束，已關閉`、`:483` 的 `[繼電器] 關閉`。
 
@@ -256,22 +375,31 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 機制：slave 執行完指令會 `sendState()` → master 的 `HO_PKT_STATE` 分支發現
 `relay` 變了就設 `dirty` → `slaveStatusScheduler()` 優先處理 dirty 的那台。
 
-**【失敗判定】**
-- `relay` 完全沒有翻成 `1` 就直接跳回 `0`（漏掉中間狀態不算 FAIL，見觀察項），
-  **或**兩個值都完全沒更新。
+**【失敗判定】只有一條**
+- **`hoban/<slave0Id>/status` 從頭到尾完全沒有更新**（`timestamp` 也沒動），
+  而 slave 序列埠明明印過 `[狀態] 已回報 relay=1` ——
+  代表 dirty 插隊代發整條路壞了。
+
+（**注意這裡刻意只留一條。** 上一版把「沒看到 `relay:1`」也列成 FAIL、
+括號裡又寫「漏掉中間狀態不算 FAIL」——**立了判準又當場推翻，正是
+「把正確行為判成 FAIL」的形狀**。漏掉 `relay:1` 是合法的取樣落差，
+已整條移到觀察項。）
 
 **【觀察項，不是失敗判定】**
+- **看不看得到 `relay:1` 這個中間值，不是判準。** 若 MQTT publish 恰好被延後
+  超過 2 秒，master 代發時 slave 早已點動結束，發出來的就直接是 `relay:0`。
+  這是取樣落差，不是缺陷。
 - **「1 秒內」不是保證。** 代發受兩道限制：任兩次代發至少間隔
   `SLAVE_STATUS_MIN_GAP_MS`（**250ms**），且每輪 `loop()` 只有一次阻塞式 socket
   寫入名額（`publishStatus()` 若剛好在同一輪先發了，這台就讓位給下一輪）。
   健康網路下典型是數百毫秒，**但沒有上界保證**。
-- **有可能整個錯過 `relay:1`**：若 MQTT publish 恰好被延後超過 2 秒，
-  master 代發時 slave 已經點動結束，發出來的就直接是 `relay:0`。
-  這是**時序造成的取樣落差，不是缺陷** —— 以序列埠的
-  `[狀態] 已回報 relay=1` / `relay=0` 兩行為準。
+- 判定一律**以序列埠的 `[狀態] 已回報 relay=1` / `relay=0` 兩行為準**，
+  MQTT 那邊看到幾個中間值都可以。
+- **本項的時序描述全部是靜態推演**（讀 `loop()` 的呼叫順序與兩個常數推出來的），
+  **沒有實機量測過**。若實測差很多，先懷疑推演而不是韌體。
 
 > 對照：`ho_master1.ino:2168` 的 `if (changed) slaves[idx].dirty = true;`
-> （`changed` 的條件含 `slaves[idx].relay != st.relay`，見 `:2152-2157`）；
+> （`changed` 的條件含 `slaves[idx].relay != st.relay`，見 `:2152-2156`）；
 > `:3101-3110` 的 `slaveStatusScheduler()` dirty 優先迴圈；
 > `:3000` 的 `const unsigned long SLAVE_STATUS_MIN_GAP_MS = 250;`；
 > `ho_slave1.ino:492` 的 `sendState();`（`HO_PKT_CMD` 分支結尾）。
@@ -304,7 +432,7 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 
 > 對照：`ho_master1.ino:1679` 的
 > `Serial.printf("[%s] %s（超過 %lu 秒沒回應即判離線）\n", isOnline ? "上線" : "離線", id, SLAVE_OFFLINE_TIMEOUT / 1000)`；
-> `:1682` 的 `slaves[i].dirty = true;`；`:3694` 的 `if (now - lastOnlineCheck >= 15000)`；
+> `:1682` 的 `slaves[i].dirty = true;`；`:3695` 的 `if (now - lastOnlineCheck >= 15000)`；
 > `:316` 的 `SLAVE_OFFLINE_TIMEOUT = 30000`；
 > `:3021` 的 `doc["status"] = slaves[idx].online ? "online" : "offline"`、
 > `:3028` 的 `wifi["connected"] = slaves[idx].online`。
@@ -367,7 +495,7 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
   會印 `[MQTT] hoban/<slaveId>/status 讓位給下一輪（本輪 publish 名額已用掉）`
   —— 也是設計行為。
 
-> 對照：`ho_master1.ino:3336-3341` 的 `SLAVES` 分支（`markAllSlavesDirty(); publishStatus();`）；
+> 對照：`ho_master1.ino:3337-3342` 的 `SLAVES` 分支（`markAllSlavesDirty(); publishStatus();`）；
 > `:3125` 的 `void markAllSlavesDirty()`；`:3101-3110` 的 dirty 優先迴圈；
 > `:3000` 的 `SLAVE_STATUS_MIN_GAP_MS = 250`；`:2866` 的讓位訊息。
 
@@ -426,7 +554,7 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
   判定一律看 `busy: 0` 的那則。
 - **`ack: 2` 只代表 MAC 層送達，不代表門關了。** 這是本階段刻意保留的極限。
 
-> 對照：`ho_master1.ino:3322-3329` 的 `ALL:ON` 分支（`sendCmdToAll(HO_CMD_PULSE, 2000)`）；
+> 對照：`ho_master1.ino:3323-3330` 的 `ALL:ON` 分支（`sendCmdToAll(HO_CMD_PULSE, 2000)`）；
 > `:1579` 的 `Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, groupJob.count)`；
 > `:1634` 的 `[群組] 已廣播 %d 次（廣播無 ACK，送出成功不代表任何一台收到），並對 %d 台各送一次單播，等 MAC 層 ACK`；
 > `:1410` 的 `[群組] 指令 %u 收工%s：單播 MAC 層已送達 %d／%d 台`；
@@ -468,7 +596,7 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
   它只有序列埠 `alloff` 與人工 MQTT 測試會走到。
   **不要因為按鈕寫「關門」就以為 App 送的是這條** —— App 送的是 `ALL:ON`。
 
-> 對照：`ho_master1.ino:3330-3335` 的 `ALL:OFF` 分支（`sendCmdToAll(HO_CMD_OFF, 0)`）；
+> 對照：`ho_master1.ino:3331-3336` 的 `ALL:OFF` 分支（`sendCmdToAll(HO_CMD_OFF, 0)`）；
 > `libraries/HoEspNow/src/HoEspNowProtocol.h:27` 的 `HO_CMD_OFF = 0`；
 > `ho_slave1.ino:483` 的 `[繼電器] 關閉`；
 > `A:\project\hoctrl` 的 `lib/pages/device_detail_page.dart:2877-2881`
@@ -490,8 +618,13 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 [MQTT] 收到指令: PAIR:START
 [配對] 進入配對模式，60 秒內請短按 slave 的按鈕
 [配對] 接受 hoban-<slave1Mac>，目前共 2 台
+[MQTT] 已訂閱 hoban/<masterId>/control
+[代理] 已訂閱 hoban/<slave0Id>/control
 [代理] 已訂閱 hoban/<slave1Id>/control
 ```
+（**`[MQTT] 已訂閱 …` 那一行也會重印**：`subscribeAllControlTopics()` 只是把游標
+歸零，而**游標 0 格就是 master 自己那條 topic**，之後才逐台走名冊。
+所以是「master 自己 ＋ 名冊全部」重訂一輪，不是只訂新加入的那台。）
 
 **預期（MQTT）**：
 - `hoban/<masterId>/status` 的 `device.slave_count` 變成 `2`、`device.pairing` 是 `true`
@@ -508,13 +641,16 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
   這是刻意的（App 端已依賴），**不是缺陷**。
 - 訂閱動作**不在** `addSlave()` 當場做（那是 WiFi task），而是設
   `pendingSubscribeRefresh` 後由 `loop()` 排隊全量重訂 ——
-  所以 `[代理] 已訂閱 …` 會把**所有**已配對的 slave 重印一遍，不只新那台。正常。
+  所以 `[MQTT] 已訂閱 …` ＋ `[代理] 已訂閱 …` 會把
+  **master 自己與所有**已配對的 slave 重印一遍，不只新那台。正常。
 
-> 對照：`ho_master1.ino:3342-3353` 的 `PAIR:START`／`PAIR:STOP` 分支；
+> 對照：`ho_master1.ino:3343-3354` 的 `PAIR:START`／`PAIR:STOP` 分支；
 > `:1063` 的 `[配對] 進入配對模式，60 秒內請短按 slave 的按鈕`；
 > `:2088` 的 `Serial.printf("[配對] 接受 %s，目前共 %d 台\n", senderId, slaveCount)`；
-> `:3542` 的 `[配對] 逾時`；`:2544` 的 `[代理] 已訂閱 %s`；
-> `:3653-3656` 的 `if (pendingSubscribeRefresh && …) subscribeAllControlTopics();`。
+> `:3543` 的 `[配對] 逾時`；`:2631` 的 `[MQTT] 已訂閱 %s`（游標 0 格＝master 自己）；
+> `:2544` 的 `[代理] 已訂閱 %s`；`:2608-2648` 的 `controlSubscribeScheduler()`
+> （`if (subscribeCursor == 0)` 那個分支就是 master 自己那條）；
+> `:3654-3657` 的 `if (pendingSubscribeRefresh && …) subscribeAllControlTopics();`。
 
 ---
 
@@ -535,13 +671,24 @@ slave1 點動 2 秒）。
 
 **【觀察項，不是失敗判定】**
 - 訂閱是**游標式、每輪 `loop()` 一格**，所以理論上有一個「剛配對完、還沒訂到」
-  的窗口。健康網路下 21 格 <21ms，而 MQTT 指令經 broker 往返要數十到數百毫秒，
-  **實務上碰不到**。若真的碰到（第一次送沒反應、再送一次就好），
+  的窗口。**窗口長度是「格數 × 每輪 `loop()` 的長度」，而每一格都含一次
+  阻塞式 socket 寫入（`subscribe()`），所以健康網路下 21 格的量級是
+  「數十毫秒」而不是「<21ms」**（上一版寫 <21ms 偏樂觀，已改）。
+  MQTT 指令經 broker 往返本身也要數十到數百毫秒，所以**實務上仍碰不到**。
+  若真的碰到（第一次送沒反應、再送一次就好），
   **記錄下來但不判 FAIL** —— 這是已知的設計取捨（避免病態 socket 下單輪凍結 210 秒）。
+
+> **本項擋得住什麼、擋不住什麼**
+>
+> - **擋得住**：「配對成功 → `pendingSubscribeRefresh` → 排隊 → 逐格訂閱」這條路真的接上了。
+> - **擋不住 20 台規模**：2 台時游標只有 3 格，窗口小到不可能觀察到；
+>   20 台是 21 格，窗口大一個數量級。**本項在 2 台下 PASS 不代表 20 台下也 PASS。**
+> - **擋不住索引錯位**（理由同第 4 項）：這裡驗的是「訂得到」，不是「送對台」。
+> - **上面的毫秒級數字全是靜態推演，沒有實機量測，沒有上界保證。**
 
 > 對照：`ho_master1.ino:2608-2648` 的 `controlSubscribeScheduler()`；
 > `:2590-2592` 的 `subscribeAllControlTopics()`（**只把游標歸零，不當場送 subscribe**）；
-> `:3416` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`。
+> `:3417` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`。
 
 ---
 
@@ -582,10 +729,10 @@ slave1 點動 2 秒）。
   `findSlave()` 擋掉，且下次重連是 `cleanSession=true`，殘留自然消失。
 - 因此第二步印的是「目標不在名冊上」而**不是**完全沒收到 —— 兩者都是 PASS。
 
-> 對照：`ho_master1.ino:3354-3368` 的 `UNPAIR:` 分支（含兩行錯誤訊息）；
+> 對照：`ho_master1.ino:3355-3369` 的 `UNPAIR:` 分支（含兩行錯誤訊息）；
 > `:1737` 的 `Serial.printf("[配對] 已移除 %s，剩 %d 台\n", id, slaveCount)`；
 > `:2574` 的 `[代理] 本輪 socket 名額已用掉，略過取消訂閱 %s`；
-> `:3416` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
+> `:3417` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
 > `ho_slave1.ino:502` 的 `[配對] master 要求解除配對`、`:150` 的 `EEPROM 無配對記錄`、
 > `:257` 的 `[掃描] 開始輪掃 channel 1~13 尋找 master`。
 
@@ -621,7 +768,24 @@ slave1 點動 2 秒）。
 - 每台 slave 收到 `HO_PKT_UNPAIR` 後會自動重啟，重啟期間它自己不發任何訊息，
   這與「失聯」不同 —— 判準以 **有沒有 `[失聯]` 那一行**為準。
 
-> 對照：`ho_master1.ino:3369-3379` 的 `UNPAIRALL` 分支（`unpairAllPending = true;`，
+> **本項擋得住什麼、擋不住什麼**
+>
+> - **擋得住**：「不分批」這個回歸（若有人把 `processUnpairAll()` 改回
+>   `while (slaveCount > 0) unpairSlave(...)` 的一口氣版本，
+>   2 台雖然只會累積約 0.2 秒，**但序列埠會在同一輪 `loop()` 內把兩台一次拆完**，
+>   看得出來）。
+> - **擋不住 20 台的累積量**。分批設計要防的是
+>   **20 台 × (每台一次 `espNowDelay(100)` ＋ 一次最壞 10 秒級的阻塞 publish)
+>   ＝ 最壞超過 60 秒沒有心跳**。
+>   **2 台的最壞累積約 20 秒，本來就撐不破 30 秒門檻** ——
+>   也就是說**這一項用 2 台跑，就算分批機制整個壞掉也可能 PASS**。
+>   要真的驗到，得配滿 20 台（或至少 5 台以上）＋ 一個會讓 publish 卡住的網路。
+> - **擋不住「單次 publish 阻塞過長」**（readme 已知風險第 0 項）：
+>   分批只保證「不疊加」，不保證「單次多短」。
+> - 上面的秒數全是靜態推演（每台 100ms 固定等待 ＋ 10 秒級黑箱的上界推算），
+>   **沒有實機量測**。
+
+> 對照：`ho_master1.ino:3370-3380` 的 `UNPAIRALL` 分支（`unpairAllPending = true;`，
 > **只插旗不跑迴圈**）；`:1750-1761` 的 `processUnpairAll()`
 > （`unpairSlave(slaveCount - 1)` ＋ `[配對] 名冊已清空`）；
 > `:1737` 的 `[配對] 已移除 %s，剩 %d 台`；
@@ -665,9 +829,9 @@ slave1 點動 2 秒）。
 - `LR:` 開頭的**任何**字串（`LR:OFF`、`LR:whatever`）都走同一條，都印同一行。
 - `status` 的 `device.long_range` **恆為 `false`**，下完 `LR:ON` 也一樣。
 
-> 對照：`ho_master1.ino:3380-3382` 的
+> 對照：`ho_master1.ino:3381-3383` 的
 > `} else if (message.startsWith("LR:")) { Serial.println("[LR] 指令尚未實作（Task 6）"); }`；
-> `:3384` 的 `Serial.printf("[MQTT] 未知指令: %s\n", message.c_str())`；
+> `:3385` 的 `Serial.printf("[MQTT] 未知指令: %s\n", message.c_str())`；
 > `:60` 的 `bool longRangeEnabled = false;`（全檔無寫入 `true` 的點）。
 
 ---
@@ -710,7 +874,7 @@ ESP-NOW 就緒，channel=<n>
 > `:1763` 的 `printSlaveList()`（`  %d. %s  %s  rssi=%d`，`i` 由 0 起算）；
 > `:930-947` 的 `prefs.begin("homaster", …)`（只有 `count`／`macs`／`espch`）；
 > `:430` 的 `[設定] SSID=%s 自訂伺服器=%s 繼電器=%s 上次AP channel=%u`；
-> `:3454` 的 `Serial.printf("ESP-NOW 就緒，channel=%u\n", currentChannel)`；
+> `:3455` 的 `Serial.printf("ESP-NOW 就緒，channel=%u\n", currentChannel)`；
 > `:2694` 的 `[MQTT] 已連線 %s`；`:2631` 的 `[MQTT] 已訂閱 %s`；`:2544` 的 `[代理] 已訂閱 %s`。
 
 ---
@@ -754,14 +918,14 @@ ESP-NOW 就緒，channel=<n>
   `⚠ [channel] 名冊有 <n> 台 slave，但 NVS 沒有 channel 記錄，…` 並停在 channel 1。
   **那是已知且已標示的行為，不算本項失敗，但也不算通過** —— 先配網成功一次再回來測。
 
-> 對照：`ho_master1.ino:3296-3305` 的 `reset` 分支（`clearNetConfig(); espNowDelay(1000); ESP.restart();`）；
+> 對照：`ho_master1.ino:3297-3306` 的 `reset` 分支（`clearNetConfig(); espNowDelay(1000); ESP.restart();`）；
 > `:464-470` 的 `clearNetConfig()`（`netPrefs.begin("hoban", false); netPrefs.clear();` ＋
 > `[設定] NVS 網路設定已清除`）；`:930`／`:946` 的 `prefs.begin("homaster", false)`；
 > `:430` 的 `[設定] SSID=%s 自訂伺服器=%s 繼電器=%s 上次AP channel=%u`；
 > `:985` 的 `[名冊] 載入 %d 台 slave（上次心跳 channel=%u）`；
 > `:2341`／`:2349` 的兩行 `[channel] …`；
 > `:622` 的 `Serial.printf("[BLE] 已啟動，名稱: %s\n", deviceId)`；
-> `:3501` 的 `Serial.println("[BLE] 等待 App 配網")`。
+> `:3502` 的 `Serial.println("[BLE] 等待 App 配網")`。
 
 ---
 
@@ -794,29 +958,56 @@ Phase 2b 只動到其中兩處，實測時要注意：
 
 ## 22. 🖥 **回歸 Phase 2a**：WiFi 拔線 60 秒，slave 全程不失聯
 
-**步驟**：master 已連上 WiFi 與 MQTT、已配對至少 1 台 slave 且該台繼電器是 ON。
-拔掉 AP 的網路線（或關掉 AP）**60 秒**，兩邊序列埠同時盯著。
+> **這一項有兩個變體，斷法不同、走的程式路徑也不同，請分開做、分開記錄。**
+> 上一版把兩者混成一句「拔掉 AP 的網路線（或關掉 AP）」，
+> 又在觀察項寫「拔線會讓 WiFi 直接斷開」——**那句對變體 B 是錯的**：
+> 拔的是 AP 對外的 WAN 線時 **WiFi 關聯根本不會斷**，
+> 而那**正好就是製造病態 socket 的方式**。
 
-**預期（master 序列埠）**：會出現 `[WiFi] 重連嘗試 #<n>`、
-`[MQTT] 嘗試 <伺服器> …`、`[MQTT] <伺服器> 失敗，state=<n>` 這類訊息；
+**共同前置**：master 已連上 WiFi 與 MQTT、已配對至少 1 台 slave 且該台繼電器是 ON。
+兩邊序列埠同時盯著，各做 **60 秒**。
+
+### 變體 A：WiFi 真的斷（關掉 AP／把 AP 電源拔掉）
+
+**預期（master 序列埠）**：出現 `[WiFi] 重連嘗試 #<n>`，之後
+`[MQTT] 嘗試 <伺服器> …`／`[MQTT] <伺服器> 失敗，state=<n>`；
 **`[心跳] …` 全程持續出現**。
 
-**【失敗判定】**
+### 變體 B：WiFi 不斷、只斷外網（**拔掉 AP 的 WAN／上行網路線**）
+
+WiFi 關聯與 IP 都還在，`WiFi.isConnected()` 仍是 true，
+本地 socket 仍停在 `ESTABLISHED`、`mqttClient.connected()` 仍回 true。
+
+**預期（master 序列埠）**：**多半看不到 `[WiFi] 重連嘗試 #<n>`**（WiFi 沒斷），
+而是狀態發布開始變慢／卡住，最後才出現 MQTT 斷線與重連訊息；
+**`[心跳] …` 全程持續出現**。
+
+**【失敗判定】（兩個變體共用）**
 - **slave 印出 `[失聯] 超過 30 秒沒收到心跳`** → FAIL。
 - slave 印出 `[安全] 失去 master，繼電器已關閉`（＝籠門被打開）→ FAIL。
 
 **【觀察項，不是失敗判定】**
-- master 重連期間單次 `mqttClient.connect()` 最壞阻塞約 **18 秒**
-  （DNS 約 15 ＋ TCP 3），期間沒有心跳。`smartConnect()` 刻意設計成
-  **一次呼叫只試一台 broker**，由 `loop()` 的 10 秒節奏推進，
-  確保兩次 18 秒之間必定隔著約 10 秒的心跳。
-- **這一項通過不代表第 0 號風險已解決。** readme「已知風險」第 0 項的
-  「socket 寫入沒有硬上限」需要的是**病態 socket**
-  （AP 正常但 WAN 斷線、本地 socket 仍 `ESTABLISHED`），
-  **拔網路線製造不出那個情境** —— 拔線會讓 WiFi 直接斷開，走的是另一條路。
-  **本項擋得住「重連流程吃掉心跳」，擋不住「單次 socket 寫入無限期阻塞」。**
+- 變體 A：單次 `mqttClient.connect()` 最壞阻塞約 **18 秒**（DNS 約 15 ＋ TCP 3），
+  期間沒有心跳。`smartConnect()` 刻意設計成**一次呼叫只試一台 broker**，
+  由 `loop()` 的 10 秒節奏推進，確保兩次 18 秒之間必定隔著約 10 秒的心跳。
+- **變體 B 是目前手邊最接近「病態 socket」的做法**，值得記錄
+  兩則心跳之間最長的空白有多久（這是第 0 號風險唯一能拿到實測數字的機會）。
 
-> 對照：`ho_master1.ino:3579` 的 `[WiFi] 重連嘗試 #%d`；
+> **本項擋得住什麼、擋不住什麼（上一版的理由對變體 B 是錯的，已更正）**
+>
+> - **兩個變體都擋得住**：「重連流程吃掉心跳」這條回歸。
+> - **變體 A 擋不住第 0 號風險** —— WiFi 一斷，socket 直接失效，
+>   根本走不到「寫得進去但寫不完」那條路。
+> - **變體 B 走得到 10 秒級黑箱**（TCP 送出緩衝塞滿後每次 `write()` 吃滿
+>   10 次重試 × 1 秒 `select()`），**但仍不保證重現「無限期」那一種**：
+>   無限期需要「每輪只擠得出幾個 byte」讓重試計數器反覆被重置，
+>   對應的是**對端 TCP 視窗趨近於零**，而不是「完全不通」。
+>   拔 WAN 線比較容易造成後者。
+> - 所以：**變體 B PASS 不代表第 0 號風險不存在**；
+>   它頂多證明「這一次沒有踩到」。第 0 號風險目前**沒有任何測試能證明它不發生**，
+>   只能靠讀 `NetworkClient::write()` 的原始碼確認機制存在。
+
+> 對照：`ho_master1.ino:3580` 的 `[WiFi] 重連嘗試 #%d`；
 > `:2684`／`:2688` 的 `[MQTT] 嘗試 %s …`／`[MQTT] %s 失敗，state=%d`；
 > `:2242` 的 `[心跳] channel=%u …`；
 > `ho_slave1.ino:667` 的 `[失聯] 超過 30 秒沒收到心跳`、`:250` 的
@@ -847,9 +1038,9 @@ Phase 2b 只動到其中兩處，實測時要注意：
 - topic 格式本身解析不了時（例如 `hoban/abc/control`）印的是
   `[MQTT] 無法解析的 topic，忽略: <topic>`，是另一行、另一條路徑。
 
-> 對照：`ho_master1.ino:3384` 的 `[MQTT] 未知指令: %s`；
-> `:3416` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
-> `:3402` 的 `[MQTT] 無法解析的 topic，忽略: %s`。
+> 對照：`ho_master1.ino:3385` 的 `[MQTT] 未知指令: %s`；
+> `:3417` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
+> `:3403` 的 `[MQTT] 無法解析的 topic，忽略: %s`。
 
 ---
 

@@ -71,7 +71,7 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 | `unpairall` | 清空整份名冊（分批執行，每輪 `loop()` 拆一台，心跳不中斷） |
 | `ch <n>` | 測試用：切換 channel，驗證 slave 重掃 |
 | `droppeer <n>` | **測試用**：刪掉第 n 台的 ESP-NOW peer 但**保留名冊條目**，製造「在名冊上卻送不出單播」。回歸清單 8e 專用。不寫 NVS、不動名冊內容，重開機或重新配對即恢復。**傷害面**：App 對那台的個別開／關會**靜默失敗**到重開機為止；群組關門仍有效（主指令走廣播×3），但它會被誠實記成未送達 |
-| `fakeslaves <n>` | **測試用**：把名冊灌成 n 台假 slave（MAC 固定為 `AA:BB:CC:DD:EE:<n>`），量狀態 JSON 容量用。**不寫 NVS**、**不註冊 ESP-NOW peer**。灌入後 `fakeSlavesActive` 會鎖住 `saveSlaves()` 直到重開機，避免假 MAC 經由後續的 pair／unpair 流程寫進 NVS 汙染真實名冊 |
+| `fakeslaves <n>` | **測試用**：把名冊灌成 n 台假 slave，量狀態 JSON 容量用。MAC 是 `AA:BB:CC:DD:EE:<i>`，**`<i>` 是迴圈索引 0…n−1（不是 n）**，所以 `fakeslaves 20` 產生的 ID 是 `hoban-aabbccddee00` … `hoban-aabbccddee13`（**十六進位**）。**不寫 NVS**、**不註冊 ESP-NOW peer**。灌入後 `fakeSlavesActive` 會鎖住 `saveSlaves()` 直到重開機，避免假 MAC 經由後續的 pair／unpair 流程寫進 NVS 汙染真實名冊。**⚠ 若當下已連上 broker，master 會在約 0.75 秒後開始把這 n 台以 `retain=true` 發上去，而那些 topic 重開機後不會被覆蓋、永久留在 broker 上** —— 清除步驟見 `docs/phase2b-regression-checklist.md` 第 3 項結尾 |
 | `jsonsize` | **測試用**：用 `buildStatusDoc()` + `measureJson()` 印出「實際會發布的那份 JSON」的大小，與 `statusBuf`／mqtt buffer 對照。不需連上 MQTT |
 | `help` | 顯示說明 |
 
@@ -607,9 +607,14 @@ publish 最壞是 10 秒級黑箱（**App 端依賴那則 `publishStatus()`，�
 - master 狀態多一個 **`"group"`** 摘要物件：
 
 ```json
-"group": {"cmd":3,"age_s":2,"busy":0,"n":20,"ack":18,"noack":2,"gone":0,
+"group": {"cmd":2,"age_s":2,"busy":0,"n":20,"ack":18,"noack":2,"gone":0,
           "exec":"unprovable"}
 ```
+
+**`cmd` 的合法值只有 `0`／`1`／`2`**（`HO_CMD_OFF = 0`、`HO_CMD_ON = 1`、
+`HO_CMD_PULSE = 2`，見 `libraries/HoEspNow/src/HoEspNowProtocol.h`）。
+上面舉的 `2` 就是 `ALL:ON`（＝廣播 `HO_CMD_PULSE`）的實際值。
+**這個範例原本寫 `"cmd":3`，那是一個不存在的值**，Task 7 review 抓到後更正。
 
 `noack` 就是 App 該顯示紅色的依據。`exec` 固定 `"unprovable"`，用來擋掉
 「App 把 `ack` 當成關門成功」這條誤讀路徑。
@@ -645,8 +650,16 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
 
 ### master 自身狀態 JSON（`hoban/<masterId>/status`，retain）
 
-**以下欄位逐一取自 `buildStatusDoc()` ＋ `appendGroupResult()` ＋
+**以下欄位名稱逐一取自 `buildStatusDoc()` ＋ `appendGroupResult()` ＋
 `appendSlavesArray()` 的實際程式碼，不是從規格抄的。**
+
+> **這句宣稱擋得住什麼、擋不住什麼（Task 7 review C1 的教訓）**：
+> 它擋的是「**欄位名稱**與程式碼不符」——每個 key 都能在上述三支函式裡 grep 到。
+> **它擋不住「範例值」寫錯**：底下那些數字是為了讓範例好讀而編的，
+> 只有 `"exec": "unprovable"` 是程式寫死的常數。
+> **這不是假設性的**：本範例的 `"cmd"` 原本寫成 `3`，而 `3` 是一個
+> **不存在的 `HoRelayCmd` 值**，review 才抓到。
+> **值的合法範圍一律以本節下方的欄位表為準，不要照抄範例的數字。**
 
 ```json
 {
@@ -672,7 +685,7 @@ slave 要在 App 眼裡是一台普通設備，語義就必須完全一致，否
     "free_heap": 123456
   },
   "group": {
-    "cmd": 3, "age_s": 2, "busy": 0,
+    "cmd": 2, "age_s": 2, "busy": 0,
     "n": 2, "ack": 1, "noack": 1, "gone": 0,
     "exec": "unprovable"
   },
@@ -958,6 +971,21 @@ Phase 2a 的 `mqttCallback()` 是把 topic 與自己的 control topic 做完整�
 > **它擋不住什麼，也要一起寫**：本節下方的所有其他防線（三／四層防護、
 > 群組指令的 6 秒 wall-clock 上限、`unpairall` 分批）擋的都是**「多次阻塞疊加」**，
 > 沒有任何一條擋得住**「單次阻塞過長」**。**別把它們讀成已經解決了第 0 項。**
+
+**目前唯一能拿到實測數字的手段（也只是逼近，不是重現）**：
+**拔掉 AP 的 WAN／上行網路線，但讓 WiFi 關聯保持不斷**。
+此時 `WiFi.isConnected()` 仍是 true、本地 socket 仍停在 `ESTABLISHED`、
+`mqttClient.connected()` 仍回 true，代發照發，直到 lwIP 的 `TCP_SND_BUF`
+（約 5.7KB）被塞滿 —— 之後每次 `write()` 吃滿 10 次重試 × 1 秒 `select()`。
+
+- **它能驗到**：10 秒級黑箱確實存在，以及兩則心跳之間最長的空白有多久。
+- **它驗不到**：「無限期」那一種。無限期需要**每輪只擠得出幾個 byte**
+  才會反覆重置重試計數器，對應的是**對端 TCP 視窗趨近於零**而不是「完全不通」，
+  而拔 WAN 線比較容易造成後者。
+- **所以這個實驗 PASS 不代表本項風險不存在**，只代表「這一次沒踩到」。
+  本項目前**沒有任何測試能證明它不發生**，只能靠讀 `NetworkClient::write()`
+  的原始碼確認機制存在。步驟寫在
+  `docs/phase2b-regression-checklist.md` 第 22 項的**變體 B**。
 
 ### 0-b. 群組廣播沒有 ack，「已送達」不等於「已關門」
 
