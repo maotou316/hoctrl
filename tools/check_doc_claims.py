@@ -17,13 +17,17 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
     python tools/check_doc_claims.py
 全部通過印 ALL CHECKS PASSED，任何一項失敗以 exit code 1 結束。
 
-六個驗證方向：
+八個驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）：
   1. HIT     —— 文件引用的判準字串必須逐字出現在原始碼裡
   2. BANNED  —— 被取代的舊值不得再以「現行事實」的樣子出現（**含原始碼註釋**）
   3. 行號    —— `檔名.ino:123` 這種對照一律禁止，判準要用字串錨點
   4. 項數    —— 數原始碼的 check() 呼叫，回頭比對文件寫死的「執行 N 項」
   5. 算式    —— 任何 `(A-1-B-C)/D = [E/D =] F` 的容量算式，逐項對原始碼常數複算
   6. 數值    —— 單獨寫出來的 `maxEntries` N 必須等於算出來的值
+  8. 開機分區 —— `ho_master1.ino` 的**非註釋行**不得出現
+                `esp_ota_set_boot_partition` / `#include <Update.h>` / `Update.begin(`
+  9. LR 掛鉤 —— `otaSessionBusy()` 的呼叫點數量必須仍是 2
+                （readme 宣稱「LR 互斥守衛現在並不存在」，這條讓那句話會過期時吵）
 
 **這支腳本擋不住什麼**（必須連著讀）：
   - 它只做**字串／算式比對**。字串對不代表語義對
@@ -102,6 +106,13 @@ HIT_IN_SOURCE = [
     ('BASE 分項 b',          'const size_t STATUS_GROUP_MAX_BYTES = 120;'),
     ('BASE 分項 c',          'const size_t STATUS_OTA_MAX_BYTES = 128;'),
     ('點動',                 '[繼電器] 點動 %u ms'),
+    # ── Phase 4 Task 3（master 端暫存下載）──
+    ('otadl 指令',           '} else if (verb == "otadl") {'),
+    ('otastat 指令',         '} else if (verb == "otastat") {'),
+    ('OTA 只收 https',       '[OTA] 只接受 https:// 開頭的網址'),
+    ('OTA 暫存取閒置分區',    'esp_ota_get_next_update_partition(NULL)'),
+    ('OTA 階段名 downloading', 'return "downloading";'),
+    ('OTA 完成訊息',         '[OTA] 完成：%s 已更新到 %u.%u.%u'),
 ]
 
 # ── 方向 3：協定測試的項數必須與文件的判準一致 ──
@@ -330,6 +341,45 @@ def main():
                         failures.append('[算式] %s:%d %s → %s'
                                         % (path, lineno, m.group(0), '；'.join(problems)))
         print('容量算式結構化複算：%d 條' % n_expr)
+    # ── 方向 8：master 絕不切換自己的開機分區（安全鐵則的機械化檢查）──
+    # ho_master1.ino 的註釋、ho_master1/readme.md 都寫著「master 不會變磚，
+    # 因為全檔沒有一行呼叫 esp_ota_set_boot_partition()，也沒有 include Update.h」。
+    # 那是一句**可被機械驗證**的宣稱，所以就驗它 —— 否則它只是一句話。
+    #
+    # **它擋不住什麼**：
+    #   - 只掃 ho_master1.ino 的**非註釋行**，而且只認這三個字面樣式。
+    #     透過函式指標、巨集別名或 esp_ota_ops.h 的其他 API（例如
+    #     esp_ota_begin/esp_ota_end 這組也會動 otadata）繞過去，它一個都抓不到。
+    #   - 它是靜態檢查，不證明執行期真的沒切換分區。
+    master_src = read('ho_master1/ho_master1.ino')
+    code_lines = [(i, ln) for i, ln in enumerate(master_src.splitlines(), 1)
+                  if not ln.lstrip().startswith('//')]
+    for pat in ('esp_ota_set_boot_partition', '#include <Update.h>', 'Update.begin('):
+        for lineno, line in code_lines:
+            if pat in line:
+                failures.append('[開機分區] ho_master1/ho_master1.ino:%d 出現 %s → %s'
+                                % (lineno, pat, line.strip()[:80]))
+
+    # ── 方向 9：otaSessionBusy() 的呼叫點數量（Phase 5 技術債的防腐）──
+    # ho_master1/readme.md 白紙黑字寫著「除了 otaStart() 自己的重入檢查以外
+    # **沒有任何呼叫端**，所以『OTA 進行中拒絕切 LR』這道守衛現在並不存在」。
+    # 那句話會在 Phase 5 有人補上守衛的當天變成假的 —— 而假的方向剛好是
+    # 「文件低估了保護」→ 下一個人以為還沒做、又做一次；或反過來被當成已經做了。
+    # 所以把「呼叫點數量」釘住：定義 1 處 + otaStart() 內 1 處 = 2。
+    #
+    # **它擋不住什麼**：它只數字面出現次數。有人加了呼叫端**同時**改掉這個
+    # 期望值卻不改 readme，它就會靜靜通過；它也不檢查那個呼叫端是不是
+    # 真的擋住了 LR 切換（那要看語義，字串比對驗不到）。
+    n_busy = len([1 for _, line in code_lines if 'otaSessionBusy(' in line])
+    if n_busy != 2:
+        failures.append('[LR 掛鉤] otaSessionBusy() 的非註釋出現次數是 %d（期望 2：'
+                        '定義 1 處 + otaStart() 重入檢查 1 處）。'
+                        '若是 Phase 5 補上了 LR 互斥守衛，請同時更新 '
+                        'ho_master1/readme.md 那段「守衛現在並不存在」的敘述'
+                        '與本檢查的期望值' % n_busy)
+    print('開機分區靜態檢查：ho_master1.ino 非註釋行 %d 行；'
+          'otaSessionBusy() 呼叫點 %d 處' % (len(code_lines), n_busy))
+
     print('HIT 檢查 %d 項、BANNED 樣式 %d 條 × 檔案 %d 份（含原始碼註釋）；'
           'PLAN 樣式 %d 條 × %d 份'
           % (len(HIT_IN_SOURCE), len(BANNED_IN_DOCS), len(BANNED_SCAN_FILES),
