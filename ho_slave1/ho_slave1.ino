@@ -9,7 +9,25 @@
 #include <Update.h>
 #include <HoEspNowProtocol.h>
 
-const char* firmwareVersion = "1.0.0";
+// ── 韌體版本：唯一真相來源 ──
+// 三段數字與 firmwareVersion 字串**必須只有一處可改**。舊寫法是這裡一個字串常數、
+// sendState() 裡另外三個寫死的字面值 1／0／0，兩者之間沒有任何連結 ——
+// 下一個人改了字串卻改不到欄位，映像仍回報舊版號。
+// 那會直接製造一次**假失敗**：master 的 OTA_VERIFYING 階段唯一的驗收依據就是
+// slaves[].fwMajor/fwMinor/fwPatch 是否等於它送出的目標版本，90 秒不符就判 no_return，
+// 於是一次**實際完全成功**的 OTA 會被記成失敗。
+//
+// **它擋不住什麼**：它只保證「字串與欄位同步」，不保證「有人記得升版號」。
+// 改了程式碼卻沒動這三個數字就重燒，master 一樣會等到 90 秒逾時 —— 那是誤紅方向。
+#define HO_SLAVE_FW_MAJOR 1
+#define HO_SLAVE_FW_MINOR 0
+#define HO_SLAVE_FW_PATCH 0
+#define HO_STRINGIFY_(x) #x
+#define HO_STRINGIFY(x) HO_STRINGIFY_(x)
+
+const char* firmwareVersion = HO_STRINGIFY(HO_SLAVE_FW_MAJOR) "."
+                              HO_STRINGIFY(HO_SLAVE_FW_MINOR) "."
+                              HO_STRINGIFY(HO_SLAVE_FW_PATCH);
 const char* deviceModel = "hoSlave1";
 
 // ── GPIO（與 ho_relay2 完全一致）──
@@ -149,9 +167,11 @@ void sendState() {
 
   HoStatePayload st;
   st.relay = relayState ? 1 : 0;
-  st.fwMajor = 1;
-  st.fwMinor = 0;
-  st.fwPatch = 0;
+  // 版本三段一律取自 HO_SLAVE_FW_* 這唯一來源（firmwareVersion 字串也是由它們組出來的），
+  // 不得改回字面值 —— master 的 OTA_VERIFYING 只認這三個欄位
+  st.fwMajor = HO_SLAVE_FW_MAJOR;
+  st.fwMinor = HO_SLAVE_FW_MINOR;
+  st.fwPatch = HO_SLAVE_FW_PATCH;
   st.uptimeSec = millis() / 1000;
   st.lastCmdId = lastCmdId;
   st.lastCmdKind = lastCmdKind;
@@ -184,6 +204,24 @@ void otaAbort(const char* why) {
 }
 
 // 回一封 OTA_ACK 給 master。mask 只在回報區塊進度時有意義。
+//
+// ── status 的分工（本 Task review 的 C2；產生端就得分清楚）──
+//   HO_OTA_READY  ＝「工作階段還在進行中，這封帶的是我目前的進度」
+//                    （BEGIN 接受、重複 BEGIN、區塊收齊、回覆 master 的查詢，四處都用它）
+//   HO_OTA_OK     ＝「**整份校驗通過、我要重開機了**」，全檔**只有一處**產生，
+//                    而且固定帶 (blockBase = otaTotalChunks, mask = 0xFFFF) 當正向識別
+//   其餘          ＝ 各自的錯誤碼
+//
+// 為什麼非分不可：master 的 OTA_END_SENT 階段**只看 status**（見 plan Task 4
+// `case OTA_END_SENT:` 的 `if (otaAckStatus == HO_OTA_OK)`）。原本查詢回覆在
+// otaBlockBase==0 && otaBlockMask==0 時產生的 (0, 0, HO_OTA_OK) 與「校驗通過」那封
+// **逐位元組相同**，一封延遲抵達的查詢回覆就會讓 master 印「slave 校驗通過」——
+// 那是加出來的綠燈。區塊收齊的回覆同理（它也曾用 HO_OTA_OK）。
+// 這也才對得上協定標頭自己的定義：`HO_OTA_OK = 0, // 校驗通過，即將重啟`。
+//
+// **它擋不住什麼**：它只讓「校驗通過」這封無法被別的回覆冒充。
+// 它不防重放 —— 協定沒有加密也沒有 nonce，錄下真正那封 (totalChunks, 0xFFFF, OK)
+// 再重播，master 一樣會信。這一層要等協定加上工作階段內的單向計數才擋得住。
 void otaSendAck(uint16_t blockBase, uint16_t mask, uint8_t status) {
   if (!masterKnown) return;
   HoOtaAckPayload ack;
@@ -311,17 +349,22 @@ void setChannel(uint8_t ch) {
 void startChannelScan() {
   if (scanning) return;
 
-  // 失去 master 就不可能繼續接收，先把 Update 釋放掉。
-  // 不釋放的話，flash 分區會被一個永遠不會完成的工作階段占著，
-  // 下一次 OTA 的 Update.begin() 會失敗。
-  otaAbort("失去 master，開始輪掃");
-
   // 安全預設：失去 master 時關閉繼電器，避免一直通電
+  //
+  // ⚠ 這一段**必須排在 otaAbort() 之前**。繼電器動作是本檔案唯一的實體安全輸出，
+  // 不能排在任何「可能變慢」的東西後面：otaAbort() 會走 Update.abort() 並印一行
+  // 序列埠訊息（115200 下數十 bytes 約 數 ms），Serial 緩衝滿時還會等。
+  // 量級雖小，但排序原則不該讓步 —— **先進入已知安全狀態，再收拾資源。**
   if (relayState) {
     setRelayPins(false);
     pulseActive = false;
     Serial.println("[安全] 失去 master，繼電器已關閉");
   }
+
+  // 失去 master 就不可能繼續接收，把 Update 釋放掉。
+  // 不釋放的話，flash 分區會被一個永遠不會完成的工作階段占著，
+  // 下一次 OTA 的 Update.begin() 會失敗。
+  otaAbort("失去 master，開始輪掃");
 
   scanning = true;
   scanChannel = 1;
@@ -684,8 +727,14 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
       return;
     }
 
-    // 把期望的 MD5 交給 Update，Update.end(true) 會在切換開機分區「之前」比對。
-    // 不符就直接回 false 且不切換 —— 這是「失敗不變磚」的核心那一道。
+    // 把期望的 MD5 交給 Update。`Update.end(true)` 會在 `_verifyEnd()`
+    //（也就是 `esp_ota_set_boot_partition()` 那一步）「之前」比對它，不符就回 false 且不切換。
+    //
+    // ⚠ 這是**唯一**擋得住「內容錯誤或長度截斷」的一道：
+    // `end(true)` 的 evenIfRemaining 分支會把 `_size = progress()`
+    //（esp32 core 3.3.7 `Updater.cpp` 的 `bool UpdateClass::end(bool evenIfRemaining)`
+    //  裡的 `_size = progress();`）—— 也就是說 **`end(true)` 根本不驗長度**，
+    // 它只驗 MD5。本檔案曾寫成「end(true) 會依序檢查長度與 MD5」，那是假宣稱。
     char md5hex[33];
     for (int i = 0; i < 16; i++) snprintf(md5hex + i * 2, 3, "%02x", bg.md5[i]);
     Update.setMD5(md5hex);
@@ -723,6 +772,21 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     // 塊號合法但內容錯誤的封包照收，那一層由整份韌體的 MD5 在 Update.end(true) 攔下。
     if (dh.chunkIndex >= otaTotalChunks) return;
 
+    // 長度必須「剛好等於這個塊號應有的長度」：中段一律 240，只有最後一包可以短，
+    // 而且短多少是由 totalSize 與 totalChunks 唯一決定的。
+    //
+    // 沒有這一條的話：一封中段短包只覆寫 otaBlockBuf 那一格的前段，
+    // **尾巴是前一個區塊留下的舊位元組**（緩衝從不清空 —— 也刻意不清空：
+    // 每塊清 3840 bytes 只是把成本換個地方付，真正該做的是不接受長度不對的包），
+    // 而 bitmap 照樣記成「這一格收到了」，湊滿之後那段殘留就被寫進映像。
+    //
+    // **它擋不住什麼**：它只檢查長度。長度剛好、內容錯誤的封包照收照寫 ——
+    // 那一層只有整份韌體的 MD5 在 Update.end(true) 擋得住（而且是整份重來，不是重傳那一包）。
+    uint32_t expectLen = (dh.chunkIndex == (uint16_t)(otaTotalChunks - 1))
+                           ? (otaTotalSize - (uint32_t)(otaTotalChunks - 1) * HO_OTA_CHUNK_SIZE)
+                           : (uint32_t)HO_OTA_CHUNK_SIZE;
+    if ((uint32_t)dataLen != expectLen) return;
+
     // 只收目前這個區塊內的包。前一個區塊的重複包（master 沒收到 ACK 而重送）
     // 落在區間外，直接丟棄即可 —— 資料已經寫進 Update 了。
     if (dh.chunkIndex < otaBlockBase || dh.chunkIndex >= otaBlockBase + HO_OTA_WINDOW) return;
@@ -741,6 +805,23 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     if ((otaBlockMask & fullMask) != fullMask) return;   // 還沒收齊，等 master 查詢
 
     // 收齊了 → 一次順序寫入。最後一個區塊的長度要用總長度回推，不能假設是滿的。
+    //
+    // ⚠ 這一行會阻塞 WiFi task（本函式就跑在 WiFi task 上），代價比原本估的大一級：
+    // esp32 core 3.3.7 的 `Updater.cpp` 在 `_writeBuffer()` 裡是
+    // `ESP.partitionEraseRange(_partition, _progress, block_erase ? SPI_FLASH_BLOCK_SIZE : SPI_FLASH_SEC_SIZE)`，
+    // 而 `Update.h` 的 `#define SPI_SECTORS_PER_BLOCK 16` 讓 SPI_FLASH_BLOCK_SIZE ＝ **64 KB**
+    //（不是 4 KB 扇區）。988 KB 的映像會跨 15 次 64 KB 邊界，每次抹除依 plan 的換算是
+    // **60~190 ms**，期間本 task 完全不處理任何 ESP-NOW 收包。
+    //
+    // **它擋不住什麼（這是誠實敘述，不是防線）**：那 60~190 ms 內抵達的封包，
+    // MAC 層 ACK 由硬體回、master 因此認定「已送達」，但應用層是否收得到取決於
+    // RX 佇列有沒有滿 —— 而轉送期間 master 正在全速灌 OTA_DATA，佇列本來就吃緊。
+    // **群組安全指令（App 的「全部關門」送的是 ALL:ON ＝廣播 PULSE）在這個窗口內
+    // 有可能被靜默丟失，而 master 端的補送判準是 MAC 層 ACK，接不住這一種。**
+    // 唯一會讓它現形的是 Phase 2b 的指令歸因（該台不會回報 lastCmdId →
+    // master 印「⚠ [群組]   無執行證明：<id>」），那是回報、不是補救。
+    // 暴露面僅限「正在接收 OTA 的那一台」；Task 5 對 relay==1 的 slave 預設拒絕 OTA
+    //（除非帶 force:true），所以正在把籠門保持關閉的那台預設不會進入這個窗口。
     uint32_t remain = otaTotalSize - otaWritten;
     size_t writeLen = (size_t)need * HO_OTA_CHUNK_SIZE;
     if (writeLen > remain) writeLen = remain;
@@ -755,8 +836,10 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     }
     otaWritten += wrote;
 
-    // 主動回報「這一塊收齊了」，master 就不必等查詢逾時，直接推進下一塊
-    otaSendAck(otaBlockBase, fullMask, HO_OTA_OK);
+    // 主動回報「這一塊收齊了」，master 就不必等查詢逾時，直接推進下一塊。
+    // status 用 HO_OTA_READY（＝進度回報）而非 HO_OTA_OK —— 理由見 otaSendAck() 上方，
+    // master 的 OTA_WAIT_BLOCK_ACK 只看 blockBase 與 mask，不看 status，所以這樣改不影響推進。
+    otaSendAck(otaBlockBase, fullMask, HO_OTA_READY);
 
     otaBlockBase += need;
     otaBlockMask = 0;
@@ -778,18 +861,28 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     if (!otaActive || q.sessionId != otaSession) return;
     otaLastPacketAt = millis();
 
-    // 查詢的區塊已經被我寫完並推進了 → 回一個「全滿」讓 master 直接往前走
+    // 查詢的區塊已經被我寫完並推進了 → 回一個「全滿」讓 master 直接往前走。
+    // 兩條路徑的 status 都是 HO_OTA_READY（進度回報），**絕不可改回 HO_OTA_OK**：
+    // 在 otaBlockBase==0 && otaBlockMask==0 時，(0, 0, HO_OTA_OK) 與「整份校驗通過」
+    // 那封逐位元組相同，而 master 的 OTA_END_SENT 只看 status。
     if (q.blockBase < otaBlockBase) {
-      otaSendAck(q.blockBase, 0xFFFF, HO_OTA_OK);
+      otaSendAck(q.blockBase, 0xFFFF, HO_OTA_READY);
       return;
     }
-    otaSendAck(otaBlockBase, otaBlockMask, HO_OTA_OK);
+    otaSendAck(otaBlockBase, otaBlockMask, HO_OTA_READY);
     return;
   }
 
   if (header.type == HO_PKT_OTA_END && payloadLen >= sizeof(HoOtaEndPayload)) {
     HoOtaEndPayload en;
     memcpy(&en, payload, sizeof(en));
+    // sessionId 不符一律「靜默」丟棄，不回 HO_OTA_ERR_SESSION。
+    // 這也是全檔 HO_OTA_ERR_SESSION 沒有產生點的原因，刻意如此：
+    // 會走到這裡的是上一場失敗留下的殘留封包，對一個「已經不存在的工作階段」回 ACK
+    // 只會在 master 那邊製造回音（它的 onEspNowRecv 只比對 sessionId 後就設旗標），
+    // 而 master 端本來就有查詢逾時與 5 分鐘總上限會把它收掉 —— **誤紅方向，可接受**。
+    // **它擋不住什麼**：代價是 master 分不出「我送錯 session」與「slave 不見了」，
+    // 兩者都只會表現成逾時。真的需要區分時，該補的是 master 端的診斷，不是這裡多回一封。
     if (en.sessionId != otaSession) return;
     otaLastPacketAt = millis();
 
@@ -799,8 +892,17 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
       return;
     }
 
-    // 進 Update.end() 之前先自己比一次長度。長度不符時直接 abort，
-    // 連 end() 都不進 —— 少一條可能切換開機分區的路徑。
+    // 進 Update.end() 之前先自己比一次長度。
+    //
+    // ⚠ 這一道**不是**「end(true) 的第二層」，它擋的是 end(true) **根本看不到**的東西：
+    // master 在 OTA_END 裡宣告的 totalSize 與它在 OTA_BEGIN 宣告的不一致。
+    // 位元組流本身可能完全正確（MD5 會過、end(true) 會回 true 並切換開機分區），
+    // 兩邊對長度的認知卻已經分歧 —— 只有這裡比得出來。
+    //
+    // 至於「我實際寫入量 < 宣告長度」（截斷），擋下它的是 **MD5**，不是長度：
+    // esp32 core 3.3.7 的 `end(true)` 會先 `_size = progress();` 再比 MD5，
+    // **等於放棄長度檢查**。本檔案原本的註釋寫「end(true) 會依序檢查長度與 MD5」，
+    // 那是照語義模型寫的假宣稱，已更正。
     if (!otaActive || otaWritten != en.totalSize || otaWritten != otaTotalSize) {
       Serial.printf("[OTA] 長度不符：已寫 %u，master 宣告 %u\n",
                     (unsigned)otaWritten, (unsigned)en.totalSize);
@@ -809,8 +911,14 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
       return;
     }
 
-    // end(true) 會依序檢查長度與 setMD5() 設定的 MD5，
-    // 兩者都過才呼叫 esp_ota_set_boot_partition()。不過就回 false 且不切換。
+    // end(true) 的實際行為（照 esp32 core 3.3.7 的 `Updater.cpp` 讀出來的，不是推的）：
+    //   1. `_size = progress();` —— **跳過長度檢查**
+    //   2. 比對 `setMD5()` 設定的 MD5，不符就 `_abort(UPDATE_ERROR_MD5)` 回 false
+    //   3. 才進 `_verifyEnd()` → `_enablePartition()`（補寫回開頭 16 bytes）
+    //      → `_partitionIsBootable()` → `esp_ota_set_boot_partition()`
+    // 所以擋住「內容錯」與「長度截斷」的是第 2 步的 MD5，全靠它一道。
+    // 另外第 3 步之前，映像的開頭 16 bytes 一直是空的（`Updater.cpp` 在第一次寫入時
+    // 把它們 stash 起來不寫），半途中斷的映像因此開不起來 —— 這是 plan 沒列到的第六道。
     if (!Update.end(true)) {
       Serial.printf("[OTA] 校驗失敗，錯誤碼 %u —— 開機分區未變動，重啟後仍是舊韌體\n",
                     Update.getError());
@@ -820,7 +928,10 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     }
 
     Serial.println("[OTA] 校驗通過，1 秒後重新啟動");
-    otaSendAck(0, 0, HO_OTA_OK);
+    // 全檔唯一一處產生 HO_OTA_OK，且固定帶 (otaTotalChunks, 0xFFFF) 當正向識別 ——
+    // 查詢回覆與區塊回報都不可能產生這個組合（它們的 blockBase 恆 < otaTotalChunks，
+    // 而 blockBase == otaTotalChunks 的查詢回覆走不到「全滿」那條路徑）。
+    otaSendAck(otaTotalChunks, 0xFFFF, HO_OTA_OK);
     otaActive = false;
     // 給 ACK 送出的時間再重啟。這裡用裸 delay() 是可以的：
     // 本機即將重開機，繼電器與心跳計時都會被重置，沒有「維持心跳」可言。

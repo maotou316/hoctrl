@@ -599,6 +599,26 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
   判定一律看 `busy: 0` 的那則。
 - **`ack: 2` 只代表 MAC 層送達，不代表門關了。** 這是本階段刻意保留的極限。
 
+> **⚠ Phase 4 加上的一個窗口：OTA 轉送期間，「正在接收 OTA 的那一台」有可能靜默漏掉這道關門指令。**
+>
+> Phase 4 的設計文件寫的是「`ALL:OFF`／單台 `OFF` 在 OTA 期間永遠可用且**不被延後**」。
+> **那句話對 master 端成立**（送出流程完全不被 OTA 阻擋，每個 `loop()` 只推進一小步），
+> **對目標 slave 不成立**：`ho_slave1.ino` 的 `Update.write()` 跑在 ESP-NOW 收包的同一個
+> task 上，跨 64 KB 邊界時會被 flash 區塊抹除擋住 **60~190 ms**
+>（依據：esp32 core 3.3.7 `Updater.cpp` 的 `partitionEraseRange(..., block_erase ? SPI_FLASH_BLOCK_SIZE : SPI_FLASH_SEC_SIZE)`，
+> 而 `Update.h` 的 `SPI_SECTORS_PER_BLOCK` 是 16 ⇒ 區塊是 64 KB 不是 4 KB 扇區），
+> 約 1 MB 的映像會發生 15 次。
+>
+> **為什麼補送接不住**：那段期間 **MAC 層 ACK 由硬體回覆**，master 因此判定「已送達」，
+> 而 `processGroupCmd()` 的補送判準正是「沒拿到 MAC 層 ACK 的才補送」。
+> **會讓它現形的是指令歸因**（該台不會回報對應的 `cmdId`，收工時印
+> `⚠ [群組]   無執行證明：%s`）—— 那是**回報，不是補救**。
+>
+> **判準怎麼寫**：本項的失敗判定**完全不變** —— 沒有 OTA 在跑時這個窗口不存在。
+> 只有在「實測當下剛好有 OTA 轉送」時，目標那一台沒動作要記成**已知窗口**而不是本項 FAIL；
+> **其餘每一台照舊一台都不能少**。實務上 Phase 4 的 `update_slave` 對 `relay == 1` 的 slave
+> 預設拒絕（除非帶 `force: true`），所以正把籠門保持關閉的那台預設不會進入這個窗口。
+
 > 對照：`ho_master1.ino` 的 `ALL:ON` 分支（`sendCmdToAll(HO_CMD_PULSE, 2000)`）；
 > `ho_master1.ino` 的 `Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, groupJob.count)`；
 > `ho_master1.ino` 的 `[群組] 已廣播 %d 次（廣播無 ACK，送出成功不代表任何一台收到），並對 %d 台各送一次單播，等 MAC 層 ACK`；
@@ -633,6 +653,10 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 - 指令碼印成 `2`（那是 PULSE）。
 - 有 slave 的繼電器仍然通電。
 - 少印那三行說明。
+
+> **OTA 轉送期間的例外與第 9 項完全相同**（目標那一台可能在 60~190 ms 的 flash 區塊抹除
+> 窗口內靜默漏包，而補送以 MAC 層 ACK 為判準、接不住）。判準寫法見第 9 項的警告框，
+> **不要在這裡重寫一份**。
 
 **【觀察項】**
 - **每台 slave 的 `[繼電器] 關閉` 會印兩次**（廣播一次、單播一次），
