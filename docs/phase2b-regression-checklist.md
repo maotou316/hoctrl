@@ -11,6 +11,16 @@
 > （複審設計了一項專門抓 N1 的測試 8e，事後才發現它抓不到）。
 > 所以請把下面每一項都當成「待驗證的假說」，不是「已知會通過的步驟」。
 
+> **本清單已於 Phase 4 Task 1 收尾時移除全部 117 處行號對照（`ho_master1.ino:3218` 這種）。**
+>
+> 理由不是嫌麻煩，是那些行號**當時已經全錯**：Phase 4 Task 1 動了 `ho_master1.ino`
+> 之後，31 處可判定的對照裡**錯了 30 處**（`:3218` 實際已是 3540、`:1892` 已是 2159）。
+> 而規則檔 `.claude/rules/claim-what-it-does-not-block.md` 早就寫著
+> 「**判準以字串為準，不以行號為準；行號會漂移**」——留著只會週期性地重演。
+>
+> 現在一律寫成「`<檔名>` 的 `<那一行的字串或函式名>`」。字串可以用 grep 逐字回讀驗證，
+> 行號不行。`tools/check_doc_claims.py` 的第 6 個方向會擋住行號被重新加回來。
+
 ## 這份清單怎麼寫的（維護時請照做）
 
 本專案有一類缺陷已經出現**四次**：**回歸清單的驗收標準與程式碼矛盾，
@@ -113,12 +123,12 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 - `slaves[i].version` 是 `"0.0.0"` —— 代表那台**還沒被輪詢到過**（`fw*` 初始值 0），
   等一輪（約 15 秒）後應變成 `"1.0.0"`。
 
-> 對照：`ho_master1.ino:2948` 的 `publishStatus()`；`:2919` 的 `buildStatusDoc()`
-> （`doc["server"]`、`dev["free_heap"]`）；`:3664` 的 `if (now - lastStatusPub > 10000)`；
-> `:2694` `Serial.printf("[MQTT] 已連線 %s\n", cfg.server)`；
-> `:2631`／`:2633` 的 `[MQTT] 已訂閱 %s`／`⚠ [MQTT] 訂閱失敗 %s（master 自己的 control topic，此時 App 的指令收不到）`；
-> `:2544` 的 `[代理] 已訂閱 %s`；`:2866` 的 `[MQTT] %s 讓位給下一輪（本輪 publish 名額已用掉）`；
-> `:2873`／`:2881` 的兩行放棄發布；`:1783` 的 `formatSlaveVersion()`。
+> 對照：`ho_master1.ino` 的 `publishStatus()`；`ho_master1.ino` 的 `buildStatusDoc()`
+> （`doc["server"]`、`dev["free_heap"]`）；`ho_master1.ino` 的 `if (now - lastStatusPub > 10000)`；
+> `ho_master1.ino` `Serial.printf("[MQTT] 已連線 %s\n", cfg.server)`；
+> `ho_master1.ino`／`ho_master1.ino` 的 `[MQTT] 已訂閱 %s`／`⚠ [MQTT] 訂閱失敗 %s（master 自己的 control topic，此時 App 的指令收不到）`；
+> `ho_master1.ino` 的 `[代理] 已訂閱 %s`；`ho_master1.ino` 的 `[MQTT] %s 讓位給下一輪（本輪 publish 名額已用掉）`；
+> `ho_master1.ino`／`ho_master1.ino` 的兩行放棄發布；`ho_master1.ino` 的 `formatSlaveVersion()`。
 
 ---
 
@@ -222,13 +232,13 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 **收尾**：`fakeslaves` 期間不要下 `pair`／`unpair`（韌體會擋，但別去試）。
 **先不要重開機** —— 第 3 項要接著在同一個狀態下做（**重開機的時機在第 3 項結尾**）。
 
-> 對照：`ho_master1.ino:3208` 的
+> 對照：`ho_master1.ino` 的
 > `Serial.printf("[測試] 名冊已灌成 %d 台假 slave（未寫入 NVS，重開機即消失）\n", n)`；
-> `:3209` 的 `⚠ [測試] 重開機前請勿執行 pair／unpair：…`；
-> `:3218` 的 `Serial.printf("[測試] 狀態 JSON 實際 %u bytes／statusBuf %u／mqtt buffer %u（名冊 %d 台）\n", …)`；
+> `ho_master1.ino` 的 `⚠ [測試] 重開機前請勿執行 pair／unpair：…`；
+> `ho_master1.ino` 的 `Serial.printf("[測試] 狀態 JSON 實際 %u bytes／statusBuf %u／mqtt buffer %u（名冊 %d 台）\n", …)`；
 > 常數宣告區的 `STATUS_BUF_SIZE = 3584`／`MQTT_BUFFER_SIZE = 3840`／
 > `STATUS_BASE_MAX_BYTES`（＝ `WITHOUT_GROUP_OTA` 480 ＋ `GROUP` 120 ＋ `OTA` 128）；
-> `:1892` 的 `⚠ [MQTT] slaves 陣列被截斷：名冊 %d 台，只放得下 %d 台`。
+> `ho_master1.ino` 的 `⚠ [MQTT] slaves 陣列被截斷：名冊 %d 台，只放得下 %d 台`。
 
 ---
 
@@ -301,12 +311,12 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 > 再也不會碰那 20 條 topic，所以**沒有任何韌體路徑能自動清掉它們**。
 > 這就是為什麼要人工清。
 
-> 對照：`ho_master1.ino:3191-3206` 的 `fakeSlavesForCapacityTest()`
+> 對照：`ho_master1.ino` 的 `fakeSlavesForCapacityTest()`
 > （`mac[5] = (uint8_t)i`、`online = false`、`rssi = -100`、`relay = 1`、`fw* = 255`）；
 > `libraries/HoEspNow/src/HoEspNowProtocol.cpp:69-72` 的
 > `snprintf(out, 20, "hoban-%02x%02x%02x%02x%02x%02x", …)`；
-> `ho_master1.ino:1862` 的 `appendSlavesArray()`；`:3410` 的 `[MQTT] 收到指令: %s`；
-> `:2201` 的 `[ESP-NOW] esp_now_send 失敗: %d`。
+> `ho_master1.ino` 的 `appendSlavesArray()`；`ho_master1.ino` 的 `[MQTT] 收到指令: %s`；
+> `ho_master1.ino` 的 `[ESP-NOW] esp_now_send 失敗: %d`。
 
 ---
 
@@ -361,12 +371,12 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 >   `sendCmdToSlaveMac()` 用呼叫方自己那份 MAC 副本），
 >   **不是靠這一項擋的**。本項 PASS 不等於那道結構防線被驗證過。
 
-> 對照：`ho_master1.ino:3245` 的 `Serial.printf("[代理] %s 收到指令: %s\n", id, message.c_str())`；
-> `:3247-3250` 的 `ON` → `sendCmdToSlaveMac(mac, HO_CMD_PULSE, 2000)`；
-> `:1099` 的 `Serial.printf("[控制] 送指令 %u 給 %s\n", (uint8_t)cmd, id)`；
-> `:3271` 的 `[代理] %s 不支援的指令: %s`；`:3417` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
-> `ho_slave1.ino:113` 的 `[繼電器] 點動 %u ms`、`:129` 的 `[狀態] 已回報 relay=%u`、
-> `:661` 的 `[繼電器] 點動結束，已關閉`、`:483` 的 `[繼電器] 關閉`。
+> 對照：`ho_master1.ino` 的 `Serial.printf("[代理] %s 收到指令: %s\n", id, message.c_str())`；
+> `ho_master1.ino` 的 `ON` → `sendCmdToSlaveMac(mac, HO_CMD_PULSE, 2000)`；
+> `ho_master1.ino` 的 `Serial.printf("[控制] 送指令 %u 給 %s\n", (uint8_t)cmd, id)`；
+> `ho_master1.ino` 的 `[代理] %s 不支援的指令: %s`；`ho_master1.ino` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
+> `ho_slave1.ino` 的 `[繼電器] 點動 %u ms`、`ho_slave1.ino` 的 `[狀態] 已回報 relay=%u`、
+> `ho_slave1.ino` 的 `[繼電器] 點動結束，已關閉`、`ho_slave1.ino` 的 `[繼電器] 關閉`。
 
 ---
 
@@ -403,11 +413,11 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 - **本項的時序描述全部是靜態推演**（讀 `loop()` 的呼叫順序與兩個常數推出來的），
   **沒有實機量測過**。若實測差很多，先懷疑推演而不是韌體。
 
-> 對照：`ho_master1.ino:2168` 的 `if (changed) slaves[idx].dirty = true;`
-> （`changed` 的條件含 `slaves[idx].relay != st.relay`，見 `:2152-2156`）；
-> `:3101-3110` 的 `slaveStatusScheduler()` dirty 優先迴圈；
-> `:3000` 的 `const unsigned long SLAVE_STATUS_MIN_GAP_MS = 250;`；
-> `ho_slave1.ino:492` 的 `sendState();`（`HO_PKT_CMD` 分支結尾）。
+> 對照：`ho_master1.ino` 的 `if (changed) slaves[idx].dirty = true;`
+> （`changed` 的條件含 `slaves[idx].relay != st.relay`，見 `ho_master1.ino`）；
+> `ho_master1.ino` 的 `slaveStatusScheduler()` dirty 優先迴圈；
+> `ho_master1.ino` 的 `const unsigned long SLAVE_STATUS_MIN_GAP_MS = 250;`；
+> `ho_slave1.ino` 的 `sendState();`（`HO_PKT_CMD` 分支結尾）。
 
 ---
 
@@ -435,12 +445,12 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
   所以實際看到的時間落在 30~45 秒之間，**不是精準的 30 秒**。
 - `wifi.rssi` 會停在最後一次收到的值，不會歸零 —— 正常。
 
-> 對照：`ho_master1.ino:1679` 的
+> 對照：`ho_master1.ino` 的
 > `Serial.printf("[%s] %s（超過 %lu 秒沒回應即判離線）\n", isOnline ? "上線" : "離線", id, SLAVE_OFFLINE_TIMEOUT / 1000)`；
-> `:1682` 的 `slaves[i].dirty = true;`；`:3695` 的 `if (now - lastOnlineCheck >= 15000)`；
-> `:316` 的 `SLAVE_OFFLINE_TIMEOUT = 30000`；
-> `:3021` 的 `doc["status"] = slaves[idx].online ? "online" : "offline"`、
-> `:3028` 的 `wifi["connected"] = slaves[idx].online`。
+> `ho_master1.ino` 的 `slaves[i].dirty = true;`；`ho_master1.ino` 的 `if (now - lastOnlineCheck >= 15000)`；
+> `ho_master1.ino` 的 `SLAVE_OFFLINE_TIMEOUT = 30000`；
+> `ho_master1.ino` 的 `doc["status"] = slaves[idx].online ? "online" : "offline"`、
+> `ho_master1.ino` 的 `wifi["connected"] = slaves[idx].online`。
 
 ---
 
@@ -474,7 +484,7 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 
 > 對照：`ho_master1.ino` 的
 > `Serial.printf("[狀態] %s relay=%u 版本=%u.%u.%u 運行=%lus rssi=%d\n", …)`；
-> `:1679` 同第 6 項；`:1644` 起的 `pollNextSlave()`。
+> `ho_master1.ino` 同第 6 項；`ho_master1.ino` 起的 `pollNextSlave()`。
 
 ---
 
@@ -504,9 +514,9 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
   會印 `[MQTT] hoban/<slaveId>/status 讓位給下一輪（本輪 publish 名額已用掉）`
   —— 也是設計行為。
 
-> 對照：`ho_master1.ino:3337-3342` 的 `SLAVES` 分支（`markAllSlavesDirty(); publishStatus();`）；
-> `:3125` 的 `void markAllSlavesDirty()`；`:3101-3110` 的 dirty 優先迴圈；
-> `:3000` 的 `SLAVE_STATUS_MIN_GAP_MS = 250`；`:2866` 的讓位訊息。
+> 對照：`ho_master1.ino` 的 `SLAVES` 分支（`markAllSlavesDirty(); publishStatus();`）；
+> `ho_master1.ino` 的 `void markAllSlavesDirty()`；`ho_master1.ino` 的 dirty 優先迴圈；
+> `ho_master1.ino` 的 `SLAVE_STATUS_MIN_GAP_MS = 250`；`ho_master1.ino` 的讓位訊息。
 
 ---
 
@@ -574,12 +584,12 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
   判定一律看 `busy: 0` 的那則。
 - **`ack: 2` 只代表 MAC 層送達，不代表門關了。** 這是本階段刻意保留的極限。
 
-> 對照：`ho_master1.ino:3323-3330` 的 `ALL:ON` 分支（`sendCmdToAll(HO_CMD_PULSE, 2000)`）；
-> `:1579` 的 `Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, groupJob.count)`；
-> `:1634` 的 `[群組] 已廣播 %d 次（廣播無 ACK，送出成功不代表任何一台收到），並對 %d 台各送一次單播，等 MAC 層 ACK`；
-> `:1410` 的 `[群組] 指令 %u 收工%s：單播 MAC 層已送達 %d／%d 台`；
-> `:1427`／`:1429` 的兩行「不能證明已執行」；`:1436` 的 `⚠ [群組] 這是關門路徑：…`；
-> `:1187`／`:1201` 的 `GROUP_BROADCAST_REPEAT = 3`／`GROUP_JOB_MAX_MS = 6000`；
+> 對照：`ho_master1.ino` 的 `ALL:ON` 分支（`sendCmdToAll(HO_CMD_PULSE, 2000)`）；
+> `ho_master1.ino` 的 `Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, groupJob.count)`；
+> `ho_master1.ino` 的 `[群組] 已廣播 %d 次（廣播無 ACK，送出成功不代表任何一台收到），並對 %d 台各送一次單播，等 MAC 層 ACK`；
+> `ho_master1.ino` 的 `[群組] 指令 %u 收工%s：單播 MAC 層已送達 %d／%d 台`；
+> `ho_master1.ino`／`ho_master1.ino` 的兩行「不能證明已執行」；`ho_master1.ino` 的 `⚠ [群組] 這是關門路徑：…`；
+> `ho_master1.ino`／`ho_master1.ino` 的 `GROUP_BROADCAST_REPEAT = 3`／`GROUP_JOB_MAX_MS = 6000`；
 > `appendGroupResult()`（`exec` 固定 `"attributed"`，另有 `exed`；**刻意沒有 `cid`**，理由見該函式上方）；
 > `groupExecutedIdx()`／`groupExecutedFor()`（執行證明與它的三項「擋不住什麼」）。
 
@@ -618,13 +628,13 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
   它只有序列埠 `alloff` 與人工 MQTT 測試會走到。
   **不要因為按鈕寫「關門」就以為 App 送的是這條** —— App 送的是 `ALL:ON`。
 
-> 對照：`ho_master1.ino:3331-3336` 的 `ALL:OFF` 分支（`sendCmdToAll(HO_CMD_OFF, 0)`）；
+> 對照：`ho_master1.ino` 的 `ALL:OFF` 分支（`sendCmdToAll(HO_CMD_OFF, 0)`）；
 > `libraries/HoEspNow/src/HoEspNowProtocol.h:27` 的 `HO_CMD_OFF = 0`；
-> `ho_slave1.ino:483` 的 `[繼電器] 關閉`；
+> `ho_slave1.ino` 的 `[繼電器] 關閉`；
 > `A:\project\hoctrl` 的 `lib/pages/device_detail_page.dart:2877-2881`
 > （`_sendGroupCloseCommand()` 內的 `_sendCommand('ALL:ON');`，
-> 由 `:2851` 的 `_handleGroupCloseDoor()` 呼叫）
-> 與 `:2848-2850` 的具名註釋「不要因為按鈕寫「關門」就改成 ALL:OFF」。
+> 由 `ho_slave1.ino` 的 `_handleGroupCloseDoor()` 呼叫）
+> 與 `ho_slave1.ino` 的具名註釋「不要因為按鈕寫「關門」就改成 ALL:OFF」。
 
 ---
 
@@ -666,13 +676,13 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
   所以 `[MQTT] 已訂閱 …` ＋ `[代理] 已訂閱 …` 會把
   **master 自己與所有**已配對的 slave 重印一遍，不只新那台。正常。
 
-> 對照：`ho_master1.ino:3343-3354` 的 `PAIR:START`／`PAIR:STOP` 分支；
-> `:1063` 的 `[配對] 進入配對模式，60 秒內請短按 slave 的按鈕`；
-> `:2088` 的 `Serial.printf("[配對] 接受 %s，目前共 %d 台\n", senderId, slaveCount)`；
-> `:3543` 的 `[配對] 逾時`；`:2631` 的 `[MQTT] 已訂閱 %s`（游標 0 格＝master 自己）；
-> `:2544` 的 `[代理] 已訂閱 %s`；`:2608-2648` 的 `controlSubscribeScheduler()`
+> 對照：`ho_master1.ino` 的 `PAIR:START`／`PAIR:STOP` 分支；
+> `ho_master1.ino` 的 `[配對] 進入配對模式，60 秒內請短按 slave 的按鈕`；
+> `ho_master1.ino` 的 `Serial.printf("[配對] 接受 %s，目前共 %d 台\n", senderId, slaveCount)`；
+> `ho_master1.ino` 的 `[配對] 逾時`；`ho_master1.ino` 的 `[MQTT] 已訂閱 %s`（游標 0 格＝master 自己）；
+> `ho_master1.ino` 的 `[代理] 已訂閱 %s`；`ho_master1.ino` 的 `controlSubscribeScheduler()`
 > （`if (subscribeCursor == 0)` 那個分支就是 master 自己那條）；
-> `:3654-3657` 的 `if (pendingSubscribeRefresh && …) subscribeAllControlTopics();`。
+> `ho_master1.ino` 的 `if (pendingSubscribeRefresh && …) subscribeAllControlTopics();`。
 
 ---
 
@@ -708,9 +718,9 @@ slave1 點動 2 秒）。
 > - **擋不住索引錯位**（理由同第 4 項）：這裡驗的是「訂得到」，不是「送對台」。
 > - **上面的毫秒級數字全是靜態推演，沒有實機量測，沒有上界保證。**
 
-> 對照：`ho_master1.ino:2608-2648` 的 `controlSubscribeScheduler()`；
-> `:2590-2592` 的 `subscribeAllControlTopics()`（**只把游標歸零，不當場送 subscribe**）；
-> `:3417` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`。
+> 對照：`ho_master1.ino` 的 `controlSubscribeScheduler()`；
+> `ho_master1.ino` 的 `subscribeAllControlTopics()`（**只把游標歸零，不當場送 subscribe**）；
+> `ho_master1.ino` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`。
 
 ---
 
@@ -751,12 +761,12 @@ slave1 點動 2 秒）。
   `findSlave()` 擋掉，且下次重連是 `cleanSession=true`，殘留自然消失。
 - 因此第二步印的是「目標不在名冊上」而**不是**完全沒收到 —— 兩者都是 PASS。
 
-> 對照：`ho_master1.ino:3355-3369` 的 `UNPAIR:` 分支（含兩行錯誤訊息）；
-> `:1737` 的 `Serial.printf("[配對] 已移除 %s，剩 %d 台\n", id, slaveCount)`；
-> `:2574` 的 `[代理] 本輪 socket 名額已用掉，略過取消訂閱 %s`；
-> `:3417` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
-> `ho_slave1.ino:502` 的 `[配對] master 要求解除配對`、`:150` 的 `EEPROM 無配對記錄`、
-> `:257` 的 `[掃描] 開始輪掃 channel 1~13 尋找 master`。
+> 對照：`ho_master1.ino` 的 `UNPAIR:` 分支（含兩行錯誤訊息）；
+> `ho_master1.ino` 的 `Serial.printf("[配對] 已移除 %s，剩 %d 台\n", id, slaveCount)`；
+> `ho_master1.ino` 的 `[代理] 本輪 socket 名額已用掉，略過取消訂閱 %s`；
+> `ho_master1.ino` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
+> `ho_slave1.ino` 的 `[配對] master 要求解除配對`、`ho_slave1.ino` 的 `EEPROM 無配對記錄`、
+> `ho_slave1.ino` 的 `[掃描] 開始輪掃 channel 1~13 尋找 master`。
 
 ---
 
@@ -807,12 +817,12 @@ slave1 點動 2 秒）。
 > - 上面的秒數全是靜態推演（每台 100ms 固定等待 ＋ 10 秒級黑箱的上界推算），
 >   **沒有實機量測**。
 
-> 對照：`ho_master1.ino:3370-3380` 的 `UNPAIRALL` 分支（`unpairAllPending = true;`，
-> **只插旗不跑迴圈**）；`:1750-1761` 的 `processUnpairAll()`
+> 對照：`ho_master1.ino` 的 `UNPAIRALL` 分支（`unpairAllPending = true;`，
+> **只插旗不跑迴圈**）；`ho_master1.ino` 的 `processUnpairAll()`
 > （`unpairSlave(slaveCount - 1)` ＋ `[配對] 名冊已清空`）；
-> `:1737` 的 `[配對] 已移除 %s，剩 %d 台`；
-> `:2242` 的 `Serial.printf("[心跳] channel=%u 配對模式=%s slave=%u\n", …)`；
-> `ho_slave1.ino:667` 的 `[失聯] 超過 30 秒沒收到心跳`。
+> `ho_master1.ino` 的 `[配對] 已移除 %s，剩 %d 台`；
+> `ho_master1.ino` 的 `Serial.printf("[心跳] channel=%u 配對模式=%s slave=%u\n", …)`；
+> `ho_slave1.ino` 的 `[失聯] 超過 30 秒沒收到心跳`。
 
 ---
 
@@ -851,10 +861,10 @@ slave1 點動 2 秒）。
 - `LR:` 開頭的**任何**字串（`LR:OFF`、`LR:whatever`）都走同一條，都印同一行。
 - `status` 的 `device.long_range` **恆為 `false`**，下完 `LR:ON` 也一樣。
 
-> 對照：`ho_master1.ino:3381-3383` 的
+> 對照：`ho_master1.ino` 的
 > `} else if (message.startsWith("LR:")) { Serial.println("[LR] 指令尚未實作（Task 6）"); }`；
-> `:3385` 的 `Serial.printf("[MQTT] 未知指令: %s\n", message.c_str())`；
-> `:60` 的 `bool longRangeEnabled = false;`（全檔無寫入 `true` 的點）。
+> `ho_master1.ino` 的 `Serial.printf("[MQTT] 未知指令: %s\n", message.c_str())`；
+> `ho_master1.ino` 的 `bool longRangeEnabled = false;`（全檔無寫入 `true` 的點）。
 
 ---
 
@@ -891,13 +901,13 @@ ESP-NOW 就緒，channel=<n>
 - **LR 設定不在復原範圍內** —— 它根本不存在，NVS 的 `homaster` 命名空間只有
   `count`／`macs`／`espch` 三個鍵。
 
-> 對照：`ho_master1.ino:985-990` 的 `[名冊] 載入 %d 台 slave（上次心跳 channel=%u）`
-> 與 `  %d. %s`（`i + 1`）；`:1024` 的 `[名冊] 已重新註冊 %d／%d 台為 ESP-NOW peer`；
-> `:1763` 的 `printSlaveList()`（`  %d. %s  %s  rssi=%d`，`i` 由 0 起算）；
-> `:930-947` 的 `prefs.begin("homaster", …)`（只有 `count`／`macs`／`espch`）；
-> `:430` 的 `[設定] SSID=%s 自訂伺服器=%s 繼電器=%s 上次AP channel=%u`；
-> `:3455` 的 `Serial.printf("ESP-NOW 就緒，channel=%u\n", currentChannel)`；
-> `:2694` 的 `[MQTT] 已連線 %s`；`:2631` 的 `[MQTT] 已訂閱 %s`；`:2544` 的 `[代理] 已訂閱 %s`。
+> 對照：`ho_master1.ino` 的 `[名冊] 載入 %d 台 slave（上次心跳 channel=%u）`
+> 與 `  %d. %s`（`i + 1`）；`ho_master1.ino` 的 `[名冊] 已重新註冊 %d／%d 台為 ESP-NOW peer`；
+> `ho_master1.ino` 的 `printSlaveList()`（`  %d. %s  %s  rssi=%d`，`i` 由 0 起算）；
+> `ho_master1.ino` 的 `prefs.begin("homaster", …)`（只有 `count`／`macs`／`espch`）；
+> `ho_master1.ino` 的 `[設定] SSID=%s 自訂伺服器=%s 繼電器=%s 上次AP channel=%u`；
+> `ho_master1.ino` 的 `Serial.printf("ESP-NOW 就緒，channel=%u\n", currentChannel)`；
+> `ho_master1.ino` 的 `[MQTT] 已連線 %s`；`ho_master1.ino` 的 `[MQTT] 已訂閱 %s`；`ho_master1.ino` 的 `[代理] 已訂閱 %s`。
 
 ---
 
@@ -940,14 +950,14 @@ ESP-NOW 就緒，channel=<n>
   `⚠ [channel] 名冊有 <n> 台 slave，但 NVS 沒有 channel 記錄，…` 並停在 channel 1。
   **那是已知且已標示的行為，不算本項失敗，但也不算通過** —— 先配網成功一次再回來測。
 
-> 對照：`ho_master1.ino:3297-3306` 的 `reset` 分支（`clearNetConfig(); espNowDelay(1000); ESP.restart();`）；
-> `:464-470` 的 `clearNetConfig()`（`netPrefs.begin("hoban", false); netPrefs.clear();` ＋
-> `[設定] NVS 網路設定已清除`）；`:930`／`:946` 的 `prefs.begin("homaster", false)`；
-> `:430` 的 `[設定] SSID=%s 自訂伺服器=%s 繼電器=%s 上次AP channel=%u`；
-> `:985` 的 `[名冊] 載入 %d 台 slave（上次心跳 channel=%u）`；
-> `:2341`／`:2349` 的兩行 `[channel] …`；
-> `:622` 的 `Serial.printf("[BLE] 已啟動，名稱: %s\n", deviceId)`；
-> `:3502` 的 `Serial.println("[BLE] 等待 App 配網")`。
+> 對照：`ho_master1.ino` 的 `reset` 分支（`clearNetConfig(); espNowDelay(1000); ESP.restart();`）；
+> `ho_master1.ino` 的 `clearNetConfig()`（`netPrefs.begin("hoban", false); netPrefs.clear();` ＋
+> `[設定] NVS 網路設定已清除`）；`ho_master1.ino`／`ho_master1.ino` 的 `prefs.begin("homaster", false)`；
+> `ho_master1.ino` 的 `[設定] SSID=%s 自訂伺服器=%s 繼電器=%s 上次AP channel=%u`；
+> `ho_master1.ino` 的 `[名冊] 載入 %d 台 slave（上次心跳 channel=%u）`；
+> `ho_master1.ino`／`ho_master1.ino` 的兩行 `[channel] …`；
+> `ho_master1.ino` 的 `Serial.printf("[BLE] 已啟動，名稱: %s\n", deviceId)`；
+> `ho_master1.ino` 的 `Serial.println("[BLE] 等待 App 配網")`。
 
 ---
 
@@ -972,9 +982,9 @@ Phase 2b 只動到其中兩處，實測時要注意：
 **【失敗判定】**
 - 換 broker 後 slave 的 `hoban/<slaveId>/status` 在新 broker 上一直不出現。
 
-> 對照：`ho_master1.ino:2696-2702`／`:2753-2755` 的 `quickConnectToIndex()`／`quickConnectCustom()`
+> 對照：`ho_master1.ino`／`ho_master1.ino` 的 `quickConnectToIndex()`／`quickConnectCustom()`
 > 結尾（`subscribeAllControlTopics(); publishStatus(); markAllSlavesDirty();`）；
-> `:2631` 的 `[MQTT] 已訂閱 %s`；`:2633` 的 `⚠ [MQTT] 訂閱失敗 %s（…）`。
+> `ho_master1.ino` 的 `[MQTT] 已訂閱 %s`；`ho_master1.ino` 的 `⚠ [MQTT] 訂閱失敗 %s（…）`。
 
 ---
 
@@ -1029,10 +1039,10 @@ WiFi 關聯與 IP 都還在，`WiFi.isConnected()` 仍是 true，
 >   它頂多證明「這一次沒有踩到」。第 0 號風險目前**沒有任何測試能證明它不發生**，
 >   只能靠讀 `NetworkClient::write()` 的原始碼確認機制存在。
 
-> 對照：`ho_master1.ino:3580` 的 `[WiFi] 重連嘗試 #%d`；
-> `:2684`／`:2688` 的 `[MQTT] 嘗試 %s …`／`[MQTT] %s 失敗，state=%d`；
-> `:2242` 的 `[心跳] channel=%u …`；
-> `ho_slave1.ino:667` 的 `[失聯] 超過 30 秒沒收到心跳`、`:250` 的
+> 對照：`ho_master1.ino` 的 `[WiFi] 重連嘗試 #%d`；
+> `ho_master1.ino`／`ho_master1.ino` 的 `[MQTT] 嘗試 %s …`／`[MQTT] %s 失敗，state=%d`；
+> `ho_master1.ino` 的 `[心跳] channel=%u …`；
+> `ho_slave1.ino` 的 `[失聯] 超過 30 秒沒收到心跳`、`ho_slave1.ino` 的
 > `[安全] 失去 master，繼電器已關閉`。
 
 ---
@@ -1060,9 +1070,9 @@ WiFi 關聯與 IP 都還在，`WiFi.isConnected()` 仍是 true，
 - topic 格式本身解析不了時（例如 `hoban/abc/control`）印的是
   `[MQTT] 無法解析的 topic，忽略: <topic>`，是另一行、另一條路徑。
 
-> 對照：`ho_master1.ino:3385` 的 `[MQTT] 未知指令: %s`；
-> `:3417` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
-> `:3403` 的 `[MQTT] 無法解析的 topic，忽略: %s`。
+> 對照：`ho_master1.ino` 的 `[MQTT] 未知指令: %s`；
+> `ho_master1.ino` 的 `[MQTT] 指令的目標不在名冊上，忽略: %s`；
+> `ho_master1.ino` 的 `[MQTT] 無法解析的 topic，忽略: %s`。
 
 ---
 

@@ -479,7 +479,7 @@ slave 的**靜止預設值**（開機、點動結束、`loadSlaves()`、`addSlav
 | 事實 | 可否證明 | 依據 |
 |---|---|---|
 | **已送達** | ✅ 可證明 | 單播有 MAC 層 ACK。`esp_now_send()` 的送出回呼 `onEspNowSent()` 逐幀回報成功／失敗，`wifi_tx_info_t::des_addr` 帶目的 MAC，可逐台歸因 |
-| **韌體層已執行** | ✅ 可證明（版本 2 起） | slave 回報的 `lastCmdId` 等於本次指令的 `cmdId`、種類相符、且回報晚於指令送出（`groupExecutedIdx()`）。證據由 slave 產生，master 造不出來 |
+| **韌體層已執行** | ✅ 可證明（版本 2 起）**但擋不住偽造** | slave 回報的 `lastCmdId` 等於本次指令的 `cmdId`、種類相符、且回報晚於指令送出（`groupExecutedIdx()`）。證據由 slave 產生，master 造不出來 —— **但射頻範圍內的第三方造得出來**（CRC-8 ＋ 原始碼裡的共享密鑰、來源 MAC 可任意填）。而且靜止狀態是繼電器 OFF ＝ 門開，所以**干擾本身就能造成失敗、偽造只需負責掩蓋**；偽造 CMD 是暫態、**偽造 STATE 卻是持續的**，還會抑制「去現場確認」這個唯一的真防線。見 `docs/phase4-flag-day-upgrade.md` 第 3.2.1 節 |
 | **繼電器硬體動作** | ❌ 不可證明 | `setRelayPins()` 只寫 GPIO。MOS 燒毀、線路脫落、觸點黏死都照樣回報「已執行」 |
 | **籠門關上了** | ❌ 不可證明 | 同上，再加上機構本身。**現場確認是唯一方法** |
 | 廣播是否被收到 | ❌ 不可證明 | 廣播沒有 ACK，`esp_now_send()` 永遠回報成功 |
