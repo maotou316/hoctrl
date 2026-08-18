@@ -154,8 +154,10 @@ MUT = {
     'wide_begin_accept_any': False,
     'drop_chunk_upper_guard': False,
     'drop_len_exact_guard': False,
+    'drop_block_lower_bound': False,
     'wide_data_any_session': False,
     'wide_query_status_ok': False,
+    'wide_end_any_session': False,
     'wide_end_skip_length': False,
     'wide_end_skip_md5': False,
     'wide_loop_no_timeout': False,
@@ -170,8 +172,10 @@ MUT_META = {
     'wide_begin_accept_any':  ('on_begin', 'widen'),
     'drop_chunk_upper_guard': ('on_data', 'remove'),
     'drop_len_exact_guard':   ('on_data', 'remove'),
+    'drop_block_lower_bound': ('on_data', 'remove'),
     'wide_data_any_session':  ('on_data', 'widen'),
     'wide_query_status_ok':   ('on_query', 'widen'),
+    'wide_end_any_session':   ('on_end', 'widen'),
     'wide_end_skip_length':   ('on_end', 'widen'),
     'wide_end_skip_md5':      ('on_end', 'widen'),
     'wide_loop_no_timeout':   ('loop', 'widen'),
@@ -295,7 +299,11 @@ class Slave(object):
             if data_len != expect:
                 return
 
-        if chunk_index < self.otaBlockBase or chunk_index >= self.otaBlockBase + HO_OTA_WINDOW:
+        # 下界與上界要分開突變：複審的 MY_wide_data_no_lower_bound 拿掉下界之後
+        # slot 會變成負數，模擬丟出的是例外而不是斷言失敗 —— 這正是 run() 必須
+        # 捕捉 Exception 的理由（只捕捉 AssertionError 會讓整支腳本靜默停工）。
+        low_ok = chunk_index >= self.otaBlockBase or MUT['drop_block_lower_bound']
+        if not low_ok or chunk_index >= self.otaBlockBase + HO_OTA_WINDOW:
             return
 
         slot = chunk_index - self.otaBlockBase
@@ -337,7 +345,7 @@ class Slave(object):
     # ── HO_PKT_OTA_END ──
     def on_end(self, now, session, abort, total_size):
         self.on_master_packet(now)
-        if session != self.otaSession:
+        if not MUT['wide_end_any_session'] and session != self.otaSession:
             return
         self.otaLastPacketAt = now
         if abort:
@@ -591,6 +599,29 @@ def t_liveness_keeps_ota_alive():
     assert s.otaActive, 'OTA 工作階段被中止'
 
 
+def t_end_from_wrong_session_is_ignored():
+    """`OTA_END` 是全檔**唯一**能產生 `HO_OTA_OK`、也**唯一**能切換開機分區的分支。
+
+    別的 sessionId 送來的 END 必須被靜默丟棄（M5 的敘述就寫在那裡，
+    但在複審之前**沒有任何情境在守它** —— `MY_wide_end_any_session` 因此存活）。
+    兩種殘留 END 都要驗：宣告成功的、以及 abort=1 的。
+    """
+    s = Slave()
+    begin(s)
+    t = deliver_all(s)
+    n_before = len(s.acks)
+    s.on_end(t + 10, 9, 0, FW_SIZE)          # session 9，不是 7：宣告「收工吧」
+    assert not s.bootSwitched, '外來 session 的 END 竟然切換了開機分區'
+    assert len(s.acks) == n_before, '對外來 session 的 END 回了 %d 封 ACK（應靜默丟棄）'         % (len(s.acks) - n_before)
+    assert s.otaActive, '外來 session 的 END 把進行中的工作階段關掉了'
+
+    s.on_end(t + 20, 9, 1, FW_SIZE)          # 同一台的殘留 abort
+    assert s.otaActive and not s.aborts, '外來 session 的 abort 打斷了進行中的工作階段'
+
+    s.on_end(t + 30, 7, 0, FW_SIZE)          # 真正的 END 仍然要能收工
+    assert s.bootSwitched, '擋掉外來 END 之後，真正的 END 也收不了工'
+
+
 def t_idle_timeout_releases_update():
     s = Slave()
     s.lastHeartbeatTime = 10 ** 9      # 排除失聯路徑，只驗 OTA 逾時
@@ -613,6 +644,7 @@ TESTS = [
     ('長度不足絕不切換開機分區', t_short_firmware_never_switches_boot),
     ('END 宣告長度不一致必中止', t_end_declares_different_size),
     ('內容錯誤由 MD5 擋下', t_md5_mismatch_never_switches_boot),
+    ('外來 session 的 END 被靜默丟棄', t_end_from_wrong_session_is_ignored),
     ('單播維持存活，OTA 不被自己打斷', t_liveness_keeps_ota_alive),
     ('30 秒閒置逾時釋放 Update', t_idle_timeout_releases_update),
 ]
@@ -624,12 +656,23 @@ def read(path):
 
 
 def run():
+    """跑一輪情境。
+
+    **必須捕捉 Exception 而不是只捕捉 AssertionError。**
+    複審的 `MY_wide_data_no_lower_bound` 突變讓模擬丟出 IndexError，
+    原本只 `except AssertionError` 的寫法讓整支腳本帶著 traceback 中止 ——
+    **後面的突變與方向 C 的分支覆蓋檢查全部靜默不執行**。
+    一個會靜默停止工作的守衛比沒有守衛更危險：它看起來還在。
+    例外本身也算一條紅（突變讓程式爆掉，同樣證明那條防線有在做事）。
+    """
     failed = []
     for name, fn in TESTS:
         try:
             fn()
         except AssertionError as e:
             failed.append((name, str(e)))
+        except Exception as e:                      # noqa: BLE001 —— 見上方
+            failed.append((name, '%s：%s' % (type(e).__name__, e)))
     return failed
 
 

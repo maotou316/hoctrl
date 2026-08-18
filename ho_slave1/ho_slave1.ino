@@ -820,8 +820,12 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     // 有可能被靜默丟失，而 master 端的補送判準是 MAC 層 ACK，接不住這一種。**
     // 唯一會讓它現形的是 Phase 2b 的指令歸因（該台不會回報 lastCmdId →
     // master 印「⚠ [群組]   無執行證明：<id>」），那是回報、不是補救。
-    // 暴露面僅限「正在接收 OTA 的那一台」；Task 5 對 relay==1 的 slave 預設拒絕 OTA
-    //（除非帶 force:true），所以正在把籠門保持關閉的那台預設不會進入這個窗口。
+    // 暴露面僅限「正在接收 OTA 的那一台」，但**不要把它讀成暴露面很小**：
+    // Task 5 對 relay==1 的 slave 預設拒絕 OTA（除非帶 force:true），
+    // 所以 **OTA 目標依建構必然是 relay==0 的那一台 —— 也就是門還開著、
+    // 正是「全部關門」要去關的那一台**。那道拒絕擋的是另一件事
+    //（避免 OTA 重啟把正在通電的繼電器斷開），對「一次要全部關」
+    // **一點暴露面都沒有減少**。本階段沒有解，補救屬於 Task 4／5。
     uint32_t remain = otaTotalSize - otaWritten;
     size_t writeLen = (size_t)need * HO_OTA_CHUNK_SIZE;
     if (writeLen > remain) writeLen = remain;

@@ -155,6 +155,28 @@ BANNED_IN_DOCS = [
 ]
 
 
+# ── 方向 7（PLAN）：設計文件裡的假宣稱不得留著等下一個 Task 抄走 ──
+#
+# A 族第 14 次的形狀：`end(true)` 的假宣稱在原始碼註釋、report 與模擬三處都改掉了，
+# **卻完整留在 plan 的「五道保障」第 2 條與 Task 2 的程式碼範本裡**，
+# 而 plan Task 6 Step 2 明文要求 `ho_slave1/readme.md` 逐條抄錄那一節。
+# 修掉的話正排隊等著被重新發表 —— 所以把 plan 也納入掃描，但**只掃這一條規則**
+#（plan 有大量刻意保留的歷史敘述，整份套用既有規則會把歷史記錄一起判成錯）。
+#
+# 事實依據（esp32 core 3.3.7 `Updater.cpp`）：`end(true)` 的 evenIfRemaining 分支
+# 會 `_size = progress();`，**放棄長度檢查**，之後只比對 setMD5() 設定的 MD5。
+#
+# **它擋不住什麼**：只認「end(true) … 長度」與「已寫入長度 == 宣告長度」兩種寫法。
+# 換個措辭說同一件事（「它會先確認寫滿了才切換」）一樣抓不到；
+# 也擋不住別的函式庫行為被憑印象寫進文件。
+PLAN_FILES = ['docs/superpowers/plans/2026-08-17-esp32-phase4-ota-relay.md']
+BANNED_IN_PLAN = [
+    ('end(true) 會檢查長度的假宣稱（A 族第 13／14 次）',
+     r'end\(true\){0,1}.{0,80}(檢查|驗).{0,24}長度|已寫入長度\s*==\s*宣告長度',
+     r'(不驗|不檢查|不會檢查|放棄|跳過)'),
+]
+
+
 def main():
     src = '\n'.join(read(f) for f in SRC_FILES)
     flat = flatten_c_strings(src)
@@ -178,6 +200,17 @@ def main():
                 if own_exception and re.search(own_exception, line.strip()):
                     continue
                 failures.append('[BANNED] %s:%d %s → %s'
+                                % (doc, lineno, name, line.strip()[:90]))
+
+    for doc in PLAN_FILES:
+        text = read(doc)
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for name, pattern, own_exception in BANNED_IN_PLAN:
+                if not re.search(pattern, line):
+                    continue
+                if re.search(own_exception, line):
+                    continue
+                failures.append('[PLAN] %s:%d %s → %s'
                                 % (doc, lineno, name, line.strip()[:90]))
 
     # ── 正向數值交叉比對（review ②）──
@@ -297,8 +330,10 @@ def main():
                         failures.append('[算式] %s:%d %s → %s'
                                         % (path, lineno, m.group(0), '；'.join(problems)))
         print('容量算式結構化複算：%d 條' % n_expr)
-    print('HIT 檢查 %d 項、BANNED 樣式 %d 條 × 檔案 %d 份（含原始碼註釋）'
-          % (len(HIT_IN_SOURCE), len(BANNED_IN_DOCS), len(BANNED_SCAN_FILES)))
+    print('HIT 檢查 %d 項、BANNED 樣式 %d 條 × 檔案 %d 份（含原始碼註釋）；'
+          'PLAN 樣式 %d 條 × %d 份'
+          % (len(HIT_IN_SOURCE), len(BANNED_IN_DOCS), len(BANNED_SCAN_FILES),
+             len(BANNED_IN_PLAN), len(PLAN_FILES)))
 
     if failures:
         print('\n%d 項失敗：' % len(failures))

@@ -616,8 +616,12 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 >
 > **判準怎麼寫**：本項的失敗判定**完全不變** —— 沒有 OTA 在跑時這個窗口不存在。
 > 只有在「實測當下剛好有 OTA 轉送」時，目標那一台沒動作要記成**已知窗口**而不是本項 FAIL；
-> **其餘每一台照舊一台都不能少**。實務上 Phase 4 的 `update_slave` 對 `relay == 1` 的 slave
-> 預設拒絕（除非帶 `force: true`），所以正把籠門保持關閉的那台預設不會進入這個窗口。
+> **其餘每一台照舊一台都不能少**（對應 Phase 4 計畫的回歸清單 21a／21b）。
+>
+> **不要拿「`update_slave` 對 `relay == 1` 預設拒絕」當安慰**：那道拒絕的效果，
+> 是讓 **OTA 目標依建構必然是 `relay == 0` 的那一台 —— 門還開著、
+> 正是這道 `ALL:ON` 要去關的那一台**。它擋的是另一件事（避免 OTA 重啟把正在通電的
+> 繼電器斷開），對「一次要全部關」**一點暴露面都沒有減少**。
 
 > 對照：`ho_master1.ino` 的 `ALL:ON` 分支（`sendCmdToAll(HO_CMD_PULSE, 2000)`）；
 > `ho_master1.ino` 的 `Serial.printf("[控制] 廣播指令 %u 給 %d 台\n", (uint8_t)cmd, groupJob.count)`；

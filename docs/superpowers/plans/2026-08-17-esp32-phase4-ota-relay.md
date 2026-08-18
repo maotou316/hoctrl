@@ -199,7 +199,29 @@ void loop() {
 | 等 ACK | 純比對計時器 | 微秒級 |
 
 **所以其他 19 台在 OTA 期間的心跳節奏與平常完全一樣。**
-`sendCmdToAll()`（`ALL:OFF`）在 OTA 期間**照常可用且不被阻擋** —— 緊急關門的優先權高於 OTA。
+**master 端**的 `sendCmdToAll()`（序列埠 `alloff` 送 `ALL:OFF`；**App 的「全部關門」實際送的是
+`ALL:ON`**）在 OTA 期間**照常可用、且不被 master 自己的狀態機延後** —— 緊急關門的優先權高於 OTA。
+
+> **⚠ 這句話只對 master 端成立，對「目標 slave 收不收得到」不成立
+> （Task 2 查證後更正；原文寫的是無條件的「照常可用且不被阻擋」）。**
+>
+> 目標 slave 的 `Update.write()` 與 ESP-NOW 收包**跑在同一個 task 上**，每跨 64 KB 邊界
+> 會被一次 flash 區塊抹除擋住 **60~190 ms**（約 1 MB 的映像發生 15 次；依據
+> `Updater.cpp` 的 `partitionEraseRange(..., block_erase ? SPI_FLASH_BLOCK_SIZE : SPI_FLASH_SEC_SIZE)`
+> 與 `Update.h` 的 `#define SPI_SECTORS_PER_BLOCK 16` ⇒ 區塊是 64 KB，不是 4 KB 扇區）。
+> 那段期間 **MAC 層 ACK 由硬體回覆**，master 因此判定「已送達」，
+> 而 `processGroupCmd()` 的補送判準正是「**沒拿到 MAC 層 ACK** 才補送」——
+> **補送接不住這一種**。唯一會讓它現形的是 Phase 2b 的指令歸因
+>（該台不會回報對應 `cmdId`，收工時印 `⚠ [群組]   無執行證明：%s`），**那是回報不是補救**。
+>
+> **本決定下方那條「`relay == 1` 預設拒絕 OTA」不是對這件事的保護。**
+> OTA 目標**依建構必然是 `relay == 0` 的那一台** —— 也就是**門還開著、
+> 正是 `ALL:ON` 要去關的那一台**。對「一次要全部關」而言，那道保護
+> **一點暴露面都沒有減少**；它擋的是另一件事（避免 OTA 重啟把正在通電的繼電器斷開）。
+>
+> **本階段沒有解。** 真正的補救屬於 Task 4／5，例如：收到群組安全指令時暫停送
+> `OTA_DATA` 一小段時間讓目標的 WiFi task 清空佇列，或對目標改走
+> 「重複單播 ＋ 等 `lastCmdId` 相符」。**兩者都未實作，不要當成已經有了。**
 
 #### (c) master 下載 HTTPS 韌體時心跳怎麼辦？
 
@@ -357,17 +379,24 @@ const unsigned long OTA_SLAVE_IDLE_MS    = 30000;  // slave 端：這麼久沒�
 - 8 輪 × 16 包重送仍失敗 → 判定該區塊無望，**中止整個工作階段**。
 - 5 分鐘總上限是最後一道防線，涵蓋「每個區塊都恰好在重試 7 次才過」這類病態情況。
 
-#### 2.5 失敗中止時，slave 為什麼不會變磚 —— 五道保障
+#### 2.5 失敗中止時，slave 為什麼不會變磚 —— 六道保障
 
 **這是雙 OTA 分區存在的全部理由，Task 2 的實作必須逐條對得上。**
 
 1. **寫入目標永遠是閒置分區。** `Update.begin()` 內部用
    `esp_ota_get_next_update_partition(NULL)` 取得**目前沒在跑的**那一槽。
    正在執行的韌體所在的分區在整個過程中一個位元都不會被動到。
-2. **開機分區只在最後一刻、且校驗通過後才切換。** `esp_ota_set_boot_partition()`
-   只在 `Update.end(true)` 內部被呼叫，而它之前會依序檢查：
-   已寫入長度 == 宣告長度 → MD5（由 `Update.setMD5()` 設定）相符。
-   **任何一項不過就直接回 `false` 且不切換。**
+2. **開機分區只在最後一刻、且 MD5 相符後才切換。** `esp_ota_set_boot_partition()`
+   只在 `Update.end(true)` → `_verifyEnd()` 內部被呼叫。
+   **⚠ 更正（Task 2 實作時回去讀 esp32 core 3.3.7 的 `Updater.cpp` 才發現，
+   本節原本寫的「會依序檢查長度與 MD5」是憑語義模型寫的假宣稱）**：
+   `end(true)` 的 `evenIfRemaining` 分支會 `_size = progress();` ——
+   **它放棄長度檢查**，之後只比對 `Update.setMD5()` 設定的 MD5，不符才回 `false`。
+   也就是說**擋下「內容錯誤」與「長度截斷」的自始至終只有 MD5 這一道**。
+   長度那一層要由 slave 自己在進 `end()` 之前比對（見第 5 道），
+   **不能指望 `end(true)`**。
+   > Task 6 抄錄本節到 `ho_slave1/readme.md` 時，這一條**必須照現在這個版本抄**。
+   > `tools/check_doc_claims.py` 的 PLAN 規則會擋住舊寫法被寫回來。
 3. **所有中止路徑都走 `Update.abort()`**：收到 `OTA_END(abort=1)`、
    `OTA_SLAVE_IDLE_MS` 逾時、進入 channel 掃描（失去 master）、收到 `HO_PKT_UNPAIR`。
    `abort()` 只是丟棄狀態，不碰 `otadata`。
@@ -376,6 +405,17 @@ const unsigned long OTA_SLAVE_IDLE_MS    = 30000;  // slave 端：這麼久沒�
 5. **長度與內容的雙重把關。** master 在 `OTA_BEGIN` 與 `OTA_END` **各帶一次** `totalSize`；
    slave 在 `end()` 前先自己比對 `Update.progress() == totalSize`，
    不符就直接 `abort()` 而不進 `end()`。
+   **這一道不是第 2 道的第二層** —— 因為 `end(true)` 根本不驗長度（見第 2 道的更正）。
+   它唯一擋得住、而別處都擋不住的情境是：**master 在 `OTA_END` 宣告的 `totalSize`
+   與它在 `OTA_BEGIN` 宣告的不一致**（位元組流可能完全正確、MD5 會過、
+   `end(true)` 會回 true 並切換分區）。
+6. **半途中斷的映像開不起來（Task 2 補上，原本漏列）。** `Updater.cpp` 在第一次寫入時
+   把映像開頭 16 bytes（`ENCRYPTED_BLOCK_SIZE`）stash 起來**不寫進 flash**
+   （`memcpy(_skipBuffer, _buffer, skip);`），要到 `_verifyEnd()` → `_enablePartition()`
+   才補回去。所以任何「寫到一半就停」的映像，開頭都不是合法的 image magic，
+   即使 `otadata` 被指過去也不會被 bootloader 接受。
+   **這一道擋不住什麼**：它只保護「沒寫完」的情況。**寫完了、MD5 也對、但韌體本身
+   有 bug 開不起來**的情況它一點忙都幫不上 —— 那正是本節下方的殘留風險。
 
 **唯一無法用軟體覆蓋的殘留風險**（必須寫進 readme 已知限制）：
 新韌體**通過 MD5 校驗、成功切換分區、但本身有 bug 開不起來**（例如在 `setupEspNow()` 前就 crash）。
@@ -544,7 +584,11 @@ const size_t STATUS_BASE_MAX_BYTES =
   沒有動靜（視為殘留，先 `abort()` 再接受新的）。
   收到 `sessionId` **相同**的 `OTA_BEGIN` 則視為「master 沒收到我的 READY，重發了」，
   **回一次 READY 但不重置進度**。
-- **`ALL:OFF` / 單台 `OFF` 在 OTA 期間永遠可用且不被延後** —— 安全指令的優先權高於 OTA。
+- **`ALL:OFF` / `ALL:ON` / 單台指令在 OTA 期間永遠可用，且不被 master 端延後** ——
+  安全指令的優先權高於 OTA。
+  **但「不被延後」到 master 送出為止**：目標 slave 在 flash 區塊抹除的 60~190 ms 窗口內
+  可能靜默漏包，而補送以 MAC 層 ACK 為判準、**接不住這一種**（見決定 1(b) 的更正框）。
+  **不要把這一條讀成「安全指令一定送達目標 slave」。**
 
 ---
 
@@ -1112,8 +1156,12 @@ void otaSendAck(uint16_t blockBase, uint16_t mask, uint8_t status) {
       return;
     }
 
-    // end(true) 會依序檢查長度與 setMD5() 設定的 MD5，
-    // 兩者都過才呼叫 esp_ota_set_boot_partition()。不過就回 false 且不切換。
+    // end(true) 的實際行為（照 esp32 core 3.3.7 的 Updater.cpp 讀出來的，不是推的）：
+    //   1. `_size = progress();` —— **不驗長度**（evenIfRemaining 分支直接放棄這道檢查）
+    //   2. 比對 setMD5() 設定的 MD5，不符就 _abort(UPDATE_ERROR_MD5) 回 false
+    //   3. 才進 _verifyEnd() → _enablePartition()（補寫回開頭 16 bytes）
+    //      → _partitionIsBootable() → esp_ota_set_boot_partition()
+    // 所以擋住「內容錯」與「長度截斷」的是第 2 步的 MD5，全靠它一道。
     if (!Update.end(true)) {
       Serial.printf("[OTA] 校驗失敗，錯誤碼 %u —— 開機分區未變動，重啟後仍是舊韌體\n",
                     Update.getError());
@@ -1176,7 +1224,7 @@ commit 訊息要包含：
 - 「收到任何 master 封包都刷新 `lastHeartbeatTime`」為什麼是收緊而非放寬安全性，
   以及沒有它 OTA 會自我打斷（channel 掃描）
 - 區塊緩衝的設計（亂序與選擇性重傳對 Update 透明）
-- 失敗不變磚的五道保障，特別是「`Update.abort()` 不碰 otadata」
+- 失敗不變磚的六道保障，特別是「`Update.abort()` 不碰 otadata」，以及「`end(true)` 不驗長度、擋下截斷的是 MD5」
 
 ---
 
@@ -2090,7 +2138,24 @@ uint8_t otaProgressPercent() {
     case OTA_END_SENT: {
       if (otaAckPending) {
         otaAckPending = false;
-        if (otaAckStatus == HO_OTA_OK) {
+        // ⚠ Task 2 已改掉 slave 端 ACK 的 status 分工（見 ho_slave1.ino 的 otaSendAck() 上方）：
+        //   HO_OTA_READY ＝「工作階段進行中，這封帶的是我的進度」
+        //                   （BEGIN 接受／重複 BEGIN／區塊收齊／查詢回覆，四處都用它）
+        //   HO_OTA_OK    ＝「整份校驗通過」，slave 全檔**唯一一處**產生，
+        //                   且固定帶 (blockBase = totalChunks, mask = 0xFFFF) 當正向識別
+        //
+        // 這裡一定要做兩件事，否則各製造一個假燈號：
+        //   1. **收到 READY 要忽略並繼續等，絕對不能判成失敗。**
+        //      一封晚到的查詢回覆落進這個階段時，slave 其實已經校驗通過、正在重開機 ——
+        //      照舊版的 else 分支會印「slave 校驗失敗」＝**假紅燈**。
+        //   2. 判定成功時**連 blockBase 與 mask 一起檢查**，不要只看 status。
+        //      產生端已經保證唯一性，這裡再加一道是零成本的第二層。
+        //      （原始設計是 (0,0,OK)，與查詢回覆逐位元組相同 ＝ **假綠燈**，已在產生端消滅。）
+        if (otaAckStatus == HO_OTA_READY) {
+          return;   // 進度回報，不是結果 —— 繼續等下面的 10 秒逾時
+        }
+        if (otaAckStatus == HO_OTA_OK &&
+            otaAckBase == otaTotalChunks && otaAckBits == 0xFFFF) {
           Serial.println("[OTA] slave 校驗通過，正在重新啟動，等它回線確認版本");
           otaPhase = OTA_VERIFYING;
           otaPhaseStart = now;
@@ -2421,7 +2486,7 @@ commit 訊息必須說明：
 
 必須涵蓋：
 - OTA 接收流程與區塊緩衝的設計
-- **失敗不變磚的五道保障**（決定 2.5 逐條）
+- **失敗不變磚的六道保障**（決定 2.5 逐條，**含第 2 道的更正與新增的第 6 道**）
 - **唯一無法用軟體覆蓋的殘留風險**：新韌體通過校驗但本身開不起來 →
   只能拆下來接 USB 重燒；補救方向是 bootloader rollback（本階段未實作，需改 sdkconfig）
 - 「收到任何 master 封包都刷新 `lastHeartbeatTime`」的理由
@@ -2480,7 +2545,8 @@ commit 訊息必須說明：
 | 18 | 同上但帶 `"force":true`：正常開始 | |
 | 19 | **容量驗證**：`fakeslaves 20` → `fakeota` → `jsonsize`，記錄實際 bytes（**加回 phase 字串的 8 bytes**），必須 < 3072 且**沒有** `slaves_truncated` | |
 | 20 | 同上狀態實際發布一次 `status`，MQTT Explorer 收到的 JSON **語法完整、20 筆條目齊全、`ota` 物件完整** | 「靜默截斷」的正面驗證 |
-| 21 | 轉送期間 `ALL:OFF` 立刻生效 | 安全指令優先權，**失敗判定** |
+| 21a | 轉送期間送 `ALL:ON`（**App 的關門路徑**）與 `ALL:OFF`：**目標以外的每一台**都立刻動作 | 安全指令優先權，**失敗判定** |
+| 21b | 同一次操作，**目標那一台**有沒有出現在 `⚠ [群組]   無執行證明：…`：記錄有沒有、幾次 | **觀察項，不是失敗判定** —— 目標在 60~190 ms 的 flash 抹除窗口內可能靜默漏包，而補送以 MAC 層 ACK 為判準、接不住（決定 1(b) 的更正框）。**判成 FAIL 會讓實測者去修一個本階段沒有解的東西** |
 | 22 | 抹除暫存分區實際耗時幾秒 | **觀察項** |
 | 23 | 一份 1 MB 韌體的實際轉送時間、重傳次數 | **觀察項**，用來校正 30~90 秒的估計 |
 | 24 | 302 重定向的網址是否正確跟隨 | **觀察項**（`setFollowRedirects` 行為未在本專案驗證） |
