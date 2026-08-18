@@ -6,6 +6,7 @@
 #include <EEPROM.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <Update.h>
 #include <HoEspNowProtocol.h>
 
 const char* firmwareVersion = "1.0.0";
@@ -122,6 +123,27 @@ void pulseRelay(uint16_t ms) {
   Serial.printf("[繼電器] 點動 %u ms\n", ms);
 }
 
+// ── OTA 接收狀態（Phase 4）──
+// 區塊緩衝：先把一個區塊的 16 包收齊在 RAM，再一次順序寫進 Update。
+// 這讓「亂序抵達」與「選擇性重傳」對 flash 寫入完全透明 ——
+// Update 只看得到嚴格遞增的位元組流，不需要任何 seek 能力。
+// 3840 bytes 放在檔案層級（.bss）而非函式區域變數：loopTask 堆疊只有 8192 bytes，
+// 而 ESP-NOW recv callback 又跑在另一個 task 上，區域變數在這裡是明確的溢位風險。
+static uint8_t otaBlockBuf[HO_OTA_WINDOW * HO_OTA_CHUNK_SIZE];
+
+uint8_t  otaSession     = HO_OTA_SESSION_NONE;  // 0 = 目前沒有工作階段
+bool     otaActive      = false;  // Update.begin() 已成功、尚未 end/abort
+uint32_t otaTotalSize   = 0;
+uint16_t otaTotalChunks = 0;
+uint16_t otaBlockBase   = 0;      // 目前區塊第一包的 chunkIndex
+uint16_t otaBlockMask   = 0;      // bit i = 已收到 otaBlockBase + i
+uint32_t otaWritten     = 0;      // 已寫進 Update 的位元組數
+unsigned long otaLastPacketAt = 0;
+
+// 這麼久沒收到任何 OTA 封包就自行中止並釋放 Update。
+// 與失聯門檻同樣是 30 秒，語義一致：master 不見了就回到已知安全狀態。
+const unsigned long OTA_SLAVE_IDLE_MS = 30000;
+
 void sendState() {
   if (!masterKnown) return;
 
@@ -139,6 +161,40 @@ void sendState() {
   size_t total = hoPackPacket(buf, sizeof(buf), HO_PKT_STATE, txSeq++, &st, sizeof(st));
   esp_now_send(masterMac, buf, total);
   Serial.printf("[狀態] 已回報 relay=%u\n", st.relay);
+}
+
+// 中止目前的 OTA 工作階段。
+// Update.abort() 只是丟棄內部狀態，「不會」碰 otadata ——
+// 開機分區維持指向目前正在跑的這一份韌體，所以中止永遠不會變磚。
+//
+// **它擋不住什麼**：它只保證「這一台在中止時不會變磚」。
+// 它不保證新韌體本身開得起來 —— 通過 MD5、切換分區、但新韌體在 setup() 早期就 crash
+// 的情況，本階段沒有任何軟體覆蓋（見 ho_slave1/readme.md 的已知限制與 plan 決定 2.5）。
+// 它也不會關閉繼電器：關繼電器是失聯保護（startChannelScan）的職責，不是這裡。
+void otaAbort(const char* why) {
+  if (!otaActive && otaSession == HO_OTA_SESSION_NONE) return;
+  if (otaActive) Update.abort();
+  Serial.printf("[OTA] 已中止：%s（已寫入 %u/%u bytes，開機分區未變動）\n",
+                why, (unsigned)otaWritten, (unsigned)otaTotalSize);
+  otaActive = false;
+  otaSession = HO_OTA_SESSION_NONE;
+  otaWritten = 0;
+  otaBlockMask = 0;
+  otaBlockBase = 0;
+}
+
+// 回一封 OTA_ACK 給 master。mask 只在回報區塊進度時有意義。
+void otaSendAck(uint16_t blockBase, uint16_t mask, uint8_t status) {
+  if (!masterKnown) return;
+  HoOtaAckPayload ack;
+  ack.sessionId = otaSession;
+  ack.blockBase = blockBase;
+  ack.mask      = mask;
+  ack.status    = status;
+
+  uint8_t buf[250];
+  size_t total = hoPackPacket(buf, sizeof(buf), HO_PKT_OTA_ACK, txSeq++, &ack, sizeof(ack));
+  esp_now_send(masterMac, buf, total);
 }
 
 // ── 設備 ID ──
@@ -254,6 +310,11 @@ void setChannel(uint8_t ch) {
 
 void startChannelScan() {
   if (scanning) return;
+
+  // 失去 master 就不可能繼續接收，先把 Update 釋放掉。
+  // 不釋放的話，flash 分區會被一個永遠不會完成的工作階段占著，
+  // 下一次 OTA 的 Update.begin() 會失敗。
+  otaAbort("失去 master，開始輪掃");
 
   // 安全預設：失去 master 時關閉繼電器，避免一直通電
   if (relayState) {
@@ -497,6 +558,24 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     return;
   }
 
+  // ── OTA 期間的失聯保護（Phase 4 決定 1a）──
+  // 走到這裡代表：封包通過了 magic/version/CRC 驗證（CRC 含共享密鑰與標頭），
+  // 而且來源正是本機已配對的 master。這比廣播心跳是更強的存活證據 ——
+  // 單播同時證明了「master 活著」和「我跟它在同一個 channel 上」，廣播只證明前者。
+  //
+  // 沒有這一行的話：OTA 轉送要跑 30~90 秒，期間 ESP-NOW 通道被單播塞滿，
+  // 沒有 ACK、沒有重傳的廣播心跳丟包率明顯上升。一旦累積 30 秒沒收到心跳，
+  // startChannelScan() 會 (1) 強制關閉繼電器＝籠子被打開，
+  // (2) 開始每 1200ms 換一個 channel，當場把正在進行的 OTA 打斷。
+  //
+  // 這是收緊而非放寬：沒有封包就是沒有封包，30 秒計時照常走完。
+  //
+  // **它擋不住什麼**：它只延長「判定失聯」的時機，不改變失聯後的動作。
+  // master 真的掛掉、或跳到別的 channel 之後，30 秒照樣走完、繼電器照樣被強制關閉。
+  // 它也不保證 OTA 一定不被打斷 —— 只要連續 30 秒一封 master 封包都沒收到
+  //（例如整個區塊連續重送都失敗），輪掃仍會啟動並中止 OTA。
+  lastHeartbeatTime = millis();
+
   if (header.type == HO_PKT_CMD && payloadLen >= sizeof(HoCmdPayload)) {
     HoCmdPayload cmd;
     memcpy(&cmd, payload, sizeof(cmd));
@@ -545,7 +624,213 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     return;
   }
 
+  if (header.type == HO_PKT_OTA_BEGIN && payloadLen >= sizeof(HoOtaBeginPayload)) {
+    HoOtaBeginPayload bg;
+    memcpy(&bg, payload, sizeof(bg));
+
+    // 同一個 sessionId 再次收到 BEGIN：多半是我的 READY 回程丟了，master 重發。
+    // 重回一次 READY 就好，「絕不」重置已經收到的進度。
+    if (otaActive && bg.sessionId == otaSession) {
+      otaLastPacketAt = millis();
+      Serial.println("[OTA] 重複收到 OTA_BEGIN，重新回覆 READY（進度保留）");
+      otaSendAck(otaBlockBase, otaBlockMask, HO_OTA_READY);
+      return;
+    }
+
+    // 已有其他工作階段：只有在它已經很久沒動靜（殘留）時才讓位。
+    //
+    // ⚠ 這裡「刻意不」在分支開頭就刷新 otaLastPacketAt（計畫書原文是在開頭刷新，
+    //    實作時改掉）。理由：BEGIN 也是 OTA 封包，先刷新的話下面這個
+    //    「millis() - otaLastPacketAt < OTA_SLAVE_IDLE_MS」差值恆為 0，殘留判定永遠不成立；
+    //    更糟的是每一次被拒絕的 BEGIN 都會把時間戳推後，連 loop() 的 30 秒逾時
+    //    也永遠不會觸發 —— 一個殘留的工作階段會把 slave 永久鎖在 BUSY，只能斷電。
+    //    現在只有「屬於目前工作階段的封包」才刷新時間戳。
+    if (otaActive && bg.sessionId != otaSession) {
+      if (millis() - otaLastPacketAt < OTA_SLAVE_IDLE_MS) {
+        Serial.printf("[OTA] 已有工作階段 %u 進行中，拒絕 %u\n", otaSession, bg.sessionId);
+        // 暫時借用 otaSession 欄位讓 master 認得出這封 ACK 是回給誰的，回完「立刻還原」。
+        // 計畫書原文是還原成 0，那會把正在進行的工作階段編號抹掉 ——
+        // 之後合法 master 送來的 OTA_DATA 全部會因 sessionId 不符而被靜默丟棄，
+        // 等於被一封來路不明的 BEGIN 打斷整場 OTA。
+        uint8_t keepSession = otaSession;
+        otaSession = bg.sessionId;
+        otaSendAck(0, 0, HO_OTA_ERR_BUSY);
+        otaSession = keepSession;
+        return;
+      }
+      // 走到這裡代表殘留超過 30 秒。實務上 loop() 的逾時通常會先一步 abort，
+      // 這是同一條判準的第二道，不依賴 loop() 的排程時機。
+      otaAbort("上一個工作階段殘留");
+    }
+
+    otaLastPacketAt = millis();
+    otaSession = bg.sessionId;
+
+    // 合理性檢查：擋掉明顯錯誤的長度，避免白白抹掉整個分區
+    if (bg.totalSize < 65536 || bg.totalSize > 2031616 ||
+        bg.totalChunks == 0 || bg.totalChunks > HO_OTA_MAX_CHUNKS) {
+      Serial.printf("[OTA] 拒絕：長度不合理 size=%u chunks=%u\n",
+                    (unsigned)bg.totalSize, bg.totalChunks);
+      otaSendAck(0, 0, HO_OTA_ERR_SIZE);
+      otaSession = HO_OTA_SESSION_NONE;
+      return;
+    }
+
+    if (!Update.begin(bg.totalSize, U_FLASH)) {
+      Serial.printf("[OTA] Update.begin 失敗，錯誤碼 %u（可用空間 %u）\n",
+                    Update.getError(), (unsigned)ESP.getFreeSketchSpace());
+      otaSendAck(0, 0, HO_OTA_ERR_BEGIN);
+      otaSession = HO_OTA_SESSION_NONE;
+      return;
+    }
+
+    // 把期望的 MD5 交給 Update，Update.end(true) 會在切換開機分區「之前」比對。
+    // 不符就直接回 false 且不切換 —— 這是「失敗不變磚」的核心那一道。
+    char md5hex[33];
+    for (int i = 0; i < 16; i++) snprintf(md5hex + i * 2, 3, "%02x", bg.md5[i]);
+    Update.setMD5(md5hex);
+
+    otaActive      = true;
+    otaTotalSize   = bg.totalSize;
+    otaTotalChunks = bg.totalChunks;
+    otaBlockBase   = 0;
+    otaBlockMask   = 0;
+    otaWritten     = 0;
+
+    Serial.printf("[OTA] 開始接收：%u bytes／%u 包，目標版本 %u.%u.%u，MD5 %s\n",
+                  (unsigned)bg.totalSize, bg.totalChunks,
+                  bg.verMajor, bg.verMinor, bg.verPatch, md5hex);
+    otaSendAck(0, 0, HO_OTA_READY);
+    return;
+  }
+
+  if (header.type == HO_PKT_OTA_DATA && payloadLen > sizeof(HoOtaDataPayload)) {
+    HoOtaDataPayload dh;
+    memcpy(&dh, payload, sizeof(dh));
+    if (!otaActive || dh.sessionId != otaSession) return;   // 殘留封包，靜默丟棄
+
+    otaLastPacketAt = millis();
+
+    size_t dataLen = payloadLen - sizeof(HoOtaDataPayload);
+    if (dataLen == 0 || dataLen > HO_OTA_CHUNK_SIZE) return;
+
+    // 超出本次宣告包數的塊號一律丟棄（計畫書沒有這一條，實作時補上）。
+    // 沒有它的話，最後一個區塊寫完之後 otaBlockBase == otaTotalChunks，
+    // 一封 chunkIndex 落在 [otaBlockBase, otaBlockBase+16) 但 >= totalChunks 的封包
+    // 會讓 need 算成 0、fullMask 算成 0，於是「條件當場成立」跑進零長度寫入並回一封
+    // 假的 OTA_OK。**這是誤綠方向**，所以擋在最前面。
+    // **它擋不住什麼**：它只檢查塊號範圍，不檢查資料內容 ——
+    // 塊號合法但內容錯誤的封包照收，那一層由整份韌體的 MD5 在 Update.end(true) 攔下。
+    if (dh.chunkIndex >= otaTotalChunks) return;
+
+    // 只收目前這個區塊內的包。前一個區塊的重複包（master 沒收到 ACK 而重送）
+    // 落在區間外，直接丟棄即可 —— 資料已經寫進 Update 了。
+    if (dh.chunkIndex < otaBlockBase || dh.chunkIndex >= otaBlockBase + HO_OTA_WINDOW) return;
+
+    uint16_t slot = dh.chunkIndex - otaBlockBase;
+    memcpy(otaBlockBuf + (size_t)slot * HO_OTA_CHUNK_SIZE,
+           payload + sizeof(HoOtaDataPayload), dataLen);
+    otaBlockMask |= (uint16_t)(1u << slot);
+
+    // 這個區塊要幾包才算滿？最後一個區塊可能不足 16 包。
+    uint16_t need = HO_OTA_WINDOW;
+    if ((uint32_t)otaBlockBase + HO_OTA_WINDOW > otaTotalChunks) {
+      need = (uint16_t)(otaTotalChunks - otaBlockBase);
+    }
+    uint16_t fullMask = (need >= 16) ? 0xFFFF : (uint16_t)((1u << need) - 1u);
+    if ((otaBlockMask & fullMask) != fullMask) return;   // 還沒收齊，等 master 查詢
+
+    // 收齊了 → 一次順序寫入。最後一個區塊的長度要用總長度回推，不能假設是滿的。
+    uint32_t remain = otaTotalSize - otaWritten;
+    size_t writeLen = (size_t)need * HO_OTA_CHUNK_SIZE;
+    if (writeLen > remain) writeLen = remain;
+
+    size_t wrote = Update.write(otaBlockBuf, writeLen);
+    if (wrote != writeLen) {
+      Serial.printf("[OTA] 寫入失敗：預期 %u 實際 %u，錯誤碼 %u\n",
+                    (unsigned)writeLen, (unsigned)wrote, Update.getError());
+      otaSendAck(otaBlockBase, otaBlockMask, HO_OTA_ERR_WRITE);
+      otaAbort("寫入失敗");
+      return;
+    }
+    otaWritten += wrote;
+
+    // 主動回報「這一塊收齊了」，master 就不必等查詢逾時，直接推進下一塊
+    otaSendAck(otaBlockBase, fullMask, HO_OTA_OK);
+
+    otaBlockBase += need;
+    otaBlockMask = 0;
+
+    // 每 40 個區塊（約 150 KB）印一行，避免序列埠被 270 行進度洗版
+    if ((otaBlockBase / HO_OTA_WINDOW) % 40 == 0) {
+      Serial.printf("[OTA] 進度 %u%%（%u/%u bytes）\n",
+                    (unsigned)(otaWritten * 100 / otaTotalSize),
+                    (unsigned)otaWritten, (unsigned)otaTotalSize);
+    }
+    return;
+  }
+
+  // 到達 slave 的 OTA_ACK 一律是 master 的查詢：「這個區塊你收到哪幾包了？」
+  // 方向本身就是語義，不需要額外的 request 欄位。
+  if (header.type == HO_PKT_OTA_ACK && payloadLen >= sizeof(HoOtaAckPayload)) {
+    HoOtaAckPayload q;
+    memcpy(&q, payload, sizeof(q));
+    if (!otaActive || q.sessionId != otaSession) return;
+    otaLastPacketAt = millis();
+
+    // 查詢的區塊已經被我寫完並推進了 → 回一個「全滿」讓 master 直接往前走
+    if (q.blockBase < otaBlockBase) {
+      otaSendAck(q.blockBase, 0xFFFF, HO_OTA_OK);
+      return;
+    }
+    otaSendAck(otaBlockBase, otaBlockMask, HO_OTA_OK);
+    return;
+  }
+
+  if (header.type == HO_PKT_OTA_END && payloadLen >= sizeof(HoOtaEndPayload)) {
+    HoOtaEndPayload en;
+    memcpy(&en, payload, sizeof(en));
+    if (en.sessionId != otaSession) return;
+    otaLastPacketAt = millis();
+
+    if (en.abort) {
+      otaSendAck(0, 0, HO_OTA_ABORTED);
+      otaAbort("master 指示中止");
+      return;
+    }
+
+    // 進 Update.end() 之前先自己比一次長度。長度不符時直接 abort，
+    // 連 end() 都不進 —— 少一條可能切換開機分區的路徑。
+    if (!otaActive || otaWritten != en.totalSize || otaWritten != otaTotalSize) {
+      Serial.printf("[OTA] 長度不符：已寫 %u，master 宣告 %u\n",
+                    (unsigned)otaWritten, (unsigned)en.totalSize);
+      otaSendAck(0, 0, HO_OTA_ERR_MD5);
+      otaAbort("長度不符");
+      return;
+    }
+
+    // end(true) 會依序檢查長度與 setMD5() 設定的 MD5，
+    // 兩者都過才呼叫 esp_ota_set_boot_partition()。不過就回 false 且不切換。
+    if (!Update.end(true)) {
+      Serial.printf("[OTA] 校驗失敗，錯誤碼 %u —— 開機分區未變動，重啟後仍是舊韌體\n",
+                    Update.getError());
+      otaSendAck(0, 0, HO_OTA_ERR_MD5);
+      otaAbort("校驗失敗");
+      return;
+    }
+
+    Serial.println("[OTA] 校驗通過，1 秒後重新啟動");
+    otaSendAck(0, 0, HO_OTA_OK);
+    otaActive = false;
+    // 給 ACK 送出的時間再重啟。這裡用裸 delay() 是可以的：
+    // 本機即將重開機，繼電器與心跳計時都會被重置，沒有「維持心跳」可言。
+    delay(1000);
+    ESP.restart();
+    return;
+  }
+
   if (header.type == HO_PKT_UNPAIR) {
+    otaAbort("收到解除配對");
     Serial.println("[配對] master 要求解除配對");
     EEPROM.begin(EEPROM_SIZE);
     EEPROM.write(EE_ADDR_MAGIC, 0);
@@ -707,6 +992,11 @@ void loop() {
     setRelayPins(false);
     Serial.println("[繼電器] 點動結束，已關閉");
     sendState();
+  }
+
+  // OTA 工作階段逾時：master 不見了就回到已知安全狀態，釋放 Update
+  if (otaActive && now - otaLastPacketAt >= OTA_SLAVE_IDLE_MS) {
+    otaAbort("超過 30 秒沒收到 OTA 封包");
   }
 
   // 已鎖定：超時沒收到心跳就重新掃描
