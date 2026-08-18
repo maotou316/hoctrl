@@ -47,29 +47,43 @@ PubSubClient、ArduinoJson 7.4.3、Preferences (NVS, master)、EEPROM (slave)
 ## 前置狀態與相依（開工第一件事就是核對，核對不過要停下來回報）
 
 本計畫的前身是 Phase 2b 的 Task 6，被裁定移到這裡（理由見 phase2b 的 progress.md）。
-移出來之後它有兩個**尚未成立**的前提，動工前必須逐一 `grep` 確認：
+**它寫於 Phase 2b Task 5 之前**，當時列的兩個「尚未成立」的前提如今都已成立，
+而且成立的**方式**改掉了本計畫好幾個段落的地基。
 
-| # | 需要的東西 | 檢查指令 | 找不到時怎麼辦 |
+> ### 2026-08-18 逐檔重新核對的結果（`git log` 最新為 `b921952`）
+>
+> 下表每一列都是實際讀過原始碼之後寫的，**不是照原計畫抄的**。
+> 開工時仍然要自己 `grep` 一次 —— 這張表也會過期。
+
+| # | 原計畫寫的前提 | 現況 | 對本計畫的影響 |
 |---|---|---|---|
-| 1 | Phase 2b Task 4 拆出來的 `handleMasterCommand()` | `grep -n "void handleMasterCommand" ho_master1/ho_master1.ino` | **不要自行改寫 `mqttCallback()` 的結構。** Task 4 已備妥兩種接法的程式碼（4-A：接在 `handleMasterCommand()`；4-B：接在現行 `mqttCallback()` 的 else-if 鏈尾）。照實際狀況選一種，**並在 report 寫明用了哪一種** |
-| 2 | Phase 4 的 `hoFrameCrc()` 與 `HO_ESPNOW_VERSION 2` | `grep -n "hoFrameCrc\|HO_ESPNOW_VERSION" libraries/HoEspNow/src/HoEspNowProtocol.h` | 兩種情況都可以做：Phase 5 只**新增**封包型別與 payload，不動 CRC 演算法也不動版本號。若 Phase 4 尚未執行，`hoPayloadCrc()` 仍在，照樣可用 |
+| 1 | `handleMasterCommand()` 可能不存在，備妥 4-A／4-B 兩種接法 | **存在**，而且它的 else-if 鏈裡已經有一個 `message.startsWith("LR:")` **佔位分支**，只印一行「[LR] 指令尚未實作（Task 6）」 | **4-B 整條作廢。** Task 4 Step 8 是**取代**那個佔位分支，不是在它後面再加一個（加在後面會永遠進不去） |
+| 2 | Phase 4 可能尚未開工，`hoPayloadCrc()` 仍在 | **`HO_ESPNOW_VERSION` 已是 2**，`hoPayloadCrc()` 已移除，CRC 改為涵蓋標頭前 6 bytes 的 `hoFrameCrc()` | Phase 5 仍然只**新增**封包型別與 payload、不動 CRC 也不升版本號；但相容性敘述要改（見 Task 5 Step 1） |
+| 3 | 指令送出點是 `sendCmdToSlave(idx, cmd, pulseMs)` | **`sendCmdToSlave()` 已被刪除。** 現在是 `bool sendCmdToSlaveMac(const uint8_t mac[6], HoRelayCmd, uint16_t pulseMs, uint16_t cmdId)`，另有薄轉換層 `void sendCmdToSlaveIndex(int idx, HoRelayCmd, uint16_t pulseMs)`。索引式的 ESP-NOW 送出路徑被**刻意全部移除**（同一類缺陷出現過兩次，後果是開錯門） | **LR 的掛鉤點與補送目標一律改用 MAC，不得用索引。** 原計畫的 `lrResendIdx` 是索引式，必須改掉（見「決定 2」） |
+| 4 | `sendCmdToAll()` 會逐台呼叫 `sendCmdToSlave()` | **不再逐台呼叫任何單台送出函式。** 它現在是三段：① 廣播到 `FF:FF:FF:FF:FF:FF` 連送 `GROUP_BROADCAST_REPEAT`(3) 次、間隔 `GROUP_BROADCAST_GAP`(20ms)；② inline 對每一台送一次單播（`groupSendUnicast()`，每台間隔 `GROUP_STEP_GAP`(20ms)）；③ 交給 `loop()` 的 `processGroupCmd()` 對「沒拿到 MAC 層 ACK」的台補送，最多 `GROUP_MAX_SWEEPS`(3) 趟 | **凡是假設「`sendCmdToAll()` 會逐台呼叫某函式」的段落全部失效**，包含原「決定 2」的防遞迴論證與 Task 5 `lrtest` 的三個理由 |
+| 5 | （原計畫沒有這個概念） | 群組指令是一個**有狀態機的 job**：`GROUP_JOB_IDLE` / `ARMED` / `WAIT` / `SWEEP`，快照 MAC 清單，一個 job 一個 `cmdId`，且有 wall-clock 硬上限 `GROUP_JOB_MAX_MS = 6000` | **Phase 5 的補送與它是兩套獨立的重試機制。** 這是本次修訂最重要的一件事，處理方式見「決定 2」 |
+| 6 | （原計畫沒有這個概念） | **ACK 歸因閂鎖**：`groupAckArmed`/`groupAckIdx`/`groupAckMac`，四個關閉點；`groupNoteUnicastAck()` 開頭有 `if (!groupCmdActive()) return;`，**結構性拒絕 job 之外的寫入**。因此**任何在 job 進行中送出的單播**（`HO_PKT_STATE_REQ` 最典型）都可能污染送達判定，程式裡已有三處 `groupCmdActive()` 讓路守衛（`pollNextSlave()`／`handleSlaveCommand()`／序列埠 `state <n>`） | **LR 驗證階段的主動探測、`lrtest` 的補查，送的都是單播 `HO_PKT_STATE_REQ`，必須加上同樣的讓路守衛**（原計畫沒有，見 Task 4 Step 5 與 Task 5 Step 5） |
+| 7 | （原計畫沒有這個概念） | slave 端有 OTA 接收狀態機（`otaActive`／`otaSession`／`otaBlockMask`／`OTA_SLAVE_IDLE_MS = 30000`），且 `startChannelScan()` 會先關繼電器、再 `otaAbort()`。**master 端的 OTA 送出側尚未實作**（Phase 4 只做到 Task 2） | **LR 切換若發生在 OTA 進行中要怎麼辦，本計畫必須回答** —— 見新增的「決定 7」 |
+| 8 | `ho_espnow_test` 共 33 個 `check()` | **實際的測試項數是 57**。注意 `grep -c "check("` 會回 **58** —— 它多算了 `void check(bool cond, ...)` 這個**定義**那一行。`tools/check_doc_claims.py` 的方向 4 是先切掉定義再數，所以它印的是 57，`docs/phase4-flag-day-upgrade.md` 寫的也是「執行 57 項」 | **要引用項數時以腳本印的數字為準，不要用 `grep -c`。** Task 5 加一項之後三處要一起變：原始碼、`phase4-flag-day-upgrade.md`、腳本印出的值 |
+| 9 | 狀態 JSON 容量常數是 `STATUS_BASE_MAX_BYTES = 512`、`SLAVE_ENTRY = 96`、`STATUS_BUF_SIZE = 3072` | 現行是 `STATUS_BASE_WITHOUT_GROUP_OTA(480) + STATUS_GROUP(120) + STATUS_OTA(128) = 728`、`SLAVE_ENTRY_MAX_BYTES = 112`、`STATUS_BUF_SIZE = 3584`、`MQTT_BUFFER_SIZE = 3840`、`SLAVES_KEY_OVERHEAD = 11` | Task 4 Step 9 的算式**整段作廢**，已重算 |
 
-> **2026-08-16 實際狀態**（撰寫本計畫時 `git log` 最新為 `85b6d15`）：
-> Phase 2b 只完成到 **Task 3**，`handleMasterCommand()` **不存在**，`mqttCallback()`
-> 仍是 Phase 2a 的 else-if 鏈；Phase 4 **尚未開工**，`HO_ESPNOW_VERSION` 仍是 1。
-> 這個狀態會變，所以**以 `grep` 的結果為準，不要以本段文字為準。**
+**另外幾件必須先知道的既有事實（2026-08-18 讀過原始碼確認）：**
 
-**另外三件必須先知道的既有事實：**
-
-- `ho_slave1.ino` 的 `EE_ADDR_LONGRANGE`（EEPROM 位址 8）**已定義但從頭到尾沒被讀也沒被寫** ——
-  `loadPairing()` 沒讀、`savePairing()` 沒寫。Phase 1 只留了位址。Task 2 要補上。
-- `ho_master1.ino` 的 `longRangeEnabled` **只被讀、從來沒被寫過**：
-  `sendHeartbeat()` 與 `HO_PKT_PAIR_ACK` 帶出去、`buildStatusDoc()` 放進 JSON，
-  但沒有任何路徑會把它從 `false` 改成 `true`，也沒有持久化。
-- `ho_espnow_test/ho_espnow_test.ino` 有一條 `check(sizeof(HoHeartbeatPayload) == 4, ...)`。
-  Task 5 會把心跳 payload 加長到 6 bytes，**那條測試必須同步改**，否則 `-Model test` 會紅。
-  （目前該檔共 33 個 `check()`，以實際 `grep -c "check("` 為準，不要照抄任何文件寫死的數字 ——
-   Phase 1 曾因 commit 訊息寫死項數而需要事後補救。）
+- `ho_slave1.ino` 的 `EE_ADDR_LONGRANGE`（EEPROM 位址 8）**仍然是已定義但從頭到尾沒被讀也沒被寫** ——
+  `loadPairing()` 沒讀、`savePairing()` 沒寫，`ho_slave1.ino` 全檔也**還沒有** `longRangeEnabled`
+  這個變數。Phase 1 只留了位址。Task 2 要補上。
+- `ho_master1.ino` 的 `longRangeEnabled` **仍然只被讀、從來沒被寫過**，全檔只有三個讀取點：
+  `sendHeartbeat()` 的 `hb.longRange`、`HO_PKT_PAIR_ACK` 的 `ack.longRange`、
+  `buildStatusDoc()` 的 `dev["long_range"]`。沒有任何路徑會把它從 `false` 改成 `true`，也沒有持久化。
+- `ho_espnow_test/ho_espnow_test.ino` 有一條 `check(sizeof(HoHeartbeatPayload) == 4, ...)`，
+  **而且 `libraries/HoEspNow/src/HoEspNowProtocol.h` 裡也有一條同樣意思的
+  `static_assert(sizeof(HoHeartbeatPayload) == 4, ...)`。** Task 5 會把心跳 payload 加長到
+  6 bytes，**兩條都必須同步改**，否則 `-Model test` 會紅、甚至四種型號全部編不過。
+  （原計畫只點名了 `ho_espnow_test` 那一條，漏了 `static_assert` 那一條。）
+- `ho_master1.ino` **沒有任何 SoftAP／`WiFi.mode(WIFI_AP*)` 路徑**，配網走的是 BLE
+  （`setupBLE()`／`bleConfigMode`）。這件事直接改寫了「危害 D」的內容，見下方。
+- master 的 `sendHeartbeatBurst()` 內部是**裸 `delay(HEARTBEAT_BURST_GAP)`**，
+  `HEARTBEAT_BURST_COUNT = 4`、`HEARTBEAT_BURST_GAP = 200`，所以一次連發 = 3 × 200 = **600ms**。
 
 ---
 
@@ -85,7 +99,10 @@ PubSubClient、ArduinoJson 7.4.3、Preferences (NVS, master)、EEPROM (slave)
     （`sendHeartbeatBurst()` 內部那個 `delay(200)` 是唯一既有例外，它本身就在發心跳）
   - LR 握手、驗證、回滾**全部是 `loop()` 驅動的狀態機**，每次 `loop()` 只推進一小步
   - `esp_wifi_set_protocol()` 是本階段唯一新增的、可能引發射頻中斷的呼叫。
-    **它的前後各必須 `sendHeartbeatBurst()` 一次**（做法與 Phase 4 對阻塞步驟的處理一致）
+    **它的前後各必須連發一次心跳** —— 但**不是**呼叫既有的 `sendHeartbeatBurst()`，
+    而是 Task 4 Step 3 的 `lrHeartbeatBurst()`（同樣連發 4 次，但等待走 `espNowDelay()`
+    而非裸 `delay()`，理由見該處）。原文寫成 `sendHeartbeatBurst()`，
+    與 Task 4 Step 3 自己的說明互相矛盾，這裡改對。
 - **ESP-NOW callback 不得發 MQTT、不得做冗長操作**：`onEspNowRecv()` 跑在 WiFi task。
   本階段新增的 `HO_PKT_LR_SET`／`HO_PKT_LR_ACK` 處理**只能設旗標與時間戳**，
   實際的 `esp_wifi_set_protocol()`／`EEPROM.commit()`／`publishStatus()` 一律交給 `loop()`。
@@ -93,6 +110,17 @@ PubSubClient、ArduinoJson 7.4.3、Preferences (NVS, master)、EEPROM (slave)
 - **安全指令的優先權高於 LR**：任何繼電器指令（`ALL:ON`／`ALL:OFF`／單台 `ON`／`OFF`／
   序列埠 `allon`／`alloff`／`allpulse`／`on`／`off`／`pulse`）在 LR 切換進行中
   **不得被延後、不得被排隊、不得被拒絕**。做法見「決定 2」。
+  - **這條有一個原計畫沒寫、但現行程式碼結構會直接踩到的推論**：LR 的收尾動作
+    （`applyLongRangeWithBurst()`，含兩次 600ms 心跳連發）**絕對不可以排在指令送出之前**。
+    原計畫把掛鉤點寫成「`sendCmdToAll()` 的第一行」，那等於在最該立刻送出的那一道
+    「全部關」前面插進 1.2 秒以上的阻塞。**掛鉤點必須在「舊 bitmap 那一輪已經送完」之後。**
+- **群組指令的 job 期間不得送任何無關的單播**：`groupNoteUnicastAck()` 只認 MAC，
+  在 job 進行中送出的任何單播（`HO_PKT_STATE_REQ` 最典型）都可能被誤記成「群組指令已送達」。
+  程式裡已有三處 `groupCmdActive()` 讓路守衛。**本階段新增的每一個單播送出點
+  （LR 驗證探測、`lrtest` 補查）都必須加上同樣的守衛**，否則就是在複製 C1 那一類的錯誤歸因。
+  - **它擋不住什麼**：這道守衛只擋「loop() 這一側主動送出的單播」。
+    ESP-NOW callback 裡回覆的 `HO_PKT_PAIR_ACK`、以及 slave 主動送來的封包所引發的回覆，
+    一樣擋不掉（既有的殘留窗口清單已經記過），本階段沒有改善那一項。
 
 ### 前階段留下、本階段必須沿用的認知更正（不得沿用錯誤前提）
 
@@ -113,13 +141,17 @@ PubSubClient、ArduinoJson 7.4.3、Preferences (NVS, master)、EEPROM (slave)
 Phase 2a 已因此踩過一次（`WiFi.begin()` 帶 channel 的掃描語義被誤以為能限制單頻掃描，
 且回歸清單把「心跳 channel 跳動」列成**失敗判定**，若 IDF 真的會續掃就會把正常韌體判成 FAIL）。
 
-本階段有**三個**同類的未驗證行為，全部集中在 Task 1 用探針量掉：
+本階段有**五個**同類的未驗證行為，全部集中在 Task 1 用探針量掉。
+（2026-08-18 修訂：**D 本來就寫在 Task 1 Step 3 的骨架裡，只是這張表漏了它**，
+造成「三個」與內文的四個對不起來；**E** 是危害 D 更正之後浮出來的新未知。）
 
 | # | 未驗證的宣稱 | 出處 | 若宣稱不成立的後果 |
 |---|---|---|---|
 | A | `esp_wifi_set_protocol()` 在**已關聯 AP** 的狀態下呼叫不會造成斷線 | Phase 2b Task 6 只寫成「可能造成一次斷線重連（未驗證）」 | LR 切換 = 一次 MQTT 中斷，最壞疊上 DNS 15 秒 |
-| B | **混合 bitmap 下兩端不同步只會失去距離增益，不會互相收不到** | Phase 2b「決定 5」的核心前提 | **握手逾時仍照樣套用」從安全行為變成危險行為**；整個切換流程要重新設計 |
+| B | **混合 bitmap 下兩端不同步只會失去距離增益，不會互相收不到** | Phase 2b「決定 5」的核心前提 | **「握手逾時仍照樣套用」從安全行為變成危險行為**；整個切換流程要重新設計 |
 | C | ESP32-C3 支援 `WIFI_PROTOCOL_LR` | 從未有人查證。master 支援 WROOM 與 C3 雙板，**slave 全部是 C3** | 若 C3 不支援，slave 端 LR 完全做不了，整個功能只剩 master 單邊，等於無效 |
+| D | `esp_now_set_peer_rate_config()` 在 Arduino core 3.3.7 這條工具鏈上編得過、呼叫得成功 | 設計規格「難點 2」把它列為「混合模式測不出差異時的備案」，但從未驗證 | 備案不存在；測項 B 若顯示混合模式沒有增益，就沒有第二條路 |
+| E | **打開 LR 位元之後 BLE 廣播仍然正常** | 2026-08-18 修訂：master 唯一的配網管道是 BLE，不是 SoftAP（危害 D 更正） | **真正的變磚路徑**：開了 LR 之後配不了網，而 LR 位元存在 NVS、重燒也清不掉（危害 E） |
 
 **宣稱 B 是本計畫最重要的一條。** 它是 Phase 2b「決定 5」的地基：因為「不同步只失去增益」，
 所以「等不到就照樣切」才是安全的；一旦這個前提倒了，那句話就變成
@@ -193,7 +225,7 @@ Task 1 的測項 A 因此**從「測會不會斷」改成「測斷多久、MQTT 
 維護者在 esp-idf#9933 明講的（"`esp_wifi_set_protocol` … need to be called after
 `esp_wifi_start()`, will update the doc"）。開機路徑的 `applyLongRange()` 位置要照這個排。
 
-##### 危害 D：STA 與 SoftAP **共用同一個 LR 位元** —— 會讓配網模式的 AP 手機看不到
+##### 危害 D：STA 與 SoftAP **共用同一個 LR 位元**
 
 esp-idf#9978，維護者逐字：
 
@@ -205,17 +237,46 @@ esp-idf#9978，維護者逐字：
 > For LR-enabled **AP** of ESP32, it is **incompatible with traditional 802.11 mode**,
 > because the **beacon is sent in LR mode**.
 
-**合起來就是一條完整的變磚路徑**：使用者開了 LR → 之後 WiFi 換路由器需要重新配網 →
-master 進 AP 模式 → **beacon 用 LR 送出，手機完全掃不到這個 AP** → 配網模式等於不存在。
+原本寫下的變磚路徑是：開了 LR → 換路由器要重新配網 → master 進 AP 模式 →
+**beacon 用 LR 送出，手機掃不到這個 AP** → 配網模式等於不存在。
 
-**本階段必須新增的硬性設計約束（寫進 Task 4，並在 Task 2 的 `applyLongRange()` 就留好介面）**：
+> ### 2026-08-18 更正：這條路徑在 `ho_master1` **今天不存在**，因為它根本不開 SoftAP
+>
+> 實際 grep 過 `ho_master1.ino`：全檔**沒有** `WiFi.mode(WIFI_AP)`／`WIFI_AP_STA`／
+> `softAP(`／任何 config portal。配網走的是 **BLE**（`setupBLE()`／`bleConfigMode`，
+> 只在開機時 `hasWifiConfig()` 為 false 才啟動，配網完 `ESP.restart()`）。
+>
+> **所以「手機掃不到那個 AP」這個具體症狀，在本專案的 master 上沒有觸發路徑。**
+> 把它照抄下來會構成一次「宣稱一道其實不存在的危害」，形狀與 A 族病灶相同，
+> 只是方向相反 —— 一樣是文件與事實不符。
 
-> **進入配網模式（SoftAP／`startConfigPortal()` 之類）之前，必須無條件先把 protocol
-> 還原成 `WIFI_PROTOCOL_11B|11G|11N`（不含 LR），且不因為 NVS 裡存的是 LR 而跳過。**
-> 配網結束離開 AP 模式後，再依儲存值重新套用。
+**但這條 IDF 事實本身仍然成立，它在本專案變成兩件事：**
 
-這條與「決定 5：現場沒有 App 時的回滾」是同一個目的的兩條路徑，但**不能互相取代**：
-決定 5 是使用者主動要求回滾，這一條是系統為了不失去最後的救援管道而強制執行。
+1. **一條前瞻性的硬約束（不是今天的修補）**：
+   > **日後若有人替 master 加上 SoftAP 配網／config portal，那條路徑必須無條件先把
+   > protocol 還原成 `WIFI_PROTOCOL_11B|11G|11N`（不含 LR），且不得因為 NVS 存的是 LR 而跳過。**
+
+   這條要寫進 `ho_master1/readme.md` 的「已知風險」，讓下一個動配網的人看得到。
+   Task 2 的 `applyLongRange()` 已經是可以被無條件呼叫的形狀，不需要為此多留介面。
+
+2. **一個真正屬於本專案的未知，必須實測**：**LR 位元打開之後，BLE 廣播還在不在？**
+   master 唯一的配網管道是 BLE。LR 位元屬 Wi-Fi PHY 的 protocol bitmap，
+   BLE 是另一套堆疊，**理論上不受影響 —— 但本專案從來沒有量過**，
+   而且如果它真的受影響，那才是本專案真正的變磚路徑（開了 LR 之後就再也配不了網）。
+   **因此 Task 1 新增測項 E 去量它**（見 Task 1）。
+   在測項 E 有結果之前，任何文件**不得**寫「BLE 配網不受 LR 影響」。
+
+3. 順帶記下一個本階段**依賴、但同樣沒有實測**的相反方向宣稱：
+   Wi-Fi 驅動指南說「LR-enabled **station**（非 LR-only 模式）與傳統 802.11 相容」，
+   本階段整個 master 側都靠它才敢在混合 bitmap 下繼續關聯一般 AP。
+   它與宣稱 B 的差別是：**這一句講的正是 STA↔AP 關聯，是它的原生語境**，
+   而宣稱 B 是把同一句誤植到 ESP-NOW。語境對不代表已驗證 —— 危害 A 已經證明
+   「同一份文件的另一段」會說 `esp_wifi_set_protocol()` 一定會造成重連。
+   Task 1 測項 A 量的就是這件事在本工具鏈上的實際代價。
+
+**這一整條與「決定 5：現場沒有 App 時的回滾」的關係**：決定 5 是使用者主動要求回滾，
+上面第 1 點是「系統為了不失去最後的救援管道而強制執行」。兩者目的相同但**不能互相取代**；
+只是在今天的程式碼上，第 1 點還沒有對應的路徑要保護。
 
 ##### 危害 E：LR 位元**存在 NVS，重燒韌體與 erase 都清不掉**
 
@@ -239,6 +300,18 @@ espressif/esp-now#37 的標題就是使用者的慘叫：
 
 這條同時是 Task 2 `applyLongRange()` 的正確性條件：它的 else 分支**不可以是空的**，
 必須實際送出不含 LR 的 bitmap。
+
+**它擋不住什麼（2026-08-18 補上，原文沒寫）**：
+
+- `applyLongRange()` 只呼叫 `esp_wifi_set_protocol(**WIFI_IF_STA**, …)`，**只設 STA 這個介面**。
+  「STA 與 softAP 共用同一個 LR 位元」是危害 D 引的維護者說法，**本專案沒有驗證過**；
+  若那句話不成立，AP 側殘留的位元不會被這條開機清除覆蓋到。
+  今天的 master 不開 SoftAP，所以觀察不到差別 —— 但這是「觀察不到」不是「已排除」。
+- 開機清除只在 `setupEspNow()`（`WiFi.mode(WIFI_STA)` 會 start WiFi）之後才可能執行。
+  在那之前的開機時間裡，射頻沿用的仍然是 NVS 殘留值。這段時間很短，
+  但「開機就一定乾淨」這句話是錯的，正確說法是「開機流程跑到那一行之後才乾淨」。
+- 它完全不處理**別台**板子。現場若有一片被切成 LR 的 slave 從此再也沒被 Phase 5 韌體燒過，
+  它的 NVS 殘留值不會有人去清。
 
 ##### 追加：**沒有 `soc_caps.h` 巨集可以判斷 LR 支援**
 
@@ -284,13 +357,23 @@ Task 6 的實測程序若把 1 公里寫成期望值，會讓實測者把正常�
 
 - **Flash 紅線**：WROOM 任一 Task 結束時若超過 **1,930,035 bytes（對 app0 的 95%）**，
   在 report 標紅並停下來回報，不要自行砍功能。
-  基準（Phase 2b Task 3 後）：WROOM **1,690,003 / 83.18%**；C3 master 與 slave 見各 Task。
+  基準（**Phase 4 Task 1 後，2026-08-18 的最新已記錄值**）：WROOM **1,699,683 / 2,031,616 = 83.66%**，
+  距紅線還有 **230,352 bytes**；C3 master 64.96%、slave 48.17%、test 23.66%。
+  （原計畫寫的「Phase 2b Task 3 後 1,690,003 / 83.18%」已是舊值。
+   Phase 4 Task 2 之後 slave 又長大了，**開工第一件事就是自己編一次取得真正的起點數字**，
+   不要沿用這裡任何一個。）
   arduino-cli 對 custom 分區印的百分比是拿整顆 flash 當分母，**一律自行換算成對
   app0（`0x1F0000 = 2,031,616`）的百分比**。
-- **狀態 JSON 容量常數必須重算**：本階段要在 master 狀態加 `long_range_pending`
-  與 `long_range_error`。Phase 4 的「決定 4.1」已經指出這個陷阱 ——
+- **狀態 JSON 容量常數必須重算**：本階段要在 master 狀態加 `long_range_error`
+  （`long_range_pending` 的 27 bytes **已經**含在 Phase 2b 就算進去的分項裡，見 Task 4 Step 9）。
+  Phase 4 的「決定 4.1」已經指出這個陷阱 ——
   **加欄位卻不同步加大常數時，`static_assert` 會用舊常數繼續通過，保護機制看起來還在、
-  實際上已經失效**。做法見 Task 4 Step 6，一樣採「分項相加的具名常數」。
+  實際上已經失效**。做法見 **Task 4 Step 9**（原文誤寫成 Step 6），一樣採「分項相加的具名常數」。
+- **容量常數一動，`tools/check_doc_claims.py` 也要一起動**：它的 HIT 表逐字鎖了
+  `STATUS_BASE_WITHOUT_GROUP_OTA_MAX_BYTES` 等常數的宣告字串，BANNED 表鎖了被取代的舊值。
+  該腳本自己的維護規則寫著「**加了新判準就必須同時加進表裡，否則覆蓋率會靜靜地退化**」
+  以及「**改完必須跑突變驗證**（每個方向故意打壞一次，確認它真的會叫，再還原）」。
+  Task 4 Step 9 與 Task 6 都有對應的待辦。
 - **ESP-NOW 封包**：單包 250 bytes，`HoPacketHeader` 佔 7，payload 上限 243。
   本階段新增的 payload 都極小（`HoLrPayload` 2 bytes、心跳由 4 加到 6 bytes）。
 
@@ -314,22 +397,25 @@ Task 6 的實測程序若把 1 公里寫成期望值，會讓實測者把正常�
 ## 檔案結構
 
 ```
-ho_lr_probe/ho_lr_probe.ino              # Task 1 新增（獨立探針，約 320 行，不進產品）
+ho_lr_probe/ho_lr_probe.ino              # Task 1 新增（獨立探針，約 380 行，不進產品）
 flash.ps1                                 # Task 1：只新增一個 lrprobe 條目
 docs/lr-idf-behavior-findings.md          # Task 1 新增（事實表，由使用者填實測結果）
-libraries/HoEspNow/src/HoEspNowProtocol.h # Task 2（+2 型別 +1 payload）、Task 5（心跳加 hbSeq）
+libraries/HoEspNow/src/HoEspNowProtocol.h # Task 2（+2 型別 +1 payload）、Task 5（心跳加 hbSeq
+                                          #   **且要同步改該檔自己的 static_assert**）
 ho_espnow_test/ho_espnow_test.ino         # Task 5（心跳 payload 大小測試要同步改）
 ho_slave1/ho_slave1.ino                   # Task 2、3、5（約 +190 行）
 ho_master1/ho_master1.ino                 # Task 2、4、5（約 +330 行）
+tools/check_doc_claims.py                 # Task 4 Step 9、Task 6（新判準進表 + 跑突變驗證）
 ho_master1/readme.md                      # Task 6
 ho_slave1/readme.md                       # Task 6
+docs/phase4-flag-day-upgrade.md           # Task 6（燒錄順序那節要與 Phase 5 的說法對齊）
 docs/phase5-field-test-procedure.md       # Task 6 新增（交付使用者執行）
 docs/phase5-regression-checklist.md       # Task 6 新增
 ```
 
 ---
 
-## 本計畫的六個設計決定（先讀完再開工）
+## 本計畫的七個設計決定（先讀完再開工）
 
 實作時若發現任一決定站不住腳，**停下來回報**，不要自行改成別的做法。
 
@@ -359,7 +445,7 @@ t=0        使用者下 LR:ON，master 進入 LR_ANNOUNCING（master 仍是舊 b
 t=0.1s     第一台 online slave 收到 LR_SET → 回 ACK → 50ms 後套用新 bitmap
            ↑ 若 B 不成立，這台從此刻起聽不到 master 的心跳
 t≤10s      全部 online 都 ACK（正常約 2 秒）或逾時 10 秒
-t=10s      master 套用新 bitmap（前後各 sendHeartbeatBurst()）
+t=10s      master 套用新 bitmap（前後各 lrHeartbeatBurst() 一次，各 600ms）
            ↑ 已 ACK 的 slave 從此刻起又聽得到了
 ```
 
@@ -375,9 +461,12 @@ t=10s      master 套用新 bitmap（前後各 sendHeartbeatBurst()）
 - **它會讓「決定 2 的緊急插隊」變得不可能** —— 一旦兩端都在倒數，master 就不能
   隨時決定不切了
 
-### 決定 2：切換期間按下「全部關門」—— 送兩次，一次舊 bitmap 一次新 bitmap
+### 決定 2：切換期間按下「全部關門」—— **只留一套補送機制，借用既有的群組 job**
 
 **這是本計畫最重要的一個決定，也是使用者點名的問題。**
+**2026-08-18 整條重寫**：原本的答案（「送兩次」＝ 在 LR 這一側再長出一套重試）
+是在 Phase 2b Task 5 之前寫的，那時 `sendCmdToAll()` 還是逐台單播、沒有 job、沒有補送。
+現在它自己就有一套補送，**兩套疊在「一次要全部關」這條路徑上會互相吃掉對方**。
 
 先確立事實：規格「Flutter App 改動」章節寫明 **App 的「全部關門」按鈕送 `ALL:ON`**
 （`ALL:ON` = 廣播 pulse）。這是捕捉系統的核心動作，**不能等**。
@@ -388,37 +477,130 @@ Phase 2b 的設計已經滿足這一層。
 
 **但這一層有一個它沒回答的漏洞**：在 B 不成立的世界裡，指令進來的那一刻，
 master 還在**舊 bitmap**（它最後才切），而名冊已經裂成兩半 ——
-已 ACK 的在新 bitmap、還沒 ACK 的在舊 bitmap。**master 用任何一個 bitmap 廣播，
+已 ACK 的在新 bitmap、還沒 ACK 的在舊 bitmap。**master 用任何一個 bitmap 送，
 都只打得到一半的門。** 這正是「切換過程本身在製造它要解決的問題」。
 
-**本計畫的答案：緊急指令送兩次，中間夾一次立即收尾的切換。**
+#### 原本的答案（「送兩次」）在現行程式碼上的四個問題
+
+1. **掛鉤點的位置與它自己的文字矛盾。** 原文的步驟是「1. 先送 → 2. 才收尾切換」，
+   但它指定的掛鉤點是 `sendCmdToAll()` 的**第一行** —— 那等於把
+   `applyLongRangeWithBurst()`（兩次 600ms 心跳連發 ＋ `esp_wifi_set_protocol()`）
+   整整 1.2 秒以上的阻塞，插在這套系統**最不能延後的那一道指令**前面。
+2. **「兩次相隔約 150~200ms」與它自己的程式碼矛盾。** 兩次送出中間夾著
+   `finishAnnouncing()` → `applyLongRangeWithBurst()`，光是兩次連發就 1200ms，
+   真正的間隔至少 **1350ms**，是文字宣稱的近十倍。這是 B 族（判準與程式碼矛盾）的形狀。
+3. **補送的做法會把既有的 job 整個作廢。** 原文的補送是「再呼叫一次 `sendCmdToAll()`」，
+   而現在 `sendCmdToAll()` 第一件事就是 `groupCmdSnapshot()`，它會
+   `groupJob.phase = GROUP_JOB_IDLE`（舊 job 直接作廢）、清空 `groupDelivered[]`、
+   **配一個新的 `cmdId`**、重設 `startedAt`。後果：第一道指令累積到一半的送達證據被清空、
+   slave 回報的 `lastCmdId` 只對得上第二道、6 秒 wall-clock 上限重新計時。
+   **兩套重試不只是疊加，是後者吃掉前者。**
+4. **`lrResendIdx` 是索引式的目標。** 全檔的索引式 ESP-NOW 送出路徑已經被刻意移除
+   （同一類缺陷出現過兩次，後果是**開錯門**）。補送目標一律要用 MAC。
+
+#### 本次修訂的答案：**合併** —— LR 不新增任何重試，直接讓既有的補送段接手
 
 ```
 繼電器指令進來（lrPhase == LR_ANNOUNCING）
-  ├─ 1. 立刻用「目前的（舊）bitmap」照常送出        → 打到還沒 ACK 的那些台
-  ├─ 2. 記下這道指令（cmd / pulseMs / 目標是全體或單台）
-  ├─ 3. 立刻結束握手：不等剩下的 ACK、不等逾時，直接
-  │       sendHeartbeatBurst() → esp_wifi_set_protocol(新) → sendHeartbeatBurst()
-  └─ 4. 套用後 LR_RESEND_GAP_MS（150ms）再送一次同一道指令 → 打到已 ACK 的那些台
+  ├─ 0. lrOnRelayCommandBegin()
+  │       只做兩件不阻塞、不動射頻的事：中止 lrtest、印一行「安全指令優先」
+  ├─ 1. 呼叫端照原流程走完「舊 bitmap 那一輪」，一行都不改
+  │       群體：3 次廣播（40ms）＋ inline 對每台各一次單播（≤380ms）
+  │       單台：一次單播
+  │       → 打到「還沒 ACK、因此還在舊 bitmap」的那些台
+  ├─ 2. lrOnRelayCommandSent()
+  │       立刻結束握手：不等剩下的 ACK、不等逾時，直接
+  │       lrHeartbeatBurst() → esp_wifi_set_protocol(新) → lrHeartbeatBurst()
+  └─ 3. 補送
+        群體：**不新增任何東西。** 既有的 processGroupCmd() 第 2、3 趟補送，
+              本來就只打「沒拿到 MAC 層 ACK 的那些台」——
+              在 B 不成立的世界裡，那正好就是「已經切到新 bitmap、
+              所以收不到舊 bitmap 單播」的那些台。而此刻 master 已經是新 bitmap，
+              補送直接打中它們。**目標集合天生一致，不需要第二套機制去湊。**
+        單台：沒有 job 可以借力（單台指令本來就沒有補送），
+              補一次 LR_RESEND_GAP_MS(150ms) 之後的單發，**目標用 MAC 記，不用索引**。
 ```
 
-**兩次送出之間相隔約 150~200ms**，遠小於 Phase 1 `sendCmdToAll()` 逐台單播就會產生的
-400ms 落差（規格「系統本質」點名那半秒是動物的逃脫窗口），所以這個做法**沒有把
-落差擴大到規格已經明確拒絕的量級**。
+**為什麼合併才是對的（三個理由，缺一個都還可以爭論）：**
 
-**為什麼不是「中止切換、回到舊值」？** 那看起來更保守，其實更糟：
-已經 ACK 並套用了新 bitmap 的那些 slave，在 B 不成立時會**永久**聽不到 master，
-只能等自己的 30 秒門檻觸發 slave 端救援（決定 3）。
-「中止」等於把一半的門丟給 30 秒之後的自救，「切完再補送」則是 150ms 之後全部覆蓋到。
+1. **目標集合天生一致**：`groupCountPending()` 挑的就是「未取得 MAC 層 ACK」的台，
+   而那在 B 不成立時等於「已經切過去的台」。第二套機制只會重算出同一份名單。
+2. **一道邏輯指令維持一個 `cmdId`**：執行歸因（`groupExecutedIdx()`／MQTT 的 `exe`）
+   不會被切成兩段。原方案會產生兩個 `cmdId`，slave 回報的 `lastCmdId` 只對得上後面那個，
+   前一個永遠顯示「無執行證明」——**那是誤紅**，而誤紅在這個專案裡會被當成雜訊吃掉，
+   進而掩蓋真的紅。
+3. **只有一個時間預算**：`GROUP_JOB_MAX_MS = 6000` 是唯一的收工判定。
+   兩套機制各有各的計時器，就會出現「job 以為自己還在跑、LR 以為自己已經補完」這種
+   誰都說不清楚的狀態 —— 使用者點名的正是這件事。
 
-**重複點動的副作用是可接受的**：目標若已在點動中，第二次 `pulseRelay()` 只是重設計時器；
-`HO_CMD_OFF` 送兩次是冪等的。對籠門機構而言「多關一次」不會造成傷害，
+#### 時間帳：LR 的套用會吃掉 job 的 wall-clock，必須算
+
+```
+t=0        groupCmdSnapshot()：startedAt 起算
++ 40ms     3 次廣播（2 × GROUP_BROADCAST_GAP）
++ 380ms    inline 單播 20 台（19 × GROUP_STEP_GAP）
+≈ 0.42s    lrOnRelayCommandSent()：連發 600 + set_protocol + 連發 600 = 1.2s
+           （若 onWifiChannelMayHaveChanged() 判定 channel 真的變了，
+             它會再走一次 sendHeartbeatBurst()，最壞再 +600ms）
+≈ 2.2s     回到 loop()
++ 300ms    GROUP_ACK_WAIT_MS
++ 400ms    第 2 趟補送（20 台，每輪 loop() 一台、間隔 GROUP_STEP_GAP）
++ 300ms    等 ACK
++ 400ms    第 3 趟補送
++ 300ms    等 ACK → 收工
+─────────
+≈ 3.9s     < GROUP_JOB_MAX_MS(6000ms)，餘裕約 2.1 秒
+```
+
+**餘裕被吃光會怎樣（誠實版）**：`processGroupCmd()` 的 wall-clock 上限會提前收工，
+序列埠印「（達 wall-clock 上限）」。**這是看得見的降級，不是靜默失敗** ——
+但代價是補送趟數變少、覆蓋率下降。所以**改動 `HEARTBEAT_BURST_COUNT`／`HEARTBEAT_BURST_GAP`／
+`GROUP_*` 任何一個常數，都必須重算這一段。**
+
+#### 兩批門之間的落差有多大 —— 不要假裝它小
+
+- 舊 bitmap 那一批：t ≈ 0 ~ 0.42s 收到
+- 新 bitmap 那一批：最快要等第 2 趟補送，t ≈ 2.5s
+
+**落差約 2.1 秒，比規格「系統本質」點名的 400ms 逃脫窗口大**，而且大了五倍。
+原計畫寫的「150~200ms，遠小於 400ms」是錯的（見上面問題 2），這裡不沿用。
+
+**它仍然是可選項裡最好的一個，理由要連著讀：**
+
+- 唯一能讓落差歸零的做法是「不要在這個窗口切換」，而使用者按下全部關門的時機不受控；
+- 替代方案「中止切換、回到舊值」更糟：已經 ACK 並套用新 bitmap 的那些 slave 會
+  **等 30 秒**才由自己的失聯救援回來（決定 4），而那條路徑一定會先強制關閉繼電器。
+  30 秒 ≫ 2.1 秒；
+- 這個落差只在「繼電器指令剛好落在 ≤10 秒的握手窗口內」時出現，不是常態路徑。
+  常態路徑（`lrPhase == LR_IDLE`）的行為與現在**完全相同**。
+
+**這三點要逐字寫進 `ho_master1/readme.md`，不要只寫結論。**
+
+**重複點動的副作用是可接受的**：目標若已在點動中，補送的 `pulseRelay()` 只是重設計時器；
+`HO_CMD_OFF` 重送是冪等的。對籠門機構而言「多關一次」不會造成傷害，
 **這正是「關的可靠性優先於開」的取捨方向**（規格「系統本質」）。
 
-**防遞迴**：補送會再次呼叫 `sendCmdToAll()`／`sendCmdToSlave()`，而那兩支的開頭又會呼叫
-`lrNoteRelayCommand()`。**`lrNoteRelayCommand()` 只在 `lrPhase == LR_ANNOUNCING` 時作用**，
-補送發生時已經是 `LR_SETTLING`／`LR_VERIFYING`，不會再觸發第二次，迴圈自然封閉。
-（Task 4 Step 4 的程式碼與註釋要把這點寫死。）
+#### 掛鉤點（**這一段是本次修訂改動最大的地方，照抄舊計畫會掛錯**）
+
+| 位置 | 掛什麼 | 為什麼 |
+|---|---|---|
+| `sendCmdToAll()` **開頭** | `lrOnRelayCommandBegin()` | 只中止 `lrtest`、印一行，不阻塞 |
+| `sendCmdToAll()` 的**兩個出口**（空名冊早退那條、以及 inline 單播跑完設 `GROUP_JOB_WAIT` 之後） | `lrOnRelayCommandSent(nullptr, cmd, pulseMs)` | 「舊 bitmap 那一輪已經送完」之後才收尾切換。**兩個出口都要放** —— 只放一處的話，空名冊時握手會卡在 ANNOUNCING 等到 10 秒逾時 |
+| `sendCmdToSlaveIndex()`（序列埠 `on`／`off`／`pulse`） | 開頭 `lrOnRelayCommandBegin()`，取完 MAC、送出之後 `lrOnRelayCommandSent(mac, cmd, pulseMs)` | 單台路徑沒有 job，補送要自己記 MAC |
+| `handleSlaveCommand()` 的 `ON`／`OFF` 分支（MQTT 單台） | 同上 | 這條**原計畫完全沒提到**，但它是 App 控制單一籠門的正式路徑 |
+| **`sendCmdToSlaveMac()`** | **什麼都不要掛** | 它同時是群組 job **每一趟補送**的送出點（`groupSendUnicast()` 呼叫它）。掛在這裡會讓每一次補送都再觸發一次 LR 邏輯 —— 那正是原計畫「掛在 `sendCmdToSlave()` 第一行」在今天的程式碼上會產生的後果 |
+| `handleMasterCommand()` 的 `ON`／`OFF`（master 自己那顆繼電器） | 不掛 | 純本機 GPIO，不經 ESP-NOW，與 bitmap 無關。**但也因此它不會中止握手** —— 這是刻意的，不是遺漏 |
+
+**防遞迴（重寫）**：合併之後，群體路徑**不再重新呼叫 `sendCmdToAll()`**，原文那套
+「補送會再走進來但 `lrPhase` 已變」的論證大部分用不到了。
+仍然保留 `if (lrPhase != LR_ANNOUNCING) return;` 當作唯一的作用條件，
+它涵蓋的是單台補送那條路徑（補送發生時 `lrPhase` 已是 `LR_SETTLING`／`LR_VERIFYING`）。
+
+> **它擋不住什麼**：它不擋「握手期間連續來兩道繼電器指令」。第二道進來時握手已經結束，
+> 它就只是一道普通指令，照常送出、照常跑它自己的群組 job —— **那是對的行為，不是漏洞**。
+> 它也不擋「繼電器指令與 `LR_SETTLING`／`LR_VERIFYING` 重疊」：那兩個階段 master 已經是
+> 新 bitmap，指令照常送出，但**已經被落在後面的那些台（沒切換成功的）收不到**，
+> 要等驗證失敗回滾、或等它們自己的 30 秒救援。這一段沒有任何機制覆蓋，**必須寫進 readme**。
 
 ### 決定 3：切換完不算完 —— 10 秒主動驗證，不合格就自動回滾
 
@@ -461,6 +643,31 @@ ANNOUNCING 10.0s（上界）
 **為什麼用主動 `STATE_REQ` 而不是等 `pollNextSlave()`**：後者一輪 15 秒，
 20 台的話每台 750ms 才輪到一次，10 秒內只問得到 13 台。主動探測每 250ms 一台，
 10 秒可以問 40 次，20 台每台至少兩次機會。
+
+**但主動探測有一個原計畫沒看到的副作用（2026-08-18 補）：`HO_PKT_STATE_REQ` 是單播。**
+它的 MAC 層 ACK 會落進 `onEspNowSent()`，若此刻剛好有群組 job 在跑，就可能被
+`groupNoteUnicastAck()` 誤記成「群組指令已送達」——**與 C1 完全同一類的錯誤歸因**，
+而且方向是誤綠（把一扇沒收到指令的門標成已送達）。檔案裡已經有三處
+`groupCmdActive()` 讓路守衛（`pollNextSlave()`／`handleSlaveCommand()`／序列埠 `state <n>`），
+**LR 的驗證探測必須加上第四處**：
+
+```
+if (groupCmdActive()) 就這一輪不探測（但驗證窗照常倒數）
+```
+
+**為什麼是「不探測」而不是「暫停倒數」**：暫停倒數會把整條路徑的上界從 24.4 秒
+推到最多 30.4 秒（群組 job 的 6 秒硬上限加上去），**直接撞破 30 秒門檻**。
+不探測則完全不影響上界。
+
+**代價是什麼、為什麼可以接受**：群組 job 最長 6 秒，驗證窗 10 秒，
+所以最壞情況仍有 4 秒、約 16 次探測機會。而且**驗證需要的證據會自己送上門** ——
+`lrVerifyMask` 是在 `HO_PKT_STATE` 分支設的，而群組指令期間每一台執行完指令都會
+主動 `sendState()`，那些回報本來就會被記進去。**讓路不等於停止蒐證。**
+
+> **它擋不住什麼**：這道守衛只擋 LR 自己送出的探測。它不擋 slave 主動送來的封包所
+> 引發的回覆（例如 `HO_PKT_PAIR_ACK`），那個殘留窗口在 Phase 2b 就記錄過、本階段沒有改善。
+> 它也不保證驗證一定收得到足夠回報 —— 極端情況下（群組 job 佔滿 6 秒 ＋ 回報全丟）
+> 驗證會失敗並觸發一次回滾，那是**假警報造成的真中斷**，屬已知代價。
 
 **為什麼門檻是 60% 而不是 100%**：現場本來就會有一兩台因為訊號邊緣或剛好在點動而漏答。
 100% 會讓正常的切換被誤判成失敗而回滾，**而回滾本身也是一次射頻中斷** ——
@@ -523,6 +730,21 @@ ANNOUNCING 10.0s（上界）
 
 **每次失聯只救援一次**：`lrRescueTried` 旗標在收到心跳時清掉。
 否則會變成「每輪掃描都對調一次 LR」，把一個穩定的掃描過程變成抖動。
+
+**與 OTA 的關係（2026-08-18 補，原計畫寫於 slave 端 OTA 存在之前）**：
+救援路徑排在 `startChannelScan()` **之後**，而 `startChannelScan()` 現行的順序已經是
+「① 若 `relayState` 為 true 就關繼電器並印 `[安全] 失去 master，繼電器已關閉`
+→ ② `otaAbort("失去 master，開始輪掃")` → ③ 開始輪掃」。
+所以**救援發生時 OTA 一定已經被中止、`Update` 已經釋放**，對調射頻不會踩到寫入中的 flash。
+這是既有程式碼就成立的，本階段不需要為此新增任何東西 —— 但**要在 readme 與回歸清單裡
+寫明這個順序依賴**，因為它不是巧合而是被依賴的前提：日後若有人把 `otaAbort()` 移到
+救援之後，救援就會在 OTA 寫入進行中改射頻。
+
+> **順帶更正一個相關的常見誤述**：`startChannelScan()` **只在 `relayState` 為 true 時
+> 才關繼電器**。所以「失聯 30 秒 → 籠門被打開」這句話的精確版本是
+> 「**若當下繼電器是通電的**，失聯 30 秒會讓它斷電 ＝ 籠門被打開」。
+> 本計畫其他段落沿用簡寫是為了可讀性，但**回歸清單的判準必須用精確版本**，
+> 否則會出現「繼電器本來就是關的、清單卻要求看到 `[安全]` 訊息」這種假 FAIL。
 
 ### 決定 5：現場沒有 App 時的回滾 —— 三層，且最後一層是純韌體、不需要人
 
@@ -599,12 +821,88 @@ slave 現在會在失聯 30 秒後自己對調 LR 試一次，master 單方面�
 兩端的檢查都是 `payloadLen >= sizeof(HoHeartbeatPayload)`，所以
 
 - **新 master → 舊 slave**：舊 slave 檢查 `6 >= 4` 通過，`memcpy` 只取前 4 bytes → **相容**
-- **舊 master → 新 slave**：新 slave 檢查 `4 >= 6` 失敗 → **丟棄心跳 → 30 秒後強制關閉繼電器**
+- **舊 master → 新 slave**：新 slave 檢查 `4 >= 6` 失敗 → **丟棄心跳 → 30 秒後
+  `startChannelScan()`；若那台的繼電器當下是通電的，就會被強制關閉＝籠門被打開**
+  （精確版本：`startChannelScan()` 只在 `relayState` 為 true 時才關繼電器）
 
 **所以燒錄順序是有方向性的：先燒 master、再燒 slave。** 反過來會在中間那段時間開籠。
-（若 Phase 4 已執行過，`HO_ESPNOW_VERSION` 已是 2 且 CRC 涵蓋標頭；本階段
-**不再升版本號**，因為 payload 只增不減、接收端一律用 `>=`，屬向前相容的擴充。
-這條「payload 只增不減」的規則要寫進 `HoEspNowProtocol.h` 的註釋。）
+
+> **2026-08-18 更正兩件事：**
+> 1. `HO_ESPNOW_VERSION` **已經**是 2、CRC **已經**涵蓋標頭（Phase 4 Task 1 做完了），
+>    不再是「若 Phase 4 已執行過」的假設語氣。本階段**不升版本號**，
+>    因為 payload 只增不減、接收端一律用 `>=`，屬向前相容的擴充。
+>    這條「payload 只增不減」的規則要寫進 `HoEspNowProtocol.h` 的註釋。
+> 2. **「先 master 後 slave」這條規則有適用範圍，不能寫成通則。**
+>    它只適用於「兩端都已經是協定版本 2」的情況。
+>    **從版本 1 升到版本 2 是 flag-day，兩個方向都不相容**，
+>    `docs/phase4-flag-day-upgrade.md` 的裁決是「**兩種順序都有窗口、
+>    沒有安全的那一種**」，規定的程序是升級前先把籠門弄成不依賴繼電器保持的狀態。
+>    兩句話不衝突（前提不同），但**寫在一起時必須把前提講清楚**，
+>    否則會讓人以為 v1→v2 也可以照這個順序安全升級。
+
+### 決定 7：LR 切換與 OTA 互斥 —— master 先擋，slave 端以「保住同步」為最後手段
+
+**2026-08-18 新增。** 原計畫寫於 Phase 4 之前，完全沒有 OTA 這個概念；
+現在 `ho_slave1.ino` 有一整套 OTA 接收狀態機（`otaActive`／`otaSession`／
+`otaBlockMask`／`OTA_SLAVE_IDLE_MS = 30000`），**問題必須被回答**。
+
+**先把「會發生什麼」講清楚（不加任何機制的情況）：**
+
+1. slave 正在收 OTA（`otaActive == true`），此時 `HO_PKT_LR_SET` 進來。
+2. 依 Task 3 的設計，slave 回 ACK，50ms 後在 `loop()` 裡呼叫 `esp_wifi_set_protocol()`。
+3. 在 B 不成立的世界裡，那一瞬間它就聽不到還在舊 bitmap 的 master 了
+   （master 最後才切自己，見決定 1）。
+4. OTA_DATA 停止到達 → **兩個 30 秒計時器同時開始跑**：
+   - `OTA_SLAVE_IDLE_MS` → `otaAbort()`（韌體沒燒進去，開機分區沒切換，**這一項是可回復的**）
+   - `HEARTBEAT_TIMEOUT` → `startChannelScan()` → **若繼電器當下是通電的就會被強制關閉＝籠門被打開**
+5. 若 master 的握手在 10 秒內結束並成功切換，兩端會在 ≈11.8 秒後重新同步，
+   OTA 工作階段還沒逾時（30 秒），理論上還能續傳 —— 但那要 master 的 OTA 送出側
+   撐得過 12 秒的空窗，而**那一段程式碼還不存在，無從保證**。
+6. 若 master 驗證失敗回滾（決定 3），這台就一路走到 30 秒。
+
+**所以 OTA 一定會死，差別只在「籠門會不會跟著開」。** 決定如下：
+
+**第一道（主要）：master 端拒絕在 OTA 進行中開始 LR 切換。**
+`startLongRangeSwitch()` 開頭加一道守衛。
+
+> **這道守衛今天擋不住任何東西，必須誠實寫出來。**
+> master 的 OTA **送出側尚未實作**（Phase 4 只做到 Task 2，做的是 slave 接收側），
+> 所以現在沒有任何 master 端的變數可以查。做法二選一，**在 report 寫明用了哪一種**：
+> - **若 Phase 4 Task 3 以後已經落地**、master 有了 OTA 工作階段狀態：直接查它。
+> - **若還沒有**：**不要造一個假的守衛**（造一個永遠為 false 的條件 ＝ 宣稱一道不存在的防線，
+>   正是本專案 A 族病灶的形狀）。改成在 `startLongRangeSwitch()` 上方留一則
+>   具名 TODO 註釋 ＋ 在 `progress.md` 登記具名技術債
+>   「**master 端 OTA 送出側落地時，必須同時加上『OTA 進行中拒絕 LR 切換』與
+>   『LR 切換中拒絕開始 OTA』兩道守衛**」，並在 `ho_master1/readme.md` 的已知風險寫一行。
+
+**第二道（後備、本階段真的會寫的那一道）：slave 收到 `LR_SET` 時若 `otaActive`，
+先 `otaAbort()`，再回 ACK、再套用。**
+
+為什麼是「中止 OTA 去跟上切換」而不是「拒絕切換去保住 OTA」——把兩條路的後果攤開比：
+
+| | 中止 OTA、跟上切換（本案） | 拒絕切換、保住 OTA |
+|---|---|---|
+| OTA | 失敗，要重跑一次。**開機分區未切換，這台仍跑舊韌體，可回復** | master 10 秒後**照樣會切**（逾時仍套用，決定 1），這台變聾，OTA 一樣死 |
+| 心跳 | 與 master 同步，不會失聯 | 30 秒後失聯 |
+| 繼電器 | 不受影響 | **若當下通電就會被強制關閉＝籠門被打開** |
+| 版本 | 這台維持舊版，`list`／MQTT 的 fw 欄位看得出落差 | 同左 |
+
+**拒絕切換那一欄沒有任何一項比較好**，所以不需要再權衡。
+**中止 OTA 必須排在 `esp_wifi_set_protocol()` 之前**（不能一邊改射頻一邊還開著 `Update`）。
+`otaAbort()` **不碰繼電器**（它上方的註釋已經明講「關繼電器是失聯保護的職責，不是這裡」），
+所以這條路徑不會多關一次門。
+
+**第三道（反方向）：OTA 不得在 LR 切換中途開始。**
+slave 端在 `HO_PKT_OTA_BEGIN` 分支加一句：若 `lrPendingApply` 為 true，
+回 `HO_OTA_ERR_BUSY` 並且不建立工作階段 —— 「我 50ms 之後就要改射頻」是拒絕的正當理由。
+
+> **它擋不住什麼**：`lrPendingApply` 的窗口只有 `LR_APPLY_DELAY_MS`(50ms)，
+> 一則在那之前 1ms 抵達的 OTA_BEGIN 照樣會被接受，然後在 50ms 後被射頻切換打斷，
+> 由 30 秒的 `OTA_SLAVE_IDLE_MS` 收拾。**這道守衛把窗口從「整個切換流程」縮到
+> 「50ms 以外都沒守」，它是廉價的降險，不是保證。** 真正的保證來自第一道（master 端不啟動）。
+
+**失聯救援那條路徑不需要額外處理**：`startChannelScan()` 已經先關繼電器、再 `otaAbort()`，
+救援對調發生在那之後（見決定 4 的補充）。
 
 ---
 
@@ -635,11 +933,22 @@ Phase 2a 踩過「Task 引用尚未存在的函式」的坑，本計畫的做法
 
 ---
 
-## Task 1：用最小探針把三個未驗證的 IDF 行為量成事實
+## Task 1：用最小探針把五個未驗證的 IDF 行為量成事實
 
 **本 Task 刻意不實作任何功能。** Phase 2a 的教訓是「未驗證的 IDF 行為被寫成事實」
 會一路傳下去（`WiFi.begin()` 帶 channel 的掃描語義那次，錯的不只是註釋，
 連回歸清單的失敗判定都跟著錯）。所以 Phase 5 的第一件事是**先量**。
+
+> **2026-08-18 修訂：測項從三個變成五個。**
+> - **測項 D**（`esp_now_set_peer_rate_config()` 在本工具鏈可不可用）**本來就在 Step 3
+>   的骨架裡**，只是 Global Constraints 那張「未驗證的宣稱」表沒有列它，
+>   造成標題寫「三個」、內文其實有四個。已把它補進那張表。
+> - **測項 E**（開了 LR 之後 BLE 廣播還在不在）是危害 D 更正之後浮出來的新未知：
+>   master 的配網管道是 BLE 不是 SoftAP，**如果 LR 會影響 BLE 廣播，那才是本專案
+>   真正的變磚路徑**（配不了網，而 LR 位元存在 NVS、重燒清不掉）。
+>   探針要多一個 `ble on` 指令：`BLEDevice::init()` + 開始廣播，然後用手機的 BLE 掃描 App
+>   在 `proto bgn` 與 `proto bgnlr` 兩種狀態下各掃一次。
+>   **這一項的觀測端在手機上，不在序列埠**，findings 文件要留這個欄位。
 
 探針刻意**不使用** `HoEspNowProtocol`：它要量的是底層射頻行為，
 若共用了會隨 Phase 4／Phase 5 改動的協定函式庫，量出來的東西就分不清是誰造成的。
@@ -661,10 +970,15 @@ Phase 2a 踩過「Task 引用尚未存在的函式」的坑，本計畫的做法
 ```cpp
 // 齁控 Long Range 行為探針 —— Phase 5 Task 1
 //
-// 這不是產品韌體，是一支只為了回答三個問題而存在的量測工具：
+// 這不是產品韌體，是一支只為了回答五個問題而存在的量測工具：
 //   A. esp_wifi_set_protocol() 在「已關聯 AP」的狀態下呼叫，會不會造成 STA 斷線？
+//      （文件已明說會，所以真正要量的是「斷多久、MQTT 多久回來」）
 //   B. 兩端 protocol bitmap 不同時（一端有 LR、一端沒有），ESP-NOW 到底還通不通？
 //   C. ESP32-C3 到底支不支援 WIFI_PROTOCOL_LR？
+//   D. esp_now_set_peer_rate_config() 在 Arduino core 3.3.7 這條工具鏈上編不編得過、
+//      呼叫成不成功？（規格「難點 2」把它列為備案，但從沒人試過）
+//   E. 打開 LR 位元之後，BLE 廣播還在不在？
+//      —— master 唯一的配網管道是 BLE，這一項若不成立就是變磚路徑
 //
 // 為什麼要有這支東西：Phase 2a 已經因為「未驗證的 IDF 行為被寫成事實」踩過一次，
 // 錯的不只是註釋，連回歸清單的失敗判定都跟著錯，會讓實測者把正確行為判成 FAIL。
@@ -872,6 +1186,8 @@ void printHelp() {
 #if PROBE_TEST_PEER_RATE
   Serial.println("  rate                嘗試 esp_now_set_peer_rate_config(LR,250K)");
 #endif
+  // 測項 E：開了 LR 之後 BLE 廣播還在不在（觀測端在手機的 BLE 掃描 App，不在序列埠）
+  Serial.println("  ble on              啟動 BLE 廣播（名稱 hoban-lrprobe），用手機掃描驗證");
   Serial.println("  help                顯示這份說明");
 }
 
@@ -1088,6 +1404,35 @@ A:\server\arduino-cli\arduino-cli.exe compile --fqbn esp32:esp32:esp32 --librari
 `peer <mac>` → `rate` → 記錄回傳值。
 若必須把 `PROBE_TEST_PEER_RATE` 改成 0 才編得過，**那本身就是結論**，照實記錄。
 
+**測項 E：LR 位元打開之後 BLE 廣播還在不在**（2026-08-18 新增，**觀測端在手機上**）
+
+為什麼要測：`ho_master1` 沒有 SoftAP，配網唯一的管道是 BLE（`setupBLE()`）。
+如果 LR 位元會讓 BLE 廣播消失或掃不到，那就是本專案真正的變磚路徑 ——
+開了 LR 之後配不了網，而 LR 位元存在 NVS、重燒韌體與 erase 都清不掉（危害 E）。
+
+1. 探針加一個 `ble on` 指令：`BLEDevice::init("hoban-lrprobe")` → `createServer()`
+   → `getAdvertising()->start()`（照 `ho_master1.ino` 的 `setupBLE()` 寫法，
+   不需要 characteristic 的實際功能，**只要廣播得出去**）
+2. `proto bgn` → 手機用任一支 BLE 掃描 App 找 `hoban-lrprobe`，記錄「找得到／RSSI」
+3. `proto bgnlr` → **等 30 秒** → 再掃一次，記錄
+4. `proto lr`（純 LR）→ 再掃一次，記錄
+5. 兩顆晶片（WROOM 與 C3）各做一次 —— BLE 堆疊不同（Bluedroid vs NimBLE 設定可能不同）
+
+| protocol | BLE 掃得到？ | 手機端 RSSI | 備註 |
+|---|---|---|---|
+| bgn | | | 基準線 |
+| bgnlr | | | **← 這一格就是測項 E** |
+| lr（純） | | | |
+
+> **判讀規則**：`bgnlr` 那一格掃不到 → **停下來回報**，Phase 5 不得預設開啟 LR，
+> 且 readme 的已知風險必須把「開 LR 之後無法重新配網」列為第一條。
+> 掃得到 → 只能寫成「在本次實測的兩顆晶片、這條工具鏈上沒有觀察到影響」，
+> **不得寫成「LR 不影響 BLE」** —— 沒觀察到不等於不存在。
+>
+> **這一項擋不住什麼**：它量的是「廣播發不發得出去」，**不量**配網流程的其他部分
+>（GATT 連線建立、寫入 characteristic、之後 `ESP.restart()` 再關聯 AP）。
+> 完整的配網流程要到 Task 6 的回歸清單第 25 項才會被走過一次。
+
 文件最後留一節「對 Phase 5 設計的影響（實測後回填）」，
 明確列出每個測項的結果會改動計畫的哪一個決定。
 
@@ -1278,12 +1623,25 @@ void saveLongRange(bool enable) {
   Serial.printf("[LR] 開機載入設定：%s\n", longRangeEnabled ? "開啟" : "關閉");
 ```
 
-`setup()` 在 `registerAllPeers();` **之後**、`WiFi.onEvent(onWiFiEvent);` **之前**插入：
+`setup()` 的插入位置（**2026-08-18 更正**：原文寫「`registerAllPeers();` 之後、
+`WiFi.onEvent(onWiFiEvent);` 之前」，那中間現在還夾著 Phase 4 的
+`nextCmdId = (uint16_t)esp_random();` 那一段。精確的位置是
+**`nextCmdId` 那段之後、`WiFi.onEvent(onWiFiEvent);` 之前**；
+兩者都要在 `setupEspNow()` 之後、`connectToWiFi()` 之前，順序不衝突）：
+
 ```cpp
   // 套用 LR 必須排在 setupEspNow() 之後（esp_wifi_set_protocol() 需要 WiFi 已 start，
   // 而 setupEspNow() 第一行的 WiFi.mode(WIFI_STA) 才會 start 它），
   // 也必須排在 connectToWiFi() 之前 —— 讓關聯 AP 這件事一開始就用最終的 bitmap 進行，
   // 避免「先關聯、再改 protocol」這條 Task 1 測項 A 正在驗證的可疑路徑在開機時就走一次。
+  //
+  // else 分支**不可以是空的**（危害 E）：LR 位元存在 NVS，重燒韌體與 erase 都清不掉，
+  // 「不呼叫」不等於「沒有 LR」，它等於「沿用上一次殘留的狀態」。
+  //
+  // **它擋不住什麼**：這裡只設 WIFI_IF_STA 這個介面。「STA 與 softAP 共用同一個 LR 位元」
+  // 是 esp-idf#9978 維護者的說法、本專案沒有驗證過；今天的 master 不開 SoftAP 所以
+  // 觀察不到差別，但那是「觀察不到」不是「已排除」。
+  // 另外，在這一行執行之前的開機時間裡，射頻沿用的仍然是 NVS 殘留值。
   if (longRangeEnabled && !applyLongRange(true)) {
     Serial.println("⚠ [LR] 開機套用失敗，強制視為關閉（NVS 一併更正，避免每次開機都失敗一次）");
     longRangeEnabled = false;
@@ -1399,13 +1757,25 @@ const unsigned long LR_RESCUE_DWELL_MS = 3000;
 - [ ] **Step 2: `HO_PKT_LR_SET` 分支（先回 ACK、後套用）**
 
 插在 `onEspNowRecv()` 的「只接受已配對 master 的控制指令」那道 guard **之後**、
-`HO_PKT_CMD` 分支**之前**：
+`HO_PKT_CMD` 分支**之前**。
+
+> **2026-08-18 補：那道 guard 與 `HO_PKT_CMD` 分支之間，現在還夾著 Phase 4 Task 2 的
+> `lastHeartbeatTime = millis();`（OTA 期間的失聯保護：任何來自已配對 master 的封包
+> 都算存活證據）。新分支要放在**那一行之後**，這樣 `LR_SET` 本身也會刷新失聯計時 ——
+> 那是對的：它確實是 master 還活著、而且與本機同 channel 的證據。
 
 ```cpp
   if (header.type == HO_PKT_LR_SET && payloadLen >= sizeof(HoLrPayload)) {
     HoLrPayload p;
     memcpy(&p, payload, sizeof(p));
     bool target = (p.longRange == 1);
+
+    // ── 決定 7：OTA 進行中收到 LR_SET ──
+    // **這裡刻意不呼叫 otaAbort()**：它內部是 Update.abort()（動 flash）＋序列埠輸出，
+    // 屬本計畫「安全鐵則」明文禁止在 ESP-NOW callback 裡做的冗長操作。
+    // 中止動作與射頻套用一起放在 loop()（Step 4），那也是唯一的套用點，
+    // 涵蓋 LR_SET、心跳對齊兩條路徑，不會漏。
+    // 完整的取捨比較見計畫「決定 7」。
 
     // ── 順序極重要：先回 ACK，後套用 ──
     // 若兩端 bitmap 不同時真的收不到彼此（Task 1 測項 B 不成立的世界），
@@ -1430,6 +1800,29 @@ const unsigned long LR_RESCUE_DWELL_MS = 3000;
     return;
   }
 ```
+
+**同一步的反方向（決定 7 第三道）**：`HO_PKT_OTA_BEGIN` 分支的最前面加一句 ——
+
+```cpp
+    // 決定 7：50ms 之後就要改射頻，此時開一個 OTA 工作階段沒有意義。
+    // 回 HO_OTA_ERR_BUSY 讓 master 知道要稍後再來，而不是讓它送完幾百包才發現斷了。
+    if (lrPendingApply) {
+      otaSendAck(0, 0, HO_OTA_ERR_BUSY);
+      Serial.println("[OTA] LR 切換即將套用，本次工作階段拒絕");
+      return;
+    }
+```
+
+> **它擋不住什麼**：`lrPendingApply` 的窗口只有 `LR_APPLY_DELAY_MS`(50ms)。
+> 一則在那之前 1ms 抵達的 `OTA_BEGIN` 照樣會被接受，然後在 50ms 後被射頻切換打斷，
+> 最後由 30 秒的 `OTA_SLAVE_IDLE_MS` 收拾。**這道守衛把「完全沒守」改善成
+> 「50ms 以外沒守」，是廉價的降險而不是保證。** 真正的保證來自 master 端不啟動
+> （決定 7 第一道），而那一道**今天還不存在**。
+>
+> **實作注意**：`otaSendAck()` 的第一個參數是 `blockBase`、第二個是 `mask`，
+> 且它內部用的是 `otaSession` 而不是收到的 `bg.sessionId` —— 照現行程式碼裡
+> 「已有工作階段進行中，拒絕」那一段的寫法（暫時借用 `otaSession` 回完立刻還原）
+> 處理，**動手前先讀那一段**，不要照抄本計畫的參數。
 
 - [ ] **Step 3: 心跳是唯一權威（自癒 + 救援收尾，合成同一條規則）**
 
@@ -1464,7 +1857,11 @@ const unsigned long LR_RESCUE_DWELL_MS = 3000;
 
 - [ ] **Step 4: `loop()` 消化待辦的套用**
 
-放在 `updateBlink(now);` 那一段之後：
+放在 `updateBlink(now);` 那一段之後 —— **並且必須在 `if (scanning) { … return; }` 之前**。
+（現行 `loop()` 的順序是：按鈕 → `updateBlink()` → 配對請求逾時 → `if (scanning)` →
+點動結束 → OTA 逾時 → 失聯門檻。放到 `if (scanning)` 之後的話，
+輪掃期間所有待辦的套用都會被那個 early return 吃掉 ——
+而輪掃期間正是最需要把 LR 套對的時候。）
 
 ```cpp
   // ── 消化 ESP-NOW callback 登記的 LR 套用（Task 3 Step 1 的理由）──
@@ -1472,6 +1869,18 @@ const unsigned long LR_RESCUE_DWELL_MS = 3000;
     lrPendingApply = false;
     bool target = (lrPendingValue == 1);
     bool needSave = lrPendingNeedSave;
+
+    // ── 決定 7：改射頻之前一定要先把 OTA 收掉 ──
+    // 不能一邊改射頻一邊還開著 Update。這裡是**唯一**的套用點，
+    // LR_SET 與心跳對齊兩條路徑都會走到，所以只需要寫這一次。
+    // 為什麼是「中止 OTA 去跟上切換」而不是「拒絕切換去保住 OTA」：
+    // master 逾時 10 秒後照樣會切，拒絕保不住 OTA，只會多換來一次失聯 ——
+    // 而失聯 30 秒後若繼電器當下是通電的就會被強制關閉＝籠門被打開。
+    // Update.abort() 不切換開機分區，這台維持舊韌體，重跑一次 OTA 即可，是可回復的。
+    // otaAbort() **不碰繼電器**，這條路徑不會多關一次門。
+    if (otaActive) {
+      otaAbort("LR 設定要變更，先中止 OTA 以保持與 master 同步");
+    }
 
     // 先寫 EEPROM 再套用：萬一套用的當下斷電，重開機會用新值，
     // 與 master（它最後才切自己）一致；反過來則會不一致。
@@ -1557,21 +1966,40 @@ commit 訊息必須包含：為什麼 ACK 一定要在套用之前送、為什�
 **Interfaces:**
 - Consumes：Task 2 的 `applyLongRange()`／`saveLongRange()`／`lrRadioValue`／`HoLrPayload`；
   既有的 `espNowSendTo()`／`sendHeartbeat()`／`espNowDelay()`／`findSlave()`／
-  `requestSlaveState()`／`sendCmdToSlave()`／`sendCmdToAll()`／`onWifiChannelMayHaveChanged()`／
-  `publishStatus()`／`buildStatusDoc()`
-- Produces（Task 5 依賴）：`lrPhase`／`lrHeartbeatBurst()`／`lrNoteRelayCommand()`／
+  `onWifiChannelMayHaveChanged()`／`publishStatus()`／`buildStatusDoc()`，
+  以及 **2026-08-18 更正過名字的這幾支**：
+  - `requestSlaveStateMac(const uint8_t mac[6])` / `requestSlaveStateIndex(int idx)`
+    （原計畫寫的 `requestSlaveState()` **不存在**）
+  - `sendCmdToSlaveMac(const uint8_t mac[6], HoRelayCmd, uint16_t pulseMs, uint16_t cmdId)`
+    / `sendCmdToSlaveIndex(int idx, HoRelayCmd, uint16_t pulseMs)`
+    （原計畫寫的 `sendCmdToSlave()` **已被刪除**）
+  - `sendCmdToAll(HoRelayCmd, uint16_t pulseMs)`（**內部已改成廣播三段流程 ＋ 群組 job**）
+  - 群組 job 的 `groupCmdActive()`（新增的單播送出點都要拿它讓路）
+- Produces（Task 5 依賴）：`lrPhase`／`lrHeartbeatBurst()`／
+  `lrOnRelayCommandBegin()`／`lrOnRelayCommandSent()`／
   狀態 JSON 的 `long_range_pending`／`long_range_error`
 
 ---
 
-- [ ] **Step 0: 核對 `handleMasterCommand()` 是否存在**
+- [ ] **Step 0: 核對指令接點與既有函式名（原本只核對一件事，現在要核對四件）**
 
 ```
 grep -n "void handleMasterCommand" ho_master1/ho_master1.ino
+grep -n "startsWith(\"LR:\")"      ho_master1/ho_master1.ino
+grep -n "sendCmdToSlaveMac\|sendCmdToSlaveIndex\|requestSlaveStateMac\|requestSlaveStateIndex" ho_master1/ho_master1.ino
+grep -n "groupCmdActive\|GROUP_JOB_MAX_MS"  ho_master1/ho_master1.ino
 ```
-找到 → 走 **4-A**（Step 8 的第一種接法）。找不到 → 走 **4-B**。
-**不要為了配合本計畫去重構 `mqttCallback()`** —— 那是 Phase 2b Task 4 的工作範圍。
-**report 必須寫明用了哪一種。**
+
+**2026-08-18 的實際狀態（開工時仍要自己跑一次上面四條）：**
+
+- `handleMasterCommand()` **存在** → 走 **4-A**。**4-B 那條已作廢，不要再看它。**
+- 它的 else-if 鏈裡**已經有一個 `message.startsWith("LR:")` 佔位分支**，只印
+  「[LR] 指令尚未實作（Task 6）」。**Step 8 是取代它，不是在它後面加**
+  —— 加在後面的分支永遠進不去，而且**編譯不會報錯**，這是最惡劣的失敗型態。
+- 那個佔位分支上方的註釋也寫著「唯一還沒長的是 LR:」，一併更新。
+- 若上面任何一條 grep 的結果與這裡寫的不同，**停下來回報**，不要自己猜。
+- **不要為了配合本計畫去重構 `mqttCallback()`。**
+- **report 必須寫明實際看到的是哪一種。**
 
 - [ ] **Step 1: 常數與時間預算（含把預算鎖在編譯期的 `static_assert`）**
 
@@ -1619,6 +2047,16 @@ static_assert(LR_ANNOUNCE_TIMEOUT_MS + LR_SETTLE_MS + LR_VERIFY_WINDOW_MS
               "請縮小 LR_ANNOUNCE_TIMEOUT_MS 或 LR_VERIFY_WINDOW_MS");
 ```
 
+> **這個 `static_assert` 擋不住什麼（2026-08-18 補，原文沒寫）：**
+> - 它只算 LR 自己那條路徑。**群組指令的 job（最長 `GROUP_JOB_MAX_MS = 6000`）
+>   不在這個算式裡**，而緊急插隊時兩者會重疊。重疊路徑的時間帳寫在「決定 2」，
+>   要靠人工重算，編譯期抓不到。
+> - 它算的是**常數的和**，不是實際耗時。任何一次 `mqttClient.publish()` 的
+>   10 秒級阻塞、或 `connectToWiFi()` 的 15 秒，都不在裡面。
+>   真正的最後防線仍然是 slave 自己的 30 秒門檻，不是這一行。
+> - `LR_BURST_COST_MS` 用 `HEARTBEAT_BURST_COUNT`／`HEARTBEAT_BURST_GAP` 推導，
+>   所以那兩個常數變了它會跟著變 —— 這一點是真的有連動，不是宣稱。
+
 - [ ] **Step 2: 全域狀態**
 
 ```cpp
@@ -1653,12 +2091,22 @@ int lrSendIdx = 0;
 //    目前使用的字串：no_online_slave(15)／verify_failed(13)／boot_guard(10)／apply_failed(12)
 char lrLastError[20] = "";
 
-// ── 緊急插隊（計畫「決定 2」）──
+// ── 緊急插隊（計畫「決定 2」，2026-08-18 改寫）──
+//
+// **只服務「單台」那條路徑。** 群體（sendCmdToAll）的補送完全交給既有的群組 job：
+// processGroupCmd() 的第 2、3 趟本來就只打「沒拿到 MAC 層 ACK 的那些台」，
+// 在宣稱 B 不成立時那正好就是「已經切到新 bitmap 所以聽不到舊 bitmap 單播」的那些台。
+// 再長一套重試出來，會作廢還在跑的 job、換掉 cmdId、讓兩個計時器互相看不見
+//（完整理由見計畫「決定 2」）。
+//
+// **目標用 MAC 不用索引**：全檔的索引式 ESP-NOW 送出路徑已被刻意移除，
+// 因為索引在阻塞或被 WiFi task 搶佔之後會失效，後果是**開錯門**。
+// 原計畫的 `lrResendIdx` 是索引式，這裡改掉。
 bool          lrResendPending = false;
 unsigned long lrResendAt      = 0;
 uint8_t       lrResendCmd     = 0;
 uint16_t      lrResendPulseMs = 0;
-int           lrResendIdx     = -1;   // -1 = 全體
+uint8_t       lrResendMac[6]  = { 0 };
 
 // ── 開機守衛（計畫「決定 5」第 2 層）──
 unsigned long lrBootGuardStart = 0;
@@ -1709,6 +2157,22 @@ void startLongRangeSwitch(bool target) {
     Serial.println("[LR] 上一次切換尚未結束，忽略本次指令");
     return;
   }
+  // ── 群組指令進行中不開始切換（2026-08-18 新增）──
+  // 兩個理由，各自都足夠：
+  //   (a) LR_SET 是單播，會污染群組指令的 ACK 歸因閂鎖（誤綠方向）；
+  //   (b) 使用者剛下過一道「全部關」，那是這套系統最重要的動作，
+  //       不該在它還在補送的時候插進一次射頻切換。
+  // 群組 job 有 GROUP_JOB_MAX_MS(6000) 硬上限，最多只擋這麼久。
+  if (groupCmdActive()) {
+    Serial.println("[LR] 群組指令進行中，拒絕切換（最多 6 秒，請稍後再下一次）");
+    return;
+  }
+  // ── 決定 7：OTA 進行中不開始切換 ──
+  // **master 端的 OTA 送出側目前尚未實作**（Phase 4 只做到 Task 2 的 slave 接收側），
+  // 所以這裡沒有東西可以查。**不要造一個永遠為 false 的假守衛** ——
+  // 那等於宣稱一道不存在的防線。做法見計畫「決定 7」第一道：
+  // 若 Phase 4 Task 3 以後已落地就查它的工作階段狀態；還沒落地就留具名 TODO，
+  // 並在 progress.md 與 readme 登記技術債。**report 必須寫明用了哪一種。**
   if (target == longRangeEnabled) {
     Serial.printf("[LR] 已經是%s狀態，不需切換\n", target ? "開啟" : "關閉");
     publishStatus();
@@ -1794,52 +2258,92 @@ void finishAnnouncing(const char* why) {
   publishStatus();
 }
 
-// 繼電器指令在 LR 握手期間進來時要做的事（計畫「決定 2」）。
+// ── 繼電器指令與 LR 握手的交會點（計畫「決定 2」，2026-08-18 整段改寫）──
 //
-// 呼叫點只有兩個：sendCmdToSlave() 與 sendCmdToAll() 的**開頭**。
-// 本函式「不」送指令 —— 送出仍由呼叫端照原本的流程做。它只負責把切換立刻收尾、
-// 並安排一次補送。
+// 拆成兩支，**因為時機不同、能做的事也不同**：
 //
-// 為什麼要補送：在 Task 1 測項 B 不成立的世界裡，指令進來的那一刻名冊已經裂成
-// 兩半 —— 已 ACK 的在新 bitmap、還沒 ACK 的在舊 bitmap，而 master 還在舊 bitmap
-// （它最後才切）。呼叫端用舊 bitmap 送出的那一次只打得到後者。所以：
-//   1. 呼叫端立刻用舊 bitmap 送 → 打到還沒 ACK 的那些台
-//   2. 這裡立刻收尾切換（套用新 bitmap）
-//   3. LR_RESEND_GAP_MS 後補送一次 → 打到已 ACK 的那些台
-// 兩次相隔約 150~200ms，遠小於 Phase 1 sendCmdToAll() 逐台單播就會產生的 400ms
-// 落差（規格「系統本質」點名那半秒是動物的逃脫窗口），所以沒有把落差擴大到
-// 規格已經明確拒絕的量級。
+//   lrOnRelayCommandBegin()  在「送出之前」呼叫。只做不阻塞、不動射頻的事。
+//   lrOnRelayCommandSent()   在「舊 bitmap 那一輪已經送完」之後呼叫。這一支會阻塞
+//                            1.2 秒以上（兩次心跳連發 ＋ esp_wifi_set_protocol）。
 //
-// 為什麼不是「中止切換、回到舊值」：那看起來更保守其實更糟 —— 已經 ACK 並套用
-// 新 bitmap 的那些 slave 會永久聽不到 master，只能等自己的 30 秒門檻觸發救援
-//（那條路徑一定會先關繼電器）。中止＝把一半的門丟給 30 秒後自救；
-// 切完再補送＝150ms 後全部覆蓋到。
+// **為什麼一定要拆**：原計畫只有一支、掛在 sendCmdToAll() 的第一行，於是
+// 1.2 秒的射頻切換被插在這套系統最不能延後的那一道指令前面 ——
+// 而它自己的文字寫的是「1. 先送 → 2. 才收尾切換」。文字與掛鉤點互相矛盾。
+
+// 送出之前：唯一該做的是讓實測工具讓路。控制是主要的，量測是次要的。
+void lrOnRelayCommandBegin() {
+  // ⚠ Task 5 會在這裡加一行 abortLrTest("收到繼電器指令");
+  //   **Task 4 階段刻意什麼都不寫，也不要先放一支空的 abortLrTest()** ——
+  //   一支永遠什麼都不做的函式看起來像一道防線，那正是本專案 A 族病灶的形狀。
+  //   Task 5 建立 lrtest 的同時再把這一行補上。
+  if (lrPhase != LR_ANNOUNCING) return;
+  Serial.println("[LR] 握手期間收到繼電器指令 —— 安全指令優先於 LR，"
+                 "指令照常立刻送出，送完立刻結束握手");
+}
+
+// 舊 bitmap 那一輪送完之後：立刻結束握手並套用新 bitmap。
 //
-// 防遞迴：補送會再次呼叫 sendCmdToAll()／sendCmdToSlave()，因而再次走進本函式，
-// 但那時 lrPhase 已經是 LR_SETTLING／LR_VERIFYING，第一行的檢查就會 return，
-// 迴圈自然封閉。**這一行檢查同時是功能條件也是防遞迴，不可以改成別的判斷。**
-void lrNoteRelayCommand(HoRelayCmd cmd, uint16_t pulseMs, int idx) {
+// mac == nullptr 代表「這是群體指令」：**不安排任何補送**，
+// 因為 processGroupCmd() 的第 2、3 趟本來就會補，而且它補的目標
+//（沒拿到 MAC 層 ACK 的那些台）在宣稱 B 不成立時正好就是已經切過去的那些台。
+// 再排一次補送＝再呼叫一次 sendCmdToAll()＝groupCmdSnapshot() 把還在跑的 job
+// 整個作廢、換一個新 cmdId、重設 6 秒上限。**兩套重試會互相吃掉對方。**
+//
+// mac != nullptr 代表「這是單台指令」：單台路徑沒有 job 可以借力，
+// 所以這裡自己排一次 LR_RESEND_GAP_MS 之後的補送，目標用 MAC 記。
+//
+// 防遞迴：單台補送會再走進 sendCmdToSlaveIndex()／handleSlaveCommand() 的掛鉤，
+// 但那時 lrPhase 已經是 LR_SETTLING／LR_VERIFYING，第一行的檢查就會 return。
+// **這一行檢查同時是功能條件也是防遞迴，不可以改成別的判斷。**
+void lrOnRelayCommandSent(const uint8_t* mac, HoRelayCmd cmd, uint16_t pulseMs) {
   if (lrPhase != LR_ANNOUNCING) return;
 
-  Serial.println("[LR] 握手期間收到繼電器指令 —— 安全指令優先於 LR，"
-                 "立刻結束握手，套用後再補送一次同一道指令");
-  lrResendCmd     = (uint8_t)cmd;
-  lrResendPulseMs = pulseMs;
-  lrResendIdx     = idx;
-  lrResendPending = true;
+  if (mac != nullptr) {
+    memcpy(lrResendMac, mac, 6);
+    lrResendCmd     = (uint8_t)cmd;
+    lrResendPulseMs = pulseMs;
+    lrResendPending = true;
+  }
 
   finishAnnouncing("被繼電器指令插隊");
-  lrResendAt = millis() + LR_RESEND_GAP_MS;   // 必須在 finishAnnouncing() 之後取時間
+
+  // 必須在 finishAnnouncing() **之後**取時間：那支函式裡的
+  // applyLongRangeWithBurst() 會走掉 1.2 秒以上，先取會讓補送在套用完成的
+  // 那一瞬間就到期，等於沒有間隔。
+  if (lrResendPending) lrResendAt = millis() + LR_RESEND_GAP_MS;
 }
 ```
 
-`sendCmdToSlave()` 與 `sendCmdToAll()` 的**第一行**各加一句：
-```cpp
-  lrNoteRelayCommand(cmd, pulseMs, idx);   // sendCmdToSlave()
-  lrNoteRelayCommand(cmd, pulseMs, -1);    // sendCmdToAll()
-```
-> `sendCmdToAll()` 會逐台呼叫 `sendCmdToSlave()`，所以本函式會被呼叫兩次以上。
-> 它是冪等的（第二次進來時 `lrPhase` 已不是 `LR_ANNOUNCING`），不需要額外去重。
+#### 掛鉤點（**照舊計畫掛會掛錯，逐格對照**）
+
+| 檔案位置 | 掛什麼 |
+|---|---|
+| `sendCmdToAll()` 開頭（`groupCmdSnapshot()` 之前） | `lrOnRelayCommandBegin();` |
+| `sendCmdToAll()` 的**空名冊早退分支**，在 `return;` 之前 | `lrOnRelayCommandSent(nullptr, cmd, pulseMs);` |
+| `sendCmdToAll()` 的**正常結尾**，在設 `groupJob.phase = GROUP_JOB_WAIT;` 與那行 `Serial.printf` 之後 | `lrOnRelayCommandSent(nullptr, cmd, pulseMs);` |
+| `sendCmdToSlaveIndex()`：`memcpy(mac, slaves[idx].mac, 6);` 之後、`sendCmdToSlaveMac()` 之前 | `lrOnRelayCommandBegin();` |
+| `sendCmdToSlaveIndex()`：`sendCmdToSlaveMac(...)` 之後 | `lrOnRelayCommandSent(mac, cmd, pulseMs);` |
+| `handleSlaveCommand()` 的 `ON`／`OFF` 兩個分支（MQTT 單台控制） | 同上兩行，包住那句 `sendCmdToSlaveMac()` |
+| **`sendCmdToSlaveMac()`** | **一個字都不要加** |
+| `handleMasterCommand()` 的 `ON`／`OFF`（master 自己那顆繼電器） | 不掛 |
+
+> **`sendCmdToSlaveMac()` 為什麼不能掛**：它同時是群組 job **每一趟補送**的送出點
+> （`groupSendUnicast()` 呼叫它）。掛在這裡等於每補送一台就再觸發一次 LR 邏輯 ——
+> 這正是原計畫「掛在 `sendCmdToSlave()` 第一行」在今天的程式碼上會產生的後果。
+>
+> **`sendCmdToAll()` 為什麼兩個出口都要掛**：只掛正常結尾的話，
+> 名冊為空時會從早退分支離開，握手不會結束，會一路等到 10 秒逾時 ——
+> 而使用者剛剛才按了「全部關門」，此時多等 10 秒完全沒有理由。
+>
+> **master 自己那顆繼電器為什麼不掛**：`handleMasterCommand()` 的 `ON`／`OFF`
+> 只寫本機 GPIO，不經 ESP-NOW，與 bitmap 無關。**代價是它不會中止握手** ——
+> 這是刻意的取捨，不是遺漏：為了一個不需要無線電的動作去打斷一次射頻切換，
+> 買不到任何安全性。
+>
+> **這一整組掛鉤擋不住什麼**：它只覆蓋 `LR_ANNOUNCING`。
+> 指令若落在 `LR_SETTLING`／`LR_VERIFYING`（最長 12 秒），master 已經是新 bitmap，
+> 指令照常送出，但**還沒切換成功的那些台收不到**，只能等驗證失敗回滾、
+> 或等它們自己的 30 秒救援。**這一段沒有任何機制覆蓋，必須寫進 readme。**
 
 - [ ] **Step 5: 驗證與回滾**
 
@@ -1879,12 +2383,21 @@ void finishVerify(bool ok, int replied, int need) {
 }
 
 void updateLongRangeSwitch(unsigned long now) {
-  // 緊急補送（決定 2 的第 3 步）優先於一切
+  // ── 單台指令的補送（決定 2）優先於一切 ──
+  // **群體指令不走這裡**：它的補送是既有的 processGroupCmd() 第 2、3 趟，
+  // 那一套本來就只打「沒拿到 MAC 層 ACK 的那些台」，目標集合與這裡要補的完全一致。
+  // 在這裡再呼叫一次 sendCmdToAll() 會 groupCmdSnapshot() 把還在跑的 job 作廢、
+  // 換掉 cmdId、重設 6 秒上限 —— 兩套重試互相吃掉對方。
+  //
+  // 用 MAC 不用索引：索引在這 150ms 之間可能已經因為 WiFi task 的 HO_PKT_UNPAIR
+  // 前移 slaves[] 而指到別台，後果是**開錯門**。sendCmdToSlaveMac() 自己會用
+  // findSlave() 確認那台還在名冊上，不在就放棄並印一行。
   if (lrResendPending && (long)(now - lrResendAt) >= 0) {
     lrResendPending = false;
-    Serial.println("[LR] 補送剛才那道繼電器指令（覆蓋在握手期間已經切換過去的那些台）");
-    if (lrResendIdx < 0) sendCmdToAll((HoRelayCmd)lrResendCmd, lrResendPulseMs);
-    else                 sendCmdToSlave(lrResendIdx, (HoRelayCmd)lrResendCmd, lrResendPulseMs);
+    Serial.println("[LR] 補送剛才那道單台繼電器指令（覆蓋握手期間已經切換過去的那台）");
+    // 一道新的邏輯指令配一個新的 cmdId：這確實是第二次送出，
+    // 誠實給新編號，讓 slave 回報的 lastCmdId 對得上實際發生的事。
+    sendCmdToSlaveMac(lrResendMac, (HoRelayCmd)lrResendCmd, lrResendPulseMs, allocCmdId());
   }
 
   if (lrPhase == LR_ANNOUNCING) {
@@ -1894,6 +2407,11 @@ void updateLongRangeSwitch(unsigned long now) {
     }
     if (allAcked) { finishAnnouncing("全部確認"); return; }
     if (now - lrPhaseStart >= LR_ANNOUNCE_TIMEOUT_MS) { finishAnnouncing("等待逾時"); return; }
+
+    // LR_SET 也是單播，同樣會污染群組指令的 ACK 歸因閂鎖，同樣讓開。
+    // 正常流程走不到這裡（繼電器指令會在 sendCmdToAll() 結尾就把握手收掉），
+    // 這是第二道防線，理由與下方 LR_VERIFYING 那道相同。
+    if (groupCmdActive()) return;
 
     if (now - lrLastSendAt < LR_SEND_GAP_MS) return;
     lrLastSendAt = now;
@@ -1938,6 +2456,18 @@ void updateLongRangeSwitch(unsigned long now) {
     if (replied >= need) { finishVerify(true, replied, need); return; }
     if (now - lrPhaseStart >= LR_VERIFY_WINDOW_MS) { finishVerify(false, replied, need); return; }
 
+    // ── 群組指令進行期間讓開探測（2026-08-18 新增，與檔案裡另外三處守衛同源）──
+    // 探測送的是**單播** HO_PKT_STATE_REQ，它的 MAC 層 ACK 會落進 onEspNowSent()；
+    // 若與群組單播的 ACK 歸因閂鎖撞在同一個 MAC 上，會把「查詢已送達」誤記成
+    // 「群組指令已送達」—— 與 C1 同一類的錯誤歸因，而且方向是誤綠。
+    //
+    // **只讓開探測，不暫停倒數**：暫停倒數會把整條路徑的上界從 24.4 秒推到
+    // 最多 30.4 秒（群組 job 的 6 秒硬上限加上去），直接撞破 30 秒門檻。
+    // 讓開的代價可接受：群組 job 最長 6 秒、驗證窗 10 秒，最壞仍有約 16 次探測機會；
+    // 而且群組指令期間每一台執行完都會主動 sendState()，那些回報照樣會被
+    // HO_PKT_STATE 分支記進 lrVerifyMask —— **讓路不等於停止蒐證。**
+    if (groupCmdActive()) return;
+
     if (now - lrLastSendAt < LR_VERIFY_PROBE_GAP_MS) return;
     lrLastSendAt = now;
     int n = slaveCount;
@@ -1946,7 +2476,9 @@ void updateLongRangeSwitch(unsigned long now) {
       if (i < 32 && (lrExpectMask & (1UL << i)) && !(lrVerifyMask & (1UL << i))) {
         // 主動探測而不是等 pollNextSlave()：後者一輪 15 秒，20 台的話每台 750ms
         // 才輪到一次，10 秒內問不完；這裡每 250ms 一台，10 秒可以問 40 次。
-        requestSlaveState(i);
+        // 函式名 2026-08-18 更正：原計畫寫的 requestSlaveState() 不存在，
+        // 現行是 requestSlaveStateMac() / requestSlaveStateIndex()。
+        requestSlaveStateIndex(i);
         lrSendIdx = (i + 1) % n;
         return;
       }
@@ -1997,6 +2529,10 @@ void updateLrBootGuard(unsigned long now) {
   if (slaveCount == 0)     { lrBootGuardDone = true; return; }
   if (lrAnySlaveReported)  { lrBootGuardDone = true; return; }
   if (lrPhase != LR_IDLE)  return;   // 正在切換，交給驗證階段處理，不要兩套機制搶著動
+  // 群組指令進行中不要插進一次 1.2 秒的射頻切換（2026-08-18 新增）：
+  // 守衛已經等了 90 秒，再多等最多 6 秒（GROUP_JOB_MAX_MS）不會有任何損失，
+  // 而在「一次要全部關」的補送中途改射頻會直接讓剩下的補送打空。
+  if (groupCmdActive()) return;
   if (now - lrBootGuardStart < LR_BOOT_GUARD_MS) return;
 
   lrBootGuardDone = true;
@@ -2036,27 +2572,56 @@ void updateLrBootGuard(unsigned long now) {
 > 注意：這裡呼叫的是 `saveLongRange(false)` 而**不是** `applyLongRange(false)` ——
 > 下一行就要 `ESP.restart()`，套用射頻沒有意義，寫進 NVS 讓開機流程去套用才是對的。
 
-同時把該分支既有的那行說明訊息改成（**它原本只提名冊，現在多了一項**）：
+同時把該分支既有的那行說明訊息改掉。**它現在的逐字內容是（2026-08-18 讀原始碼確認）：**
+```cpp
+  Serial.println("[重置] 長按重置只清除網路設定（WiFi/MQTT），"
+                 "slave 配對記錄（homaster 名冊）保留，不會解除任何已配對的籠子");
+```
+改成：
 ```cpp
   Serial.println("[重置] 長按重置清除網路設定（WiFi/MQTT）並關閉 Long Range，"
                  "slave 配對記錄（homaster 名冊）保留，不會解除任何已配對的籠子");
 ```
-> **這一行改了字串。Task 6 的回歸清單必須以這裡的最終字串為準，
-> 且要一併檢查 `docs/phase2a-regression-checklist.md` 有沒有引用舊字串。**
+> **這一行改了字串（「只清除」→「清除…並關閉 Long Range」）。動手前後都要做兩件事：**
+> 1. Task 6 的回歸清單必須以這裡的最終字串為準；
+> 2. **`grep` 舊字串**（`長按重置只清除網路設定`）**掃過整個 repo** ——
+>    `docs/phase1-regression-checklist.md`、`docs/phase2a-regression-checklist.md`、
+>    `ho_master1/readme.md`、以及 **`tools/check_doc_claims.py` 的 HIT 表**都可能引用它。
+>    本專案已經有**四次**「回歸清單的判準字串與程式碼不符，導致實測者把正確行為判成 FAIL」。
 
 - [ ] **Step 8: 指令接點（MQTT 與序列埠）**
 
-**4-A（`handleMasterCommand()` 存在時）** —— 在它的 else-if 鏈補：
+**走 4-A（`handleMasterCommand()` 已確認存在）。**
+它的 else-if 鏈裡**現在就有一個佔位分支**：
+
+```cpp
+  } else if (message.startsWith("LR:")) {
+    // Task 6 實作，先給一個明確的回應而不是掉進「未知指令」
+    Serial.println("[LR] 指令尚未實作（Task 6）");
+```
+
+**這一段是要被「取代」的，不是在它後面再加兩個分支** ——
+`startsWith("LR:")` 會先命中，後面的 `== "LR:ON"` 永遠進不去，**而且編譯不會報錯**。
+取代成：
+
 ```cpp
   } else if (message == "LR:ON") {
     startLongRangeSwitch(true);
   } else if (message == "LR:OFF") {
     startLongRangeSwitch(false);
+  } else if (message.startsWith("LR:")) {
+    // 保留這一條當「LR: 開頭但不是 ON/OFF」的明確回應，
+    // 不要讓它掉進最後的「未知指令」——App 端可能送出別的 LR: 變體。
+    Serial.printf("[LR] 不支援的 LR 指令: %s（只支援 LR:ON 與 LR:OFF）\n", message.c_str());
 ```
 
-**4-B（`handleMasterCommand()` 不存在時）** —— 在 `mqttCallback()` 的
-`HASRELAY:ON`／`HASRELAY:OFF` 分支之後、`else` 之前補上完全相同的兩個分支。
-**不要順手重構整支 `mqttCallback()`。**
+同時更新 `handleMasterCommand()` 上方那段註釋 —— 它現在寫著
+「**唯一還沒長的是 LR:**，⋯⋯Task 6（Long Range）已依 Phase 2b 的 Ruling 整個移到
+Phase 5 執行，本階段不做」，這句在本 Task 之後就過期了。
+
+> **4-B 已作廢，不要再實作它。** 原計畫寫「`handleMasterCommand()` 不存在時接在
+> `mqttCallback()` 的 else-if 鏈尾」，那是 Phase 2b Task 4 之前的狀態。
+> **不要順手重構整支 `mqttCallback()`。**
 
 序列埠：`handleSerialCommand()` 補一個**不走 `parseIndexArg()`** 的分支
 （`lr` 的參數是 `on`／`off` 不是數字，**絕對不能加進 `needsArg` 清單**，
@@ -2086,29 +2651,67 @@ void updateLrBootGuard(unsigned long now) {
 Phase 4 的「決定 4.1」已經指出這個陷阱 —— 加欄位卻不同步加大常數時，
 `static_assert` 會用舊常數繼續通過，**保護機制看起來還在、實際上已經失效**。
 
-在 Task 1（Phase 2b）建立的容量常數區把 `STATUS_BASE_MAX_BYTES` 改成分項相加：
+> **2026-08-18 整段重算。** 原文的所有數字（512／96／3072／26 台／680）
+> 都是 Phase 2b 時代的值，**現在一個都不對**。現行常數（讀 `ho_master1.ino` 確認）是：
+>
+> | 常數 | 現值 |
+> |---|---|
+> | `STATUS_BASE_WITHOUT_GROUP_OTA_MAX_BYTES` | 480（**已含 `"long_range_pending":true,` 的 27 bytes**） |
+> | `STATUS_GROUP_MAX_BYTES` | 120 |
+> | `STATUS_OTA_MAX_BYTES` | 128 |
+> | `STATUS_BASE_MAX_BYTES` | 480 + 120 + 128 = **728** |
+> | `SLAVE_ENTRY_MAX_BYTES` | 112 |
+> | `SLAVES_KEY_OVERHEAD` | 11 |
+> | `STATUS_BUF_SIZE` | 3584 |
+> | `MQTT_BUFFER_SIZE` | 3840 |
+>
+> 現行 `maxEntries = (3584 − 1 − 728 − 11) / 112 = 2844 / 112 = 25`。
+
+本階段**只加一項**（`long_range_pending` 已經在 480 裡面，不要重複算）：
 
 ```cpp
-// slaves 陣列與 Phase 5 的 long_range_error 「以外」所有欄位的上界。
-// 這個 512 是 Phase 2b 的實算值，且**已經**含了 "long_range_pending":true, 的 27 bytes
-//（Phase 2b Task 1 的預算表就列進去了），所以本階段只需要為 long_range_error 加額度。
-const size_t STATUS_BASE_WITHOUT_LR_ERR_MAX_BYTES = 512;
-
 // Phase 5 新增：  "long_range_error":"<最長 16 字元>",
 //   key 含引號 18 + 冒號 1 + 值含引號 18 + 逗號 1 = 38 → 取 40
 // ⚠ lrLastError 放進去的字串長度必須 ≤ 16 字元，新增字串時要回頭檢查這裡。
+//   目前使用的字串：no_online_slave(15)／verify_failed(13)／boot_guard(10)／apply_failed(12)
 const size_t STATUS_LR_ERROR_MAX_BYTES = 40;
 
 const size_t STATUS_BASE_MAX_BYTES =
-    STATUS_BASE_WITHOUT_LR_ERR_MAX_BYTES + STATUS_LR_ERROR_MAX_BYTES;   // 552
+    STATUS_BASE_WITHOUT_GROUP_OTA_MAX_BYTES + STATUS_GROUP_MAX_BYTES
+    + STATUS_OTA_MAX_BYTES + STATUS_LR_ERROR_MAX_BYTES;   // 480 + 120 + 128 + 40 = 768
 ```
 
-> **若 Phase 4 已經執行過**，那裡已經把 `STATUS_BASE_MAX_BYTES` 改成
-> `STATUS_BASE_WITHOUT_OTA_MAX_BYTES(512) + STATUS_OTA_MAX_BYTES(128) = 640`。
-> 這種情況下本階段是**再加一項**：`512 + 128 + 40 = 680`。
-> **兩種情況都要重驗 `static_assert` 並把算式寫進註釋：**
-> - 沒有 Phase 4：`(3072 − 1 − 552 − 11) / 96 = 26 ≥ 20` ✓（餘裕 6 台）
-> - 有 Phase 4：`(3072 − 1 − 680 − 11) / 96 = 24 ≥ 20` ✓（餘裕 4 台）
+**重算並寫進註釋的算式**：
+`(3584 − 1 − 768 − 11) / 112 = 2804 / 112 = 25 ≥ 20` ✓（**餘裕仍是 5 台，不需要放大 buf**）
+
+`static_assert` 的訊息字串也要改 —— 它現在結尾寫著
+「請放大 `STATUS_BUF_SIZE`，或縮減 `STATUS_BASE` 的三個分項之一（WITHOUT_GROUP_OTA／GROUP／OTA）」，
+**分項變成四個了**，字串要跟著改成四項，否則就是一句與程式碼矛盾的說明。
+
+**同一步還要做的三件事（漏掉任何一件，保護機制就只是看起來還在）：**
+
+1. **`tools/check_doc_claims.py` 的 `base_parts` 一定要加上第四項。** 它現在寫死成
+   ```python
+   base_parts = [const('STATUS_BASE_WITHOUT_GROUP_OTA_MAX_BYTES'),
+                 const('STATUS_GROUP_MAX_BYTES'),
+                 const('STATUS_OTA_MAX_BYTES')]
+   ```
+   不加的話腳本會用 728 去複算，而程式碼是 768 —— **它會大聲報錯（這是好事），
+   但如果有人為了讓它變綠而去改文件的數字，就會把正確的 768 改成錯的 728。**
+   下一行的 `print('  STATUS_BASE 分項：%d + %d + %d = %d' % tuple(base_parts + [base]))`
+   是三個 `%d` 的格式字串，一併改成四個，否則會 `TypeError`。
+2. **HIT 表**加一條
+   `('BASE 分項 d', 'const size_t STATUS_LR_ERROR_MAX_BYTES = 40;')`。
+3. **BANNED 表**把被取代的舊值加進去
+   （`STATUS_BASE_MAX_BYTES = 728`、以及 `(3584-1-728-11)/112 = 25` 這條舊算式），
+   寫法照既有那幾條的「遷移表格例外」樣式。
+4. **跑突變驗證，而且要跑兩個方向**（`.claude/rules/claim-what-it-does-not-block.md`）：
+   - **移除方向**：把要驗的東西拿掉／改成舊值，確認腳本會叫；
+   - **加寬方向**：把規則本身放寬（例如例外樣式寫得更寬、正則少一個錨點），
+     確認它**不再**叫得出來 —— 這個方向才抓得到「規則其實是裝飾品」。
+   兩個方向都跑完再還原。腳本自己的維護規則就是這麼寫的 ——
+   沒跑過突變的規則等於「宣稱一道沒看過它啟動的防線」，
+   而它上一個真實案例（BANNED 只禁散文寫法、沒禁常數表格列）**讀十遍腳本也看不出來**。
 
 `buildStatusDoc()` 的 `dev` 區塊補兩行：
 ```cpp
@@ -2116,21 +2719,37 @@ const size_t STATUS_BASE_MAX_BYTES =
   dev["long_range_error"] = lrLastError;   // 空字串代表沒有錯誤
 ```
 
+> **`long_range_pending` 的語義擋不住什麼**：它只反映 `lrPhase`，
+> 也就是「master 自己的切換狀態機還沒回到 IDLE」。
+> 它**不代表**所有 slave 都已經切換完成，更不代表兩端一致 ——
+> `LR_IDLE` ＋ `long_range_error` 為空，只證明 master 這一側走完了驗證門檻（預設 60%）。
+
 - [ ] **Step 10: 接進 `loop()`**
 
-在 `maintainEspNow();` **之後**加：
+**2026-08-18 更正：位置改到 `processGroupCmd();` 之後，並且自己重新取時間。**
+
 ```cpp
   // ── Long Range 切換狀態機與開機守衛（Phase 5）──
-  // 放在 maintainEspNow() 之後：本輪的心跳先發出去，再去推進可能會動射頻的狀態機。
-  updateLongRangeSwitch(now);
-  updateLrBootGuard(now);
+  // 位置理由（兩條都成立才選這裡）：
+  //  (a) 排在 processGroupCmd() **之後**：群組指令的補送每輪最多送一台，
+  //      讓它先走完本輪那一步，再去推進一個可能會阻塞 1.2 秒動射頻的狀態機。
+  //      反過來的話，補送會被 LR 的套用整輪整輪往後推。
+  //  (b) **自己呼叫 millis()，不要沿用 loop() 開頭那個 now**：
+  //      這個位置在 WiFi／MQTT 區塊之後，而 connectToWiFi() 最壞 15 秒、
+  //      smartConnect() 最壞 18 秒、單次阻塞 publish 最壞 10 秒 ——
+  //      loop() 開頭取的 now 到這裡可能已經落後十幾秒，
+  //      會讓 10 秒逾時判斷在進入的第一輪就成立。
+  //      （Phase 2a Task 3 的 Critical 1 就是同一類問題。）
+  unsigned long lrNow = millis();
+  updateLongRangeSwitch(lrNow);
+  updateLrBootGuard(lrNow);
 ```
 
-> **`now` 的取樣時機**：`loop()` 開頭取的 `now` 在經過 `connectToWiFi()`（最壞 15 秒）
-> 或 `smartConnect()`（最壞 18 秒）之後就已經過時了。`updateLongRangeSwitch()` 排在
-> `maintainEspNow()` 之後、WiFi／MQTT 區塊之前，所以拿到的 `now` 是新鮮的。
-> **不要把這兩行搬到 `loop()` 的尾巴** —— 那裡的 `now` 可能落後真實時間十幾秒，
-> 會讓 10 秒逾時判斷立刻成立。（Phase 2a Task 3 的 Critical 1 就是同一類問題。）
+> **原計畫寫「放在 `maintainEspNow();` 之後、WiFi／MQTT 區塊之前，所以 `now` 是新鮮的」**——
+> 那個位置的 `now` 確實新鮮，但它排在 `processGroupCmd()` 之前，
+> 會讓 LR 的射頻套用插在群組補送的每一輪前面。改成排在後面 ＋ 自己取時間，
+> 兩個問題一起解掉，而且**「自己取時間」讓位置不再是正確性的前提**——
+> 日後有人搬動這兩行也不會默默壞掉。
 
 - [ ] **Step 11: 編譯驗證**
 
@@ -2140,7 +2759,13 @@ const size_t STATUS_BASE_MAX_BYTES =
 
 commit 訊息必須包含：
 - master 為什麼最後才切自己（且理由與 Phase 2b 寫的不同：那個理由若成立反而推不出這個做法）
-- 緊急指令為什麼是「送兩次」而不是「中止切換」
+- **緊急插隊為什麼借用既有的群組 job 補送、而不是自己再長一套重試**
+  （目標集合天生一致／cmdId 不被切成兩段／只有一個時間預算），
+  以及**兩批門之間約 2.1 秒的落差是誠實列出來的、不是被壓小的**
+- **掛鉤點為什麼不能掛在 `sendCmdToSlaveMac()`**（它是群組補送的送出點）
+- **新增的兩個單播送出點（LR 探測、LR_SET）為什麼要拿 `groupCmdActive()` 讓路**
+- **LR 與 OTA 的互斥（決定 7）**：slave 端為什麼選「中止 OTA 去跟上切換」，
+  以及 master 端那道守衛**今天還不存在**、登記成具名技術債
 - 為什麼加了 `LR_VERIFYING` 與自動回滾，以及「回滾是必要但不充分，恢復保證來自 slave 端」
 - 為什麼回滾之後刻意不自動重試
 - 開機守衛的 90 秒是怎麼推出來的（不得早於規格算出的 45.6 秒正常恢復路徑）
@@ -2162,8 +2787,10 @@ commit 訊息必須包含：
 - Modify: `ho_slave1/ho_slave1.ino`
 
 **Interfaces:**
-- Consumes：Task 4 的 `lrPhase`／`lrNoteRelayCommand()`；既有的 `espNowSendTo()`／
-  `requestSlaveState()`／`hoFormatDeviceId()`／slave 的 `requestBlink()`
+- Consumes：Task 4 的 `lrPhase`／`lrOnRelayCommandBegin()`（把它的 `abortLrTest()` 空實作換成真的）／
+  `groupCmdActive()`；既有的 `espNowSendTo()`／`allocCmdId()`／
+  `requestSlaveStateIndex()`（**不是** `requestSlaveState()`，那支不存在）／
+  `hoFormatDeviceId()`／slave 的 `requestBlink()`
 - Produces（Task 6 的實測程序文件依賴）：
   - `HoHeartbeatPayload.hbSeq`
   - slave 的 `[實測]` 統計行與 `field`／`stats` 序列埠指令
@@ -2195,6 +2822,12 @@ struct __attribute__((packed)) HoHeartbeatPayload {
 };  // 6 bytes
 ```
 
+**`HoEspNowProtocol.h` 自己也有一條要改（原計畫漏了，漏掉會四種型號全部編不過）：**
+```c
+static_assert(sizeof(HoHeartbeatPayload) == 4,  "HoHeartbeatPayload 必須是 4 bytes");
+```
+→ 改成 `== 6` 並更新訊息字串。
+
 `ho_espnow_test/ho_espnow_test.ino` 要同步改，**至少三處**（動手前先
 `grep -n "HoHeartbeatPayload" ho_espnow_test/ho_espnow_test.ino` 把全部找出來，
 不要只改記得的那幾處）：
@@ -2206,6 +2839,12 @@ struct __attribute__((packed)) HoHeartbeatPayload {
   // 加長 payload 的向前相容性：用「舊長度」解包新封包時，前 4 個欄位仍應正確
   check(sizeof(HoHeartbeatPayload) > 4, "心跳 payload 只增不減（Phase 5 由 4 加到 6）");
 ```
+
+> **加一項 `check()` 會連動兩個地方（2026-08-18 補）：**
+> 1. `docs/phase4-flag-day-upgrade.md` 寫著「執行 **57** 項，失敗 0 項」，
+>    那是 `tools/check_doc_claims.py` 方向 4 的比對對象。加一項就要一起改成 58。
+> 2. 改完**跑一次 `python tools/check_doc_claims.py`** 確認方向 4 是綠的。
+>    不要用 `grep -c "check("` 的數字（它會多算 `void check(...)` 的定義那一行）。
 
 - [ ] **Step 2: master 送出心跳序號**
 
@@ -2362,14 +3001,31 @@ void handleSerialCommand(const String& line) {
 **這是 Phase 5 最重要的量測工具。** 它回答的是規格「系統本質」真正在問的問題：
 **在這個距離上，一次廣播的「全部關」到底有幾成的門真的關上了。**
 
-量測原理（不需要新增任何協定）：
-- 廣播 `HO_PKT_CMD` + `HO_CMD_PULSE`（2000ms）。slave 的 `HO_PKT_CMD` 處理完會
-  **主動** `sendState()`，回報 `relay=1`
-- **收到 `relay==1` 的 `HO_PKT_STATE` ＝ 這台確實收到了那封廣播**
-- 800ms 之後對還沒回報的台補送 `HO_PKT_STATE_REQ`：若補查回來 `relay` 仍是 1
-  （點動 2000ms 還沒結束），代表**廣播有到、只是上行回報掉了**
-- 於是可以把「到達」拆成「直接回報」與「補查確認」兩欄，
-  把下行遺失與上行遺失分開看
+量測原理（不需要新增任何協定）。**2026-08-18 改用協定版本 2 的指令歸因，
+判準比原稿強得多，而且原稿有一個會產生垃圾資料的漏洞（見下）：**
+
+- 每一輪 `allocCmdId()` 配一個**新的 `cmdId`**，廣播 `HO_PKT_CMD` + `HO_CMD_PULSE`（2000ms）
+- slave 的 `HO_PKT_CMD` 處理完會**主動** `sendState()`，而版本 2 的 `HoStatePayload`
+  會帶回 `lastCmdId`／`lastCmdKind`
+- **收到 `lastCmdId == 本輪 cmdId` 的 `HO_PKT_STATE` ＝ 這台確實收到了那封廣播**
+- 800ms 之後對還沒回報的台補送 `HO_PKT_STATE_REQ`：若補查回來的 `lastCmdId`
+  仍是本輪的值，代表**廣播有到、只是第一則上行回報掉了**
+- 於是可以把「到達」拆成「直接回報」與「補查確認」兩欄，把下行遺失與上行遺失分開看
+
+> **原稿用 `relay == 1` 當判準，有兩個問題：**
+> 1. **`HoCmdPayload` 現在有 `cmdId` 欄位，原稿的程式碼沒填它** ——
+>    `payload.cmdId` 會是未初始化的堆疊垃圾，slave 會把垃圾值當成指令編號回報，
+>    污染 `groupExecutedIdx()` 之後的所有歸因。**這是必須修掉的實際缺陷，不是風格問題。**
+> 2. `relay == 1` 不區分「是哪一道指令造成的」。任何其他來源的點動
+>    （群組指令、單台 `ON`、上一輪測試的殘留）都會被算成本輪到達，方向是**誤綠**。
+>    `lastCmdId` 比對是由 slave 產生、master 造不出來的證據，沒有這個問題。
+>
+> **它擋不住什麼（照 Phase 4 已經寫過的那份清單，不重複造一份新的）**：
+> `lastCmdId` 只證明 slave 的韌體走完了繼電器動作那段程式 —— 不證明繼電器硬體動作、
+> 不證明籠門關上、**完全擋不住偽造**（CRC-8 ＋ 原始碼字面常數密鑰，
+> 射頻範圍內的第三方組得出一封合法的 `HO_PKT_STATE`）。
+> 用在**實測工具**上這個強度是夠的（實測現場沒有攻擊者），
+> 但表格印出來的百分比**不得**被引用成「關門成功率」。
 
 ```cpp
 // ── 「全部關」到達率測試（Phase 5 Task 5）──
@@ -2382,6 +3038,9 @@ int lrTestRound = 0;
 unsigned long lrTestPhaseStart = 0;
 unsigned long lrTestProbeAt = 0;
 volatile uint32_t lrTestRoundMask = 0;   // 本輪已確認的台（callback 設 bit）
+// 本輪廣播用的 cmdId。判準就是「slave 回報的 lastCmdId 等於它」。
+// volatile：loop() 寫、WiFi task 的 HO_PKT_STATE 分支讀。
+volatile uint16_t lrTestCmdId = HO_CMD_ID_NONE;
 uint16_t lrTestHit[HO_ESPNOW_MAX_SLAVES];
 uint16_t lrTestDirect[HO_ESPNOW_MAX_SLAVES];
 long     lrTestRssiSum[HO_ESPNOW_MAX_SLAVES];
@@ -2391,14 +3050,16 @@ uint8_t lrTestChannelAtStart = 0;
 
 const uint16_t      LRT_PULSE_MS  = 2000;
 const unsigned long LRT_DIRECT_MS = 800;    // 這之前收到的算「直接回報」
-const unsigned long LRT_WAIT_MS   = 1500;   // 本輪等待總長（必須 < LRT_PULSE_MS，
-                                            // 否則補查時點動已結束、relay 回到 0）
+const unsigned long LRT_WAIT_MS   = 1500;   // 本輪等待總長
 const unsigned long LRT_PROBE_GAP_MS = 120; // 補查時每台之間的間隔
 const unsigned long LRT_GAP_MS    = 4000;   // 輪與輪之間，讓點動結束、射頻回到閒置
 
-static_assert(LRT_WAIT_MS < LRT_PULSE_MS,
-              "補查窗必須落在點動still ON 的期間內，否則 relay 已回 0，"
-              "補查確認會全部誤判成沒收到");
+// 補查窗必須真的存在：LRT_DIRECT_MS 之後才開始補查，若它 ≥ LRT_WAIT_MS，
+// 本輪會在補查開始之前就結束，「補查確認」那一欄永遠是 0 而且**看起來很正常** ——
+// 那會讓實測者把「上行回報大量遺失」誤讀成「下行到達率低」。
+static_assert(LRT_DIRECT_MS < LRT_WAIT_MS,
+              "補查窗被壓成 0：LRT_DIRECT_MS 必須小於 LRT_WAIT_MS，"
+              "否則「補查確認」欄永遠是 0，會把上行遺失誤讀成下行遺失");
 
 void abortLrTest(const char* why) {
   if (lrTestPhase == LRT_IDLE) return;
@@ -2419,13 +3080,19 @@ void printLrTestResult() {
                   id, lrTestHit[i], lrTestRound, pct,
                   lrTestDirect[i], (uint16_t)(lrTestHit[i] - lrTestDirect[i]), avgRssi);
   }
-  Serial.println("[實測] 「到達」＝那一輪的廣播確實被該台收到（直接回報或補查時仍在點動）；"
+  Serial.println("[實測] 「到達」＝該台回報的 lastCmdId 等於那一輪的 cmdId，"
+                 "也就是它確實收到並執行了那封廣播；"
                  "「直接回報」與「補查確認」的差額就是上行回報的遺失");
+  Serial.println("[實測] 注意：執行證明只到韌體層 —— 不證明繼電器硬體動作，"
+                 "更不證明籠門關上；本表格的百分比不得當成關門成功率引用");
 }
 
 void startLrTest(int rounds) {
   if (lrTestPhase != LRT_IDLE) { Serial.println("[實測] 上一次測試尚未結束"); return; }
   if (lrPhase != LR_IDLE) { Serial.println("[實測] LR 切換進行中，請稍候再測"); return; }
+  // 群組指令的 job 還在補送時不要開始測試：本測試的補查是單播，
+  // 會污染那個 job 的 ACK 歸因（誤綠方向）。job 最長 6 秒。
+  if (groupCmdActive()) { Serial.println("[實測] 群組指令進行中，請稍候再測"); return; }
   if (slaveCount == 0) { Serial.println("[實測] 名冊是空的，沒有東西可測"); return; }
   if (rounds < 1) rounds = 1;
   if (rounds > 200) rounds = 200;
@@ -2452,14 +3119,26 @@ void updateLrTest(unsigned long now) {
   if (lrTestPhase == LRT_FIRE) {
     lrTestRound++;
     lrTestRoundMask = 0;
-    // 直接廣播，刻意「不」走 sendCmdToAll()：
-    //   (a) sendCmdToAll() 目前是逐台單播（Phase 1 的寫法），而規格「系統本質」
-    //       明確要求群組指令走廣播 —— 本測試要量的正是那條「規格要求的」路徑
+    // ── 直接廣播，刻意「不」走 sendCmdToAll()（2026-08-18 重寫理由）──
+    //   (a) 本測試要量的是**單獨一封廣播**的到達率。sendCmdToAll() 現在是
+    //       「廣播 3 次 ＋ 對每台各一次單播 ＋ 最多 2 趟補送」，量出來的是
+    //       整套補送機制的綜合命中率，那是另一個問題（而且必然接近 100%，
+    //       量不出距離差異）。
+    //       ⚠ 原稿寫的理由是「sendCmdToAll() 目前是逐台單播（Phase 1 的寫法）」——
+    //         那已經不是事實，Phase 2b Task 5 早就改成廣播優先了。
     //   (b) 走 sendCmdToAll() 會連 master 自己的繼電器一起動，與量測無關
-    //   (c) 走 sendCmdToAll() 會呼叫 lrNoteRelayCommand()，本測試自己就會被自己中止
+    //   (c) 走 sendCmdToAll() 會啟動一個群組 job，而 job 期間 pollNextSlave()
+    //       與本測試的補查都要讓路，等於自己把自己的量測擋掉
+    //   (d) 走 sendCmdToAll() 會觸發 lrOnRelayCommandBegin()，本測試會被自己中止
     HoCmdPayload payload;
     payload.cmd = (uint8_t)HO_CMD_PULSE;
     payload.pulseMs = LRT_PULSE_MS;
+    // ⚠ 協定版本 2 起 HoCmdPayload 有 cmdId，**一定要填** ——
+    // 不填就是把未初始化的堆疊垃圾當成指令編號送出去，slave 會照樣回報它，
+    // 污染 master 端所有的指令歸因。原稿漏了這一行。
+    // 一輪一個新編號：本輪的到達判準就是「slave 回報的 lastCmdId 等於它」。
+    lrTestCmdId = allocCmdId();
+    payload.cmdId = lrTestCmdId;
     espNowSendTo(BROADCAST_MAC, HO_PKT_CMD, &payload, sizeof(payload));
     Serial.printf("[實測] 第 %d/%d 輪：已廣播點動指令\n", lrTestRound, lrTestRoundsTotal);
     lrTestPhase = LRT_WAIT;
@@ -2476,10 +3155,16 @@ void updateLrTest(unsigned long now) {
     }
     // 800ms 之後才開始補查：在那之前收到的算「直接回報」
     if (now - lrTestPhaseStart < LRT_DIRECT_MS) return;
+    // 補查送的是**單播** HO_PKT_STATE_REQ，會污染群組指令的 ACK 歸因閂鎖，
+    // 與檔案裡另外三處守衛（pollNextSlave()／handleSlaveCommand()／序列埠 state <n>）
+    // 以及 LR 驗證階段的守衛同源。理論上測試期間不會有群組 job（繼電器指令會中止測試），
+    // 這是第二道防線。
+    if (groupCmdActive()) return;
     if (now - lrTestProbeAt < LRT_PROBE_GAP_MS) return;
     lrTestProbeAt = now;
     for (int i = 0; i < slaveCount && i < 32; i++) {
-      if (!(lrTestRoundMask & (1UL << i))) { requestSlaveState(i); return; }
+      // 函式名 2026-08-18 更正：requestSlaveState() 不存在
+      if (!(lrTestRoundMask & (1UL << i))) { requestSlaveStateIndex(i); return; }
     }
     return;
   }
@@ -2498,8 +3183,12 @@ void updateLrTest(unsigned long now) {
 
 `onEspNowRecv()` 的 `HO_PKT_STATE` 分支補（在 `lrVerifyMask` 那兩行旁邊）：
 ```cpp
-    // 全關測試計分：收到 relay==1 的回報 ＝ 那封廣播確實被這台收到了
-    if (lrTestPhase == LRT_WAIT && idx < 32 && st.relay == 1 &&
+    // 全關測試計分：回報的 lastCmdId 等於本輪的 cmdId ＝ 那封廣播確實被這台收到並執行了。
+    // **這是由 slave 產生、master 造不出來的證據**（協定版本 2 的指令歸因）。
+    // 刻意不用 st.relay == 1：relay 不區分是哪一道指令造成的，
+    // 群組指令／單台 ON／上一輪殘留都會被算進來，方向是誤綠。
+    if (lrTestPhase == LRT_WAIT && idx < 32 &&
+        st.lastCmdId == lrTestCmdId && st.lastCmdId != HO_CMD_ID_NONE &&
         !(lrTestRoundMask & (1UL << idx))) {
       lrTestRoundMask |= (1UL << idx);
       lrTestHit[idx]++;
@@ -2509,11 +3198,20 @@ void updateLrTest(unsigned long now) {
     }
 ```
 
-`lrNoteRelayCommand()` 的**第一行**（在 `if (lrPhase != LR_ANNOUNCING) return;` **之前**）補：
+在 `lrOnRelayCommandBegin()` 的**第一行**（Task 4 在那裡留了一則 ⚠ 註解）補上：
 ```cpp
-  // 使用者下了真的繼電器指令 → 測試立刻讓位。實測是次要的，控制是主要的。
   abortLrTest("收到繼電器指令");
 ```
+**必須排在 `if (lrPhase != LR_ANNOUNCING) return;` 之前** ——
+這樣不論當下有沒有在切換 LR，繼電器指令都會讓測試立刻讓位。
+實測是次要的，控制是主要的。
+
+> 原計畫寫的是「掛在 `lrNoteRelayCommand()` 的第一行」，
+> 那支函式在 2026-08-18 的修訂裡已經拆成
+> `lrOnRelayCommandBegin()`／`lrOnRelayCommandSent()` 兩支（見決定 2）。
+> **要掛在 Begin 那一支** —— 掛在 Sent 那一支的話，
+> 測試會在指令都送完之後才中止，中間那一段的統計已經被污染了。
+
 `startLongRangeSwitch()` 開頭補：
 ```cpp
   if (lrTestPhase != LRT_IDLE) {
@@ -2522,7 +3220,8 @@ void updateLrTest(unsigned long now) {
   }
 ```
 
-`loop()` 在 `updateLrBootGuard(now);` 之後補 `updateLrTest(now);`。
+`loop()` 在 `updateLrBootGuard(lrNow);` 之後補 `updateLrTest(lrNow);`
+（沿用 Task 4 Step 10 自己重新取樣的那個 `lrNow`，理由見該處）。
 
 `handleSerialCommand()` 加 `lrtest`（**要走 `parseIndexArg()`，加進 `needsArg` 清單**；
 `lrtest 0` 代表中止）：
@@ -2555,9 +3254,13 @@ void updateLrTest(unsigned long now) {
 
 commit 訊息必須包含：為什麼心跳要加序號（`HEARTBEAT_INTERVAL_ASSOC` 會讓
 「則數÷秒數」的推算失真）、加長 payload 的相容性方向與**燒錄順序必須先 master 後 slave**、
-`lrtest` 的量測原理（`relay==1` 的回報就是「廣播確實到達」的證明）、
-為什麼 `lrtest` 直接廣播而不走 `sendCmdToAll()`（三個理由）、
-以及 `LRT_WAIT_MS < LRT_PULSE_MS` 的 `static_assert` 在守什麼。
+`lrtest` 的量測原理（**`lastCmdId` 等於本輪 `cmdId` 的回報**就是「廣播確實到達並被執行」的
+證明，而且那是 slave 產生、master 造不出來的證據；**不是** `relay==1`，那個不區分是哪一道指令）、
+**`HoCmdPayload.cmdId` 一定要填**（不填是把未初始化的堆疊垃圾當指令編號送出去）、
+為什麼 `lrtest` 直接廣播而不走 `sendCmdToAll()`（**四個**理由，且原稿寫的
+「sendCmdToAll() 目前是逐台單播」已不是事實）、
+以及 `LRT_DIRECT_MS < LRT_WAIT_MS` 的 `static_assert` 在守什麼
+（補查窗被壓成 0 會把上行遺失誤讀成下行遺失）。
 
 ---
 
@@ -2729,6 +3432,20 @@ commit 訊息必須包含：為什麼心跳要加序號（`HEARTBEAT_INTERVAL_AS
 >    `docs/phase2a-regression-checklist.md` 有沒有引用舊字串當判準**，有就一併更正。
 > 7. **Task 1 的 findings 文件若仍是空白骨架**，清單裡任何與「混合 bitmap 互通性」
 >    有關的項目一律寫成觀察項，且**不得出現「不同步只會失去距離增益」這句話**
+> 8. **寫完必須跑 `python tools/check_doc_claims.py`**，並把本階段新增的判準字串
+>    （`[LR] ...` 那幾條、改過的長按重置說明、改過的 slave 開機訊息）加進它的 HIT 表、
+>    把被取代的舊值加進 BANNED 表，然後**對每一條新規則跑兩個方向的突變驗證**：
+>    **移除方向**（把東西拿掉／改回舊值，確認會叫）與
+>    **加寬方向**（把規則本身放寬，確認它不再叫得出來）。
+>    只跑移除方向抓不到「規則其實是裝飾品」這一種 ——
+>    腳本上一個真實缺口（BANNED 只禁散文寫法、沒禁常數表格列）就是這樣漏掉的。
+> 9. **本階段的敘述不得與 `docs/phase4-flag-day-upgrade.md` 打架。**
+>    那份文件寫的是**協定版本 1→2 的 flag-day**：兩個方向都不相容，
+>    「**兩種順序都有窗口、沒有安全的那一種**」。
+>    Phase 5 的心跳加長是**版本 2 內的向前相容擴充**，只有一個方向會壞，
+>    所以才有「先 master 後 slave」這條規則。**兩句話的前提不同，都要保留，
+>    而且要明講各自適用在什麼情況**——把 Phase 5 那條寫成通則就會讓人以為
+>    v1 升 v2 也可以照這個順序安全升級。
 
 清單開頭必須有與前幾階段同樣的警告：**本清單尚未在任何實體硬體上執行過任何一項。**
 
@@ -2745,8 +3462,10 @@ commit 訊息必須包含：為什麼心跳要加序號（`HEARTBEAT_INTERVAL_AS
 | 7 | **切換全程其他 slave 不失聯**（沒有任何一台印 `[失聯] 超過 30 秒沒收到心跳`） | **失敗判定** | 本階段的核心約束 |
 | 8 | **拔掉一台 slave 再切換**：master 逾時 10 秒後印未確認名單並仍套用；該台復電後由心跳對齊 | 失敗判定 | 逾時路徑 + 自癒 |
 | 9 | **驗證失敗與回滾**：切換後立刻把所有 slave 斷電 → master 10 秒內印 `[LR] 驗證失敗` 並回滾 → `long_range` 回到舊值、`long_range_error` 為 `verify_failed` | 失敗判定 | 決定 3 |
-| 10 | **緊急插隊**：`LR:ON` 之後 2 秒內對 master 送 `ALL:ON`（或序列埠 `allpulse`）→ master 印「握手期間收到繼電器指令」→ 印結束握手 → 印補送 → **所有 slave 都動作了兩次** | **失敗判定** | 決定 2，本計畫最重要的一條 |
-| 11 | 同上，兩次動作之間的間隔目測 < 1 秒 | 觀察項 | 落差不得擴大到規格拒絕的 400ms 量級以上太多 |
+| 10 | **緊急插隊（群體）**：`LR:ON` 之後 2 秒內對 master 送 `ALL:ON`（或序列埠 `allpulse`）→ master 依序印「握手期間收到繼電器指令」→ 廣播與 inline 單播的既有訊息 → 「結束握手（被繼電器指令插隊）」→ 套用 → **群組 job 的第 2／3 趟補送訊息** → 收工訊息 | **失敗判定** | 決定 2。**判準是「群組 job 有跑完補送」，不是「看到 LR 自己的補送訊息」** —— 合併之後 LR 不再有自己的群體補送 |
+| 10b | **緊急插隊（單台）**：`LR:ON` 之後 2 秒內對某一台送 MQTT `ON`（或序列埠 `pulse <n>`）→ 印「補送剛才那道單台繼電器指令」 | **失敗判定** | 決定 2 的單台路徑，只有這條會出現 LR 自己的補送 |
+| 11 | 群體插隊時，「舊 bitmap 那批」與「新 bitmap 那批」動作的時間差 | **觀察項** | 計畫算出來的上界約 2.1 秒。**刻意不是失敗判定** —— 它比規格點名的 400ms 大，這是已知且被接受的取捨（決定 2） |
+| 11b | 同一次插隊只出現**一份**群組收工訊息、只有**一個** `cmdId` | **失敗判定** | 「兩套重試互相吃掉對方」的正面驗證：看到兩份收工或兩個 cmdId 就代表合併沒做到 |
 | 12 | **slave 失聯自我救援**：把 master 斷電 → slave 30 秒後依序印 `[失聯]`、`[安全] 失去 master，繼電器已關閉`、`[掃描]`、`[LR] 失聯救援：把射頻對調成…`，3 秒後印切回原值 | 失敗判定 | 決定 4；**注意訊息順序：關繼電器一定在救援之前** |
 | 13 | master 復電後 slave 印 `[鎖定]`，且若 LR 不同會印 `[LR] 依心跳對齊為…` | 失敗判定 | |
 | 14 | **開機守衛**：LR 開著時把所有 slave 斷電再重開 master → 90 秒後印 `[LR] 開機守衛：…` 且 `long_range` 變 `false`、`long_range_error` 為 `boot_guard` | 失敗判定 | 決定 5 第 2 層 |
@@ -2762,7 +3481,11 @@ commit 訊息必須包含：為什麼心跳要加序號（`HEARTBEAT_INTERVAL_AS
 | 24 | 兩端 bitmap 不同步期間 ESP-NOW 是否仍通 | **觀察項** | Task 1 測項 B 的產品端複驗 |
 | 25 | **回歸 Phase 2a/2b**：BLE 配網、長按重置、`FIND_BEST_SERVER`、`HASRELAY:*`、代發 topic、`fakeslaves 20` + `jsonsize` 行為不變 | 失敗判定 | `jsonsize` 要重新記錄數字（多了 `long_range_error` 欄位） |
 | 26 | **回歸**：WiFi 拔線 60 秒，slave 全程不失聯 | **失敗判定** | Phase 2a 的既有約束 |
-| 27 | **協定測試**：`.\flash.ps1 -Model test` 燒錄後全部通過，含新增的心跳 payload 大小檢查 | 失敗判定 | |
+| 27 | **協定測試**：`.\flash.ps1 -Model test` 燒錄後全部通過，含新增的心跳 payload 大小檢查 | 失敗判定 | 項數以當下 `grep -c "check("` 為準，**不要寫死數字** |
+| 28 | **LR 切換發生在 OTA 進行中**（決定 7）：對某台 slave 開始 OTA，中途下 `LR:ON` → 該台印 `[OTA]` 中止訊息 → 印 LR 已套用 → **不出現 `[失聯] 超過 30 秒沒收到心跳`** | **失敗判定** | 「中止 OTA 去跟上切換」的正面驗證。master 端那道守衛若尚未實作，這條就是唯一的覆蓋 |
+| 29 | **OTA 開始在 LR 套用前 50ms 內**：觀察是否印 `[OTA] LR 切換即將套用，本次工作階段拒絕` | **觀察項** | 窗口只有 50ms，**做不出穩定觸發手法就照實記「未能觸發」**，不要為了填表硬湊 |
+| 30 | **群組指令與 LR 不互相污染**：`ALL:OFF` 之後立刻下 `LR:ON` → 應印 `[LR] 群組指令進行中，拒絕切換` | **失敗判定** | `groupCmdActive()` 讓路守衛的正面驗證 |
+| 31 | **`tools/check_doc_claims.py` 全綠**，且本階段新增的每一條規則都各跑過一次突變驗證 | **失敗判定** | 容量常數與兩條序列埠訊息都改過，不重跑等於沒有覆蓋 |
 
 - [ ] **Step 3: 更新 `ho_master1/readme.md`**
 
@@ -2782,8 +3505,19 @@ commit 訊息必須包含：為什麼心跳要加序號（`HEARTBEAT_INTERVAL_AS
      `docs/lr-idf-behavior-findings.md`；文件若尚未填寫就明講「未驗證」
    - **混合 bitmap 的互通性**：同上。**findings 未填寫時，readme 不得出現
      「不同步只會失去距離增益」這句話**
-   - **心跳 payload 加長的燒錄順序**：先 master 後 slave，反過來會開籠
+   - **心跳 payload 加長的燒錄順序**：先 master 後 slave，反過來時**若該台繼電器
+     當下是通電的**就會在 30 秒後被強制關閉＝籠門被打開（精確版本，見決定 4 的補充）
    - **LR 的距離效益未經實測**：指向 `docs/phase5-field-test-procedure.md`
+   - **緊急插隊的落差約 2.1 秒**（決定 2）：三個理由要逐字寫，不要只寫結論
+   - **`LR_SETTLING`／`LR_VERIFYING` 期間（最長 12 秒）進來的繼電器指令沒有任何補送覆蓋**：
+     還沒切換成功的那些台收不到，只能等驗證失敗回滾或等它們自己的 30 秒救援
+   - **LR 位元存在 NVS，重燒韌體與 erase 都清不掉**（危害 E），以及開機無條件重設
+     只覆蓋 `WIFI_IF_STA` 這一個介面
+   - **日後若替 master 加上 SoftAP 配網，必須先強制關閉 LR**（危害 D 的前瞻約束）
+   - **測項 E（LR 是否影響 BLE 廣播）在填表之前一律寫「未驗證」**，
+     不得寫成「BLE 不受影響」
+   - **master 端「OTA 進行中拒絕 LR 切換」的守衛尚未存在**（決定 7 第一道），
+     目前只有 slave 端的後備（中止 OTA 去跟上切換）
 
 - [ ] **Step 4: 更新 `ho_slave1/readme.md`**
 
@@ -2838,8 +3572,11 @@ commit 訊息必須包含：為什麼心跳要加序號（`HEARTBEAT_INTERVAL_AS
 ## 本階段結束後的狀態
 
 - `LR:ON` / `LR:OFF` 可用，且切換的每一條路徑（成功／逾時／驗證失敗／緊急插隊／
-  開機守衛／長按重置）都有明確的時間上界，總和 24.4 秒 < 30 秒失聯門檻，
-  且用 `static_assert` 鎖在編譯期
+  開機守衛／長按重置）都有明確的時間上界，**LR 自己那條路徑**總和 24.4 秒 < 30 秒失聯門檻，
+  且用 `static_assert` 鎖在編譯期。
+  **緊急插隊那條路徑會與群組指令的 job（`GROUP_JOB_MAX_MS = 6000`）重疊**，
+  重疊後的時間帳算在「決定 2」，約 3.9 秒 < 6 秒，**但那一段是人工重算的、
+  編譯期抓不到**
 - 三個未驗證的 IDF 行為有了獨立的探針與一份可填寫的事實表
 - 兩端都有自我恢復能力：master 有 10 秒驗證回滾與 90 秒開機守衛，
   slave 有 30 秒失聯後的 LR 對調救援
@@ -2861,3 +3598,8 @@ commit 訊息必須包含：為什麼心跳要加序號（`HEARTBEAT_INTERVAL_AS
 | **60% 驗證門檻可能誤判** | 正常切換被判失敗而回滾（多一次射頻中斷） | 1~2 台的小名冊改成「至少一台回應」；回滾不自動重試所以不會震盪；門檻是具名常數，實測後可調 |
 | WROOM flash 餘裕 | Phase 4 若已執行，本階段再加約 8~12 KB | 每個 Task 記錄用量；95% 紅線 |
 | `lrAckMask`／`lrVerifyMask`／`lrTestRoundMask` 的 read-modify-write 競態 | 漏記一次 ACK 或一次命中 | 只在階段結束的瞬間可能發生；ACK 漏記的後果只是序列埠多印一台「未確認」；`lrtest` 漏記會讓到達率**低估**（保守方向），不會高估 |
+| **緊急插隊時兩批門的落差約 2.1 秒**（決定 2，已重算，原計畫誤寫成 150~200ms） | 比規格點名的 400ms 逃脫窗口大五倍 | 替代方案「中止切換」是 30 秒，更糟；只在繼電器指令落進 ≤10 秒握手窗時才發生；三個理由逐字寫進 readme。**沒有進一步的緩解，這是被接受的取捨** |
+| **`LR_SETTLING`／`LR_VERIFYING`（最長 12 秒）期間進來的繼電器指令完全沒有補送覆蓋** | 沒切換成功的那些台收不到那道指令 | 只能靠驗證失敗回滾（10 秒內）或 slave 自己的 30 秒救援。**本階段不處理**，明確寫進 readme 與回歸清單 |
+| **LR 套用會吃掉群組 job 的 6 秒 wall-clock 預算** | 補送趟數變少，覆蓋率下降 | 算出來約 3.9 秒 < 6 秒，餘裕 2.1 秒；超過時 `processGroupCmd()` 會印「（達 wall-clock 上限）」，**是看得見的降級不是靜默失敗**；改動 `HEARTBEAT_BURST_*`／`GROUP_*` 必須重算 |
+| **master 端「OTA 進行中拒絕 LR 切換」的守衛不存在**（決定 7 第一道） | 未來 OTA 送出側落地後，一次 LR 切換會直接打斷 OTA | 目前只有 slave 端的後備（中止 OTA 去跟上切換，保住心跳不失聯）；登記成具名技術債，寫進 progress.md 與 readme |
+| **測項 E 未做時就開啟 LR** | 若 LR 會影響 BLE 廣播，master 從此配不了網，而 NVS 清不掉（危害 E） | Task 1 測項 E 是唯一的檢出手段；在它有結果之前，**出貨預設一律關閉 LR** |
