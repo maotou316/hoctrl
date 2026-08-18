@@ -988,7 +988,8 @@ Phase 2a 的 `mqttCallback()` 是把 topic 與自己的 control topic 做完整�
 > 群組指令的 6 秒 wall-clock 上限、`unpairall` 分批）擋的都是**「多次阻塞疊加」**，
 > 沒有任何一條擋得住**「單次阻塞過長」**。**別把它們讀成已經解決了第 0 項。**
 
-**目前唯一能拿到實測數字的手段（也只是逼近，不是重現）**：
+**目前手邊最接近的做法（也只是逼近，不是重現；起一個不 `read()` 的 TCP sink 或用
+netem 壓上行才是真重現，但那超出本節範圍）**：
 **拔掉 AP 的 WAN／上行網路線，但讓 WiFi 關聯保持不斷**。
 此時 `WiFi.isConnected()` 仍是 true、本地 socket 仍停在 `ESTABLISHED`、
 `mqttClient.connected()` 仍回 true，代發照發，直到 lwIP 的 `TCP_SND_BUF`

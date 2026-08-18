@@ -152,19 +152,30 @@ App 端的行為（讀 `grp`／`group.noack`、樹狀 UI）是 Phase 3，不在�
 > （`mqttgo.io`／`mqtt.eclipseprojects.io`／`broker.emqx.io`／`broker.hivemq.com`），
 > 留下的垃圾別人也看得到、也清不掉（除了你自己去清）。
 >
-> **這會不會直接讓使用者的 App 冒出 20 台幽靈設備？照實說：不會自動冒出，
-> 但有一條真實路徑。** App 目前是**逐台訂閱** `hoban/<device.mqttTopicId>/status`
+> **這會不會直接讓使用者的 App 冒出 20 台幽靈設備？照實說：不會自動變成
+> 「我的設備」清單上的一列，但有一條路徑**今天就通、不是 Phase 3 才有**。**
+> App 是**逐台訂閱** `hoban/<device.mqttTopicId>/status`
 > （`lib/services/multi_mqtt_service.dart`），不是萬用字元，所以那 20 條
-> retained 不會自己變成設備清單上的一列。
-> **但 Phase 3 的樹狀 UI 是要從 master 狀態的 `slaves[]` 展開子節點的** ——
-> 在 master 重開機覆蓋掉那則 status 之前，樹狀 UI 會展出 20 個假子節點、
-> 去訂閱它們，那時就會讀到這 20 則 retained。
+> retained **不會自己**變成設備清單上的一列——這句擋得住的就只有這件事。
+>
+> **它擋不住的**：`device_detail_page.dart` **現行版本**只要打開任何一台
+> master 的詳情頁，就會直接渲染出「子設備（N 台）」清單（收到 master status 後
+> `SlaveStatus.listFromMqtt()` 存進 `_slaveStatuses`，**不等 Phase 3 樹狀 UI**；
+> 行號會隨 App 端開發持續漂移，判準以函式名稱為準，不要照抄行號）；
+> 每一列還帶一顆「加入」鈕（`_buildSlaveTile()` → `_handleAddSlave()`），
+> 按下去會把假設備**寫進 Firestore**。之後 App 就會真的去訂
+> `hoban/hoban-aabbccddee0x/status`，讀到那 20 則永久 retained，
+> 變成一台永遠在線、怎麼控制都沒反應的**持久幽靈設備**。
+> **所以：`fakeslaves` 期間請不要打開該 master 的詳情頁，更不要按「加入」。**
 >
 > ### 三個做法，挑一個（**按安全性排序**）
 >
 > 1. **【最安全】在還沒連上 MQTT 時做第 2 項。**
 >    `jsonsize` 走 `buildStatusDoc()` ＋ `measureJson()`，**完全不碰 socket**，
 >    不需要連線。代價是 `mqtt buffer` 那個數字會是 `256`（見下方預期輸出的兩種變體）。
+>    **怎麼進入未連線狀態**：用一台**還沒配網**的 master 最乾淨；
+>    若板子已配網，**光靠「重開機」做不到**——已配網的板子幾秒內就會自動連上 broker，
+>    要在它連上之前搶下 `fakeslaves`／`jsonsize`，或乾脆先把 AP／WiFi 關掉再開機。
 >    **第 3 項需要 broker，做不到——請改走做法 2 或 3。**
 > 2. **【推薦】把 master 配網到一台私有 broker**（筆電上的 mosquitto、或自架的
 >    `broker.hoban.tw` 以外的任何私有位址），第 2、3 項都在那台上做。
@@ -231,6 +242,8 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 
 **收尾**：`fakeslaves` 期間不要下 `pair`／`unpair`（韌體會擋，但別去試）。
 **先不要重開機** —— 第 3 項要接著在同一個狀態下做（**重開機的時機在第 3 項結尾**）。
+（**走做法 1 的人**：第 3 項需要 broker、做法 1 做不到，所以第 2 項做完**直接重開機即可**，
+沒有殘留需要清，不用管上面這句「先不要重開機」。）
 
 > 對照：`ho_master1.ino` 的
 > `Serial.printf("[測試] 名冊已灌成 %d 台假 slave（未寫入 NVS，重開機即消失）\n", n)`；
@@ -268,10 +281,10 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
 - **Phase 4 Task 1 起**：若開機以來下過群組指令，每筆還會多 `"grp"` 與 `"exe"`；
   `fakeslaves` 的假 MAC 不在任何群組快照裡，所以**通常兩個都不帶** —— 那是正常的
 - **沒有** `slaves_truncated` 這個 key。
-  （**這是本清單唯一一條否定式判準，而它有明確依據**：
+  （**這是本清單兩條否定式判準之一，而它有明確依據**：
   `slaves_truncated` 只在 `shown < slaveCount` 時才被寫入，而
   `shown = min(slaveCount, maxEntries) = min(20, 25) = 20 = slaveCount`，
-  程式上沒有任何路徑會在 20 台時寫入它。）
+  程式上沒有任何路徑會在 20 台時寫入它。另一條見下方「收尾」第 3 步。）
 
 **【失敗判定】**
 - JSON 語法不完整（尾端被切掉、少一個 `]` 或 `}`）。
@@ -305,7 +318,9 @@ buffer 會停在 `PubSubClient` 建構子給的 `MQTT_MAX_PACKET_SIZE` ＝ **256
    - CLI：`mosquitto_pub -h <broker> -t hoban/hoban-aabbccddee00/status -r -n`
      （20 條各跑一次）
 3. **確認清乾淨**：重新連上 broker、訂閱 `hoban/#`，
-   應該只剩真實設備的 topic，沒有任何 `hoban-aabbccddee??`。
+   應該只剩真實設備的 topic，沒有任何 `hoban-aabbccddee??`
+   （**否定式判準，依據見下方「韌體幫不上忙」**：重開機後名冊裡沒有那些假 MAC，
+   `publishSlaveStatus()` 再也不會碰那 20 條 topic）。
 
 > **韌體幫不上忙**：重開機後名冊裡沒有那些假 MAC，`publishSlaveStatus()`
 > 再也不會碰那 20 條 topic，所以**沒有任何韌體路徑能自動清掉它們**。
