@@ -17,7 +17,9 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
     python tools/check_doc_claims.py
 全部通過印 ALL CHECKS PASSED，任何一項失敗以 exit code 1 結束。
 
-八個驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）：
+**十一個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
+這個數字自己就是一個判準 —— 初版寫「八個」而實際是九個，
+**一支專門檢查「文件寫死的 N 項」的腳本自己數錯**，所以改動方向時請一起數：
   1. HIT     —— 文件引用的判準字串必須逐字出現在原始碼裡
   2. BANNED  —— 被取代的舊值不得再以「現行事實」的樣子出現（**含原始碼註釋**）
   3. 行號    —— `檔名.ino:123` 這種對照一律禁止，判準要用字串錨點
@@ -28,6 +30,8 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
                 `esp_ota_set_boot_partition` / `#include <Update.h>` / `Update.begin(`
   9. LR 掛鉤 —— `otaSessionBusy()` 的呼叫點數量必須仍是 2
                 （readme 宣稱「LR 互斥守衛現在並不存在」，這條讓那句話會過期時吵）
+ 10. 文件必含 —— 「宣告某道保護不存在」的句子本身不得被刪（方向 9 的另一半）
+ 11. 假綠燈  —— `otaFinish()` 的函式本體不得出現「已更新到」
 
 **這支腳本擋不住什麼**（必須連著讀）：
   - 它只做**字串／算式比對**。字串對不代表語義對
@@ -112,7 +116,11 @@ HIT_IN_SOURCE = [
     ('OTA 只收 https',       '[OTA] 只接受 https:// 開頭的網址'),
     ('OTA 暫存取閒置分區',    'esp_ota_get_next_update_partition(NULL)'),
     ('OTA 階段名 downloading', 'return "downloading";'),
-    ('OTA 完成訊息',         '[OTA] 完成：%s 已更新到 %u.%u.%u'),
+    # C2 修正後的收尾訊息。**刻意不再拿「已更新到」當錨點** ——
+    # 那句話在 Task 3 是假綠燈（見方向 11）。
+    ('OTA 暫存完成訊息',     '「未轉送、未接觸任何 slave」，目標 %s 的韌體版本沒有任何改變'),
+    ('OTA 工作階段結束訊息',  '[OTA] 工作階段 %u 結束（目標 %s，階段轉為 success）'),
+    ('OTA 自己跟隨重定向',    'otaHttp->setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);'),
 ]
 
 # ── 方向 3：協定測試的項數必須與文件的判準一致 ──
@@ -180,6 +188,15 @@ BANNED_IN_DOCS = [
 # **它擋不住什麼**：只認「end(true) … 長度」與「已寫入長度 == 宣告長度」兩種寫法。
 # 換個措辭說同一件事（「它會先確認寫滿了才切換」）一樣抓不到；
 # 也擋不住別的函式庫行為被憑印象寫進文件。
+# ── 方向 10 的表：文件裡「宣告某道保護不存在」的句子，本身必須還在 ──
+# 格式：(檔案, 說明, 必須逐字出現的字串)
+DOC_MUST_CONTAIN = [
+    ('ho_master1/readme.md', 'LR 互斥守衛尚未存在的告知',
+     '「OTA 進行中拒絕切 LR」這道守衛現在並不存在'),
+    ('ho_master1/readme.md', 'otadl 不代表 slave 被更新過',
+     '兩行都不會出現「已更新到 x.y.z」'),
+]
+
 PLAN_FILES = ['docs/superpowers/plans/2026-08-17-esp32-phase4-ota-relay.md']
 BANNED_IN_PLAN = [
     ('end(true) 會檢查長度的假宣稱（A 族第 13／14 次）',
@@ -368,8 +385,18 @@ def main():
     # 所以把「呼叫點數量」釘住：定義 1 處 + otaStart() 內 1 處 = 2。
     #
     # **它擋不住什麼**：它只數字面出現次數。有人加了呼叫端**同時**改掉這個
-    # 期望值卻不改 readme，它就會靜靜通過；它也不檢查那個呼叫端是不是
-    # 真的擋住了 LR 切換（那要看語義，字串比對驗不到）。
+    #   期望值卻不改 readme，它就會靜靜通過；它也不檢查那個呼叫端是不是
+    #   真的擋住了 LR 切換（那要看語義，字串比對驗不到）。
+    #
+    # **這種「把不存在翻成可數量」的檢查有四項副作用，要跟著推廣一起講**：
+    #   1. **正當重構會誤觸**（把重入檢查抽成一個函式、加一行 assert 都會 +1），
+    #      久了會養成「看到就把期望值 +1」的反射 —— 那等於這道檢查失效。
+    #   2. **它是中斷器，不是守衛**：它只保證「有人動了就會停下來看一眼」，
+    #      不保證動的方向是對的。
+    #   3. **只適用小而穩定的量**。呼叫點會自然成長的東西（例如 espNowDelay()）
+    #      套上去只會製造噪音。
+    #   4. **它會誘使人為了讓數字好看而不重構**。發現這種壓力時，
+    #      正確的反應是改期望值＋改文件，不是放棄重構。
     n_busy = len([1 for _, line in code_lines if 'otaSessionBusy(' in line])
     if n_busy != 2:
         failures.append('[LR 掛鉤] otaSessionBusy() 的非註釋出現次數是 %d（期望 2：'
@@ -377,8 +404,45 @@ def main():
                         '若是 Phase 5 補上了 LR 互斥守衛，請同時更新 '
                         'ho_master1/readme.md 那段「守衛現在並不存在」的敘述'
                         '與本檢查的期望值' % n_busy)
+    # ── 方向 10：文件裡「宣告某道保護不存在」的句子本身必須還在 ──
+    # M3：方向 9 只釘住了不變量的一半。它保證「有人加了呼叫端會被抓到」，
+    # **但沒有保護 readme 那句「守衛現在並不存在」本身** —— 有人把那句話刪掉、
+    # 呼叫點數量不變，腳本一聲不吭，於是「這道保護不存在」的告知就靜靜消失了。
+    # 兩半要成對：方向 9 顧程式碼側，方向 10 顧文件側。
+    #
+    # **它擋不住什麼**：只比對整段字串在不在。有人改寫成語氣相反的句子
+    #（「已由 otaSessionBusy() 擋住」）而剛好不含這段字，它一樣抓不到；
+    # 它也不檢查那句話講的是不是事實。
+    for path, label, needle in DOC_MUST_CONTAIN:
+        if needle not in read(path):
+            failures.append('[文件必含] %s 少了「%s」的敘述：%r'
+                            % (path, label, needle))
+
+    # ── 方向 11：otaFinish() 不得宣稱 slave 已更新（C2／B 族第 10 次）──
+    # otaFinish() 是「工作階段結束」的共用收尾，Task 3 的唯一呼叫點是 OTA_STAGED，
+    # 那時一台 slave 都沒接觸過。「已更新到 x.y.z」只能由 Task 4 的 OTA_VERIFYING
+    # 版本回檢路徑印（前提是 slave 自己回報了新版本）。
+    #
+    # **它擋不住什麼**：只看 otaFinish() 函式本體的**非註釋行**、只認「已更新到」四個字。
+    # 註釋要排除的理由與方向 8 相同：解釋「為什麼這裡不能印那句話」的註釋本身
+    # 就得寫出這四個字，連它一起判違規的話，規則會逼人刪掉自己的說明。
+    # 換句話說同一件事（「升級成功」「版本已生效」）它抓不到；
+    # 也不管別的函式怎麼寫 —— Task 4 在 OTA_VERIFYING 裡印這句話是**正當的**，
+    # 這條規則刻意放行那裡。
+    body = master_src.split('void otaFinish()', 1)
+    if len(body) < 2:
+        failures.append('[假綠燈] 找不到 otaFinish() 的定義，方向 11 無法檢查')
+    else:
+        fn = '\n'.join(ln for ln in body[1].split('\n}', 1)[0].split('\n')
+                       if not ln.lstrip().startswith('//'))
+        if '已更新到' in fn:
+            failures.append('[假綠燈] otaFinish() 內出現「已更新到」：'
+                            '它的呼叫點包含 OTA_STAGED（下載＋暫存＋MD5，零 slave 接觸），'
+                            '這句話會讓回歸清單第 12 項的判準在第 3 項就成立')
+
     print('開機分區靜態檢查：ho_master1.ino 非註釋行 %d 行；'
-          'otaSessionBusy() 呼叫點 %d 處' % (len(code_lines), n_busy))
+          'otaSessionBusy() 呼叫點 %d 處；文件必含 %d 條'
+          % (len(code_lines), n_busy, len(DOC_MUST_CONTAIN)))
 
     print('HIT 檢查 %d 項、BANNED 樣式 %d 條 × 檔案 %d 份（含原始碼註釋）；'
           'PLAN 樣式 %d 條 × %d 份'

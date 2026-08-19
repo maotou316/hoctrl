@@ -74,7 +74,7 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 | `fakeslaves <n>` | **測試用**：把名冊灌成 n 台假 slave，量狀態 JSON 容量用。MAC 是 `AA:BB:CC:DD:EE:<i>`，**`<i>` 是迴圈索引 0…n−1（不是 n）**，所以 `fakeslaves 20` 產生的 ID 是 `hoban-aabbccddee00` … `hoban-aabbccddee13`（**十六進位**）。**不寫 NVS**、**不註冊 ESP-NOW peer**。灌入後 `fakeSlavesActive` 會鎖住 `saveSlaves()` 直到重開機，避免假 MAC 經由後續的 pair／unpair 流程寫進 NVS 汙染真實名冊。**⚠ 若當下已連上 broker，master 會在約 0.75 秒後開始把這 n 台以 `retain=true` 發上去，而那些 topic 重開機後不會被覆蓋、永久留在 broker 上** —— 清除步驟見 `docs/phase2b-regression-checklist.md` 第 3 項結尾 |
 | `jsonsize` | **測試用**：用 `buildStatusDoc()` + `measureJson()` 印出「實際會發布的那份 JSON」的大小，與 `statusBuf`／mqtt buffer 對照。不需連上 MQTT |
 | `help` | 顯示說明 |
-| `otadl <n> <url>` | **測試用（Phase 4 Task 3）**：只跑「HTTPS 下載 → 寫進 master 自己的**閒置 OTA 分區**暫存 → 算 MD5」，**不轉送給 slave**（轉送是 Task 4）。所以它印出的 `[OTA] 完成` **不代表任何 slave 被更新過**。會抹除閒置 OTA 分區（不動開機分區，master 不會變磚：全檔沒有任何一行呼叫 `esp_ota_set_boot_partition()`）。**固定帶 `force=true`**，因此**略過**「目標繼電器正開著就拒絕」那道保護。只接受 `https://` 開頭的網址 |
+| `otadl <n> <url>` | **測試用（Phase 4 Task 3）**：只跑「HTTPS 下載 → 寫進 master 自己的**閒置 OTA 分區**暫存 → 算 MD5」，**不轉送給 slave**（轉送是 Task 4）。收尾印的是 `[OTA] 已暫存完成：… 「未轉送、未接觸任何 slave」…` 與 `[OTA] 工作階段 N 結束（目標 …，階段轉為 success）`，**兩行都不會出現「已更新到 x.y.z」** —— 那句話只由 Task 4 的版本回檢路徑印。（初版這裡是 `[OTA] 完成：%s 已更新到 x.y.z`，每跑一次 `otadl` 就宣稱一次 slave 已更新，是**假綠燈方向**的判準矛盾，已修掉。）會抹除閒置 OTA 分區（不動開機分區，master 不會變磚：全檔沒有任何一行呼叫 `esp_ota_set_boot_partition()`）。**固定帶 `force=true`**，因此**略過**「目標繼電器正開著就拒絕」那道保護。只接受 `https://` 開頭的網址 |
 | `otastat` | 印出目前 OTA 工作階段的階段（`otaPhaseName()`）、目標、已下載／總位元組數與錯誤碼。工作階段結束回到 `idle` 之後**錯誤碼刻意不清空**，所以還看得到上一次的失敗原因 |
 
 **沒有 `lr on｜off` 這條序列埠指令。** Long Range 的原 Task 6 已整個移到 Phase 5，

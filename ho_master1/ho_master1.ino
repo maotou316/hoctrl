@@ -458,6 +458,12 @@ uint8_t  otaExpectMd5[16] = { 0 };   // App 指定的期望值（全 0 = 未指�
 bool     otaHasExpectMd5 = false;
 uint8_t  otaImageMd5[16] = { 0 };    // master 實算的值，Task 4 會塞進 OTA_BEGIN
 int      otaAttempt = 0;
+// ── C1 修正：重定向次數自己數（不再交給 HTTPClient 的 setRedirectLimit）──
+// 理由見 OTA_DOWNLOADING 分支的長註釋：函式庫跟隨會把「最多 4 次完整連線」
+// 塞進**一次** GET() 呼叫，而每次連線內部的 DNS 完全不受 setConnectTimeout()
+// 管轄 —— 那是一個單次可達 100 秒級的阻塞窗口，直接撞破 30 秒鐵則。
+int      otaRedirects = 0;
+const int OTA_MAX_REDIRECTS = 3;
 unsigned long otaPhaseStart = 0;
 unsigned long otaRetryAt = 0;
 unsigned long otaSessionStart = 0;
@@ -2964,13 +2970,37 @@ void otaFinish() {
   otaPhase = OTA_SUCCESS;
   otaPhaseStart = millis();
   otaErrCode[0] = '\0';
-  Serial.printf("[OTA] 完成：%s 已更新到 %u.%u.%u\n",
-                otaTargetId, otaVerMajor, otaVerMinor, otaVerPatch);
+  // ⚠ C2（B 族第 10 次，且是**第一次往假綠燈方向**）：這裡原本印
+  //   「[OTA] 完成：%s 已更新到 x.y.z」。但 otaFinish() 是「工作階段結束」的
+  //   共用收尾，在**本 Task 唯一的呼叫點**（OTA_STAGED）只代表「下載＋暫存＋MD5
+  //   完成」，一台 slave 都沒接觸過 —— 每跑一次 otadl 就印一次「已更新到」，
+  //   而 plan 的回歸清單第 12 項正是拿那一行當「slave 真的更新了」的判準。
+  //   「已更新到 x.y.z」這句話**只能由 Task 4 的版本回檢路徑（OTA_VERIFYING
+  //   比對 slaves[].fw*）印出**，本檔在那之前不得出現。
+  Serial.printf("[OTA] 工作階段 %u 結束（目標 %s，階段轉為 success）\n",
+                otaSessionId, otaTargetId);
 }
 
 // 啟動一次轉送 OTA。呼叫端（Task 5 的 MQTT 指令、序列埠 otadl）負責確認
 // otaPhase == OTA_IDLE；本函式自己也會擋（見第一段）。
 // expectMd5 可為 nullptr／空字串（App 沒指定）；force 用來略過「繼電器正開著」的保護。
+// M1 修正：把「記下這次指令的目標」收斂成一個函式。
+// 以前每條早退路徑各自 snprintf(otaTargetId, …)，**卻沒有一條更新 otaTargetMac**，
+// 於是失敗回報的 id 是新的、而 otaTargetMac 還停在上一次成功那台 ——
+// 而 otaTargetMac 的註釋正宣稱「真相一律以它為準」（Task 4 會照這句話送封包）。
+// 那是「開錯門」的 MAC 版：兩個欄位各自指向不同的 slave。
+// 現在一律經由這裡：id 與 mac **一起**更新，解析不出 MAC 就把 mac 清成全 0，
+// 索引清成 -1（全 0 的 MAC 不是任何一台 slave，送不出去、也對不上任何名冊條目）。
+void otaSetTarget(const char* slaveId, const uint8_t* mac) {
+  snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
+  if (mac != nullptr) {
+    memcpy(otaTargetMac, mac, 6);
+  } else {
+    memset(otaTargetMac, 0, sizeof(otaTargetMac));
+    otaTargetIdx = -1;
+  }
+}
+
 bool otaStart(const char* slaveId, const char* url, const char* version,
               const char* expectMd5, bool force) {
   if (otaSessionBusy()) {
@@ -2981,31 +3011,31 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
     return false;
   }
   if (!WiFi.isConnected()) {
-    snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
+    otaSetTarget(slaveId, nullptr);
     otaFail("offline");
     return false;
   }
   // TLS 握手需要約 40~50 KB heap，不夠就不要開始 —— 失敗在握手中途比一開始就拒絕更難查
   if (ESP.getFreeHeap() < 70000) {
-    snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
+    otaSetTarget(slaveId, nullptr);
     otaFail("low_heap");
     return false;
   }
 
   uint8_t mac[6];
   if (!hoParseMacFromDeviceId(slaveId, mac)) {
-    snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
+    otaSetTarget(slaveId, nullptr);
     otaFail("no_target");
     return false;
   }
   int idx = findSlave(mac);
   if (idx < 0) {
-    snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
+    otaSetTarget(slaveId, nullptr);
     otaFail("no_target");
     return false;
   }
   if (!slaves[idx].online) {
-    snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
+    otaSetTarget(slaveId, nullptr);
     otaFail("offline");
     return false;
   }
@@ -3021,7 +3051,7 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
   //   3. slaves[idx].relay 是 slave 上一次回報的值，不是即時真相；
   //      該台若剛好在抹除窗口漏掉指令、或回報還沒送到，這裡看到的就是舊值。
   if (slaves[idx].relay != 0 && !force) {
-    snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
+    otaSetTarget(slaveId, nullptr);
     otaFail("relay_on");
     Serial.println("[OTA] 目標的繼電器正開著。OTA 會讓它重開機並把繼電器歸零，"
                    "確定要做請在指令加上 \"force\":true");
@@ -3030,7 +3060,7 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
 
   // 解析 URL 取出 host（只支援 https://），供 OTA_RESOLVING 預熱 DNS 用
   if (strncmp(url, "https://", 8) != 0) {
-    snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
+    otaSetTarget(slaveId, nullptr);
     otaFail("bad_url");
     Serial.println("[OTA] 只接受 https:// 開頭的網址");
     return false;
@@ -3039,15 +3069,14 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
   const char* hostEnd = strpbrk(hostStart, "/:");
   size_t hostLen = (hostEnd != nullptr) ? (size_t)(hostEnd - hostStart) : strlen(hostStart);
   if (hostLen == 0 || hostLen >= sizeof(otaHost)) {
-    snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
+    otaSetTarget(slaveId, nullptr);
     otaFail("bad_url");
     return false;
   }
   memcpy(otaHost, hostStart, hostLen);
   otaHost[hostLen] = '\0';
 
-  snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
-  memcpy(otaTargetMac, mac, 6);
+  otaSetTarget(slaveId, mac);
   otaTargetIdx = idx;
   // ⚠ url 長度超過 otaUrl[160] 時 snprintf 會截斷，之後 GET 幾乎必然失敗（http_fail）。
   //   不另外報 bad_url，因為截斷的後果是誠實的紅燈，不是綠燈。
@@ -3078,6 +3107,7 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
   // sessionId 避開 0（0 保留給「無工作階段」）
   otaSessionId = (uint8_t)((millis() % 255) + 1);
   otaAttempt = 0;
+  otaRedirects = 0;
   otaDownloaded = 0;
   otaTotalSize = 0;
   otaTotalChunks = 0;
@@ -3102,18 +3132,26 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
 //   publish（各約 10 秒典型上界），它們各自被 maintainEspNow() 前後夾住，
 //   所以疊加的是「多個各自 ≤ 15 秒的窗口」而不是一個 35 秒的窗口。
 //   前提是那些夾心跳的呼叫都還在 —— 任何人拿掉其中一處，這個推演就失效。
+//   **這段推演第一版就漏掉了一個單一窗口的破口**（A 族第 15 次）：
+//   `setRedirectLimit(3)` 會讓**一次** GET() 內跑最多 4 次完整連線，
+//   每次連線各自吃一段不受任何 timeout 管的 DNS —— 單一窗口 48~108 秒。
+//   已改成本狀態機自己跟隨重定向（見 OTA_DOWNLOADING 的長註釋）。
+//   教訓：列「它擋不住什麼」時，**要連自己函式外 20 行的設定一起看**，
+//   不能只盤點同一個函式裡看得到的阻塞點。
 //   而且這整段推演是**靜態的、沒有實測上界**（publishJsonDoc() 註釋已載明
 //   NetworkClient::write() 的 10 秒不是硬上限）。
 void updateOtaSession(unsigned long now) {
   if (otaPhase == OTA_IDLE) return;
 
   // 整段的總上限。任何階段卡住都由這裡兜底。
-  // ⚠ 已知的誤標：本 Task 的下載半段若撞到這個上限，錯誤碼一樣是 "slave_timeout"，
-  //   但那時根本還沒接觸過任何 slave。這是照計畫實作、刻意保留的粗顆粒錯誤碼；
-  //   它不會造成假綠燈（仍是紅燈），只會讓錯誤原因看起來像 slave 的問題。
+  // M2 修正：錯誤碼依「卡在哪一半」分流。原本一律報 slave_timeout，
+  // 而下載半段撞線時根本還沒接觸過任何 slave —— 那不是假綠燈（仍是紅燈），
+  // 但會把現場的診斷**導向 ESP-NOW，而真正該查的是 WiFi／HTTP**。
+  // ⚠ 它仍然分不出「下載半段裡到底是 DNS 還是 TLS 還是伺服器不給資料」，
+  //   那要看序列埠當下停在哪一行。
   if (otaPhase != OTA_SUCCESS && otaPhase != OTA_FAILED &&
       now - otaSessionStart >= OTA_SESSION_MAX_MS) {
-    otaFail("slave_timeout");
+    otaFail(otaPhase < OTA_BEGIN_SENT ? "http_fail" : "slave_timeout");
     return;
   }
 
@@ -3166,15 +3204,77 @@ void updateOtaSession(unsigned long now) {
         otaTls->setInsecure();
         otaHttp->setConnectTimeout(6000);
         otaHttp->setTimeout(6000);
-        // ho_relay2 手寫的 302 處理有缺陷：重定向分支用 continue 且「不」遞增
-        // retryCount，惡意或設定錯誤的伺服器可讓它無限迴圈。改交給函式庫限制次數。
-        otaHttp->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-        otaHttp->setRedirectLimit(3);
+        // ── C1（A 族第 15 次）：**必須關掉函式庫的自動跟隨** ──
+        // 這裡原本是 setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS) +
+        // setRedirectLimit(3)，理由是「把次數上限交給函式庫比 ho_relay2 的
+        // 手寫無限迴圈安全」。次數確實有上限了，**但阻塞時間沒有**：
+        //   HTTPClient::sendRequest() 是 `do { … } while (redirect);`，
+        //   限制 3 代表**一次 GET() 呼叫內最多做 4 次完整連線**；
+        //   而每次 NetworkClientSecure::connect() 都會自己先做一次
+        //   Network.hostByName()，**那段 DNS 不受 setConnectTimeout(6000) 管**
+        //   （lwIP 沒有 timeout 參數，最壞約 15 秒；OTA_RESOLVING 的預熱只暖了
+        //    原始 host，重定向後的新主機是冷的）。
+        //   單一 GET() 的最壞窗口：全部命中快取 ≈ 4×12 = 48 秒；
+        //   一次重定向到冷主機 ≈ 12+27 = 39 秒；最壞 ≈ 4×27 = 108 秒。
+        //   任何一個都遠超過 slave 的 30 秒失聯門檻 →
+        //   **全場 slave 逾時 → 正關著的籠門全部放開**。這是本系統最壞的結果。
+        //   而 GitHub Releases 的下載網址（302 到 objects.githubusercontent.com）
+        //   正是最可能的部署形狀 —— 這不是理論路徑。
+        // 改法：函式庫不跟隨，**由本狀態機自己跟隨**：收到 3xx 就取 Location、
+        // 回到 OTA_RESOLVING 重新預熱新主機的 DNS，再開一次連線。
+        // 這樣每一段都回到「一次 loop() 只做一個阻塞步驟、前後補心跳」的預算內。
+        otaHttp->setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
 
         otaBurst("HTTPS 連線與 GET 前");
         bool begun = otaHttp->begin(*otaTls, otaUrl);
         int code = begun ? otaHttp->GET() : -1;
         otaBurst("HTTPS 連線與 GET 後");
+
+        // ── C1：自己跟隨重定向（函式庫已被關掉）──
+        // 只認 RFC 這五個碼；Location 必須仍是 https://（降級到 http 一律拒絕）。
+        // 次數用**獨立**的 otaRedirects 計數（ho_relay2 的缺陷正是重定向分支
+        // 不遞增重試計數，於是可以無限繞）；otaAttempt 不受影響，兩者互不吃對方的額度。
+        if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
+            code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT ||
+            code == HTTP_CODE_PERMANENT_REDIRECT) {
+          // getLocation() 讀的是 HTTPClient::_location，它在解析標頭時**無條件**
+          // 填入（HTTPClient.cpp 的 Location 分支不看 _followRedirects），
+          // 所以關掉自動跟隨之後仍然拿得到。_location 在物件生命週期內不會被清空，
+          // 但我們**每次嘗試都 new 一個新的 HTTPClient**，所以不可能讀到上一輪的殘值。
+          String loc = otaHttp->getLocation();
+          otaReleaseHttp();
+          otaRedirects++;
+          if (otaRedirects > OTA_MAX_REDIRECTS) {
+            Serial.printf("[OTA] 重定向超過 %d 次，放棄\n", OTA_MAX_REDIRECTS);
+            otaFail("http_fail");
+            return;
+          }
+          // ⚠ 相對路徑的 Location（"/path/x.bin"）會被這裡判成不可用而失敗。
+          //   這是刻意的 fail-closed：要支援相對路徑就得自己拼 base URL，
+          //   而拼錯的後果是去下載一份不知道是什麼的東西。誤紅可接受。
+          if (loc.length() == 0 || loc.length() >= sizeof(otaUrl) ||
+              strncmp(loc.c_str(), "https://", 8) != 0) {
+            Serial.printf("[OTA] 碼 %d 的 Location 不可用（空、過長、或不是 https）：%s\n",
+                          code, loc.c_str());
+            otaFail("bad_url");
+            return;
+          }
+          // 重新取 host，回到 OTA_RESOLVING 預熱它的 DNS。
+          const char* hs = loc.c_str() + 8;
+          const char* he = strpbrk(hs, "/:");
+          size_t hl = (he != nullptr) ? (size_t)(he - hs) : strlen(hs);
+          if (hl == 0 || hl >= sizeof(otaHost)) { otaFail("bad_url"); return; }
+          memcpy(otaHost, hs, hl);
+          otaHost[hl] = '\0';
+          snprintf(otaUrl, sizeof(otaUrl), "%s", loc.c_str());
+          Serial.printf("[OTA] 碼 %d 重定向（第 %d／%d 次）→ %s\n",
+                        code, otaRedirects, OTA_MAX_REDIRECTS, otaUrl);
+          otaAttempt = 0;
+          otaRetryAt = 0;
+          otaPhase = OTA_RESOLVING;
+          otaPhaseStart = millis();
+          return;
+        }
 
         if (code != HTTP_CODE_OK) {
           Serial.printf("[OTA] GET 失敗，碼 %d，10 秒後重試\n", code);
@@ -3183,12 +3283,27 @@ void updateOtaSession(unsigned long now) {
           return;
         }
 
-        // ⚠ getSize() 在 chunked 傳輸時回 -1，會落進下面的 len <= 65536 分支、
-        //   被記成 "too_big"。錯誤碼名稱與實情不符（實情是「長度未知，不支援」），
-        //   但拒絕本身是對的：本流程需要事先知道總長才能抹除與分包。
+        // M2：getSize() 在 chunked 傳輸回 -1。那是「長度未知，本流程不支援」，
+        //     不是「太大」—— 分開報成 http_fail，免得現場照 too_big 去查檔案大小。
+        // M4：上界不再硬編碼 2031616，改問**實際的暫存分區**。
+        //     兩顆板子的 partitions.csv 位元組級相同（app0/app1 各 0x1F0000 =
+        //     2,031,616），所以這個值目前等於 slave 端 bg.totalSize > 2031616 的
+        //     那道檢查；改用分區大小的意義是「分區表改了，這裡自動跟著改」。
+        //     ⚠ 它擋不住 master 與 slave 分區表不一致的情況：master 的槽若比
+        //     slave 大，超出的檔案會由 **slave** 拒收（誤紅、fail-closed），
+        //     不會變成假綠燈。
         int len = otaHttp->getSize();
-        if (len <= 65536 || len > 2031616) {
-          Serial.printf("[OTA] 韌體長度不合理: %d\n", len);
+        if (len < 0) {
+          Serial.println("[OTA] 伺服器沒給 Content-Length（可能是 chunked），本流程需要事先知道總長");
+          otaReleaseHttp();
+          otaFail("http_fail");
+          return;
+        }
+        const esp_partition_t* stagePeek = esp_ota_get_next_update_partition(NULL);
+        uint32_t stageMax = (stagePeek != nullptr) ? stagePeek->size : 0;
+        if (len <= 65536 || (uint32_t)len > stageMax) {
+          Serial.printf("[OTA] 韌體長度不合理: %d（暫存分區 %u bytes）\n",
+                        len, (unsigned)stageMax);
           otaReleaseHttp();
           otaFail("too_big");
           return;
@@ -3297,7 +3412,10 @@ void updateOtaSession(unsigned long now) {
       // 讓 otadl 指令可以單獨驗證「下載 + 暫存 + MD5」這一整段。
       // ⚠ 因此本 Task 的 "success" **不代表任何 slave 被更新過**，
       //   只代表 master 把檔案抓下來、寫進暫存分區、MD5 算完了。
-      Serial.println("[OTA] 已暫存完成，轉送階段尚未實作（Task 4）");
+      Serial.printf("[OTA] 已暫存完成：%u bytes 已寫入 master 的閒置分區、MD5 已核對；"
+                    "「未轉送、未接觸任何 slave」，目標 %s 的韌體版本沒有任何改變"
+                    "（轉送是 Task 4）\n",
+                    (unsigned)otaDownloaded, otaTargetId);
       otaFinish();
       return;
 

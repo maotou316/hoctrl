@@ -1446,8 +1446,14 @@ void otaFinish() {
   otaPhase = OTA_SUCCESS;
   otaPhaseStart = millis();
   otaErrCode[0] = '\0';
-  Serial.printf("[OTA] 完成：%s 已更新到 %u.%u.%u\n",
-                otaTargetId, otaVerMajor, otaVerMinor, otaVerPatch);
+  // ⚠ Task 3 執行後的更正（C2／B 族第 10 次，第一次往假綠燈方向）：
+  //   otaFinish() 是「工作階段結束」的共用收尾，Task 3 的唯一呼叫點是
+  //   OTA_STAGED —— 那時一台 slave 都沒接觸過。原本這裡印
+  //   「[OTA] 完成：%s 已更新到 x.y.z」，等於每跑一次 otadl 就宣稱一次
+  //   slave 已更新，而回歸清單第 12 項正是拿那一行當判準。
+  //   「已更新到」只能由 Task 4 的 OTA_VERIFYING 版本回檢路徑印。
+  Serial.printf("[OTA] 工作階段 %u 結束（目標 %s，階段轉為 success）\n",
+                otaSessionId, otaTargetId);
 }
 ```
 
@@ -1737,7 +1743,11 @@ void updateOtaSession(unsigned long now) {
     case OTA_STAGED:
       // Task 4 會在這裡接上轉送。本 Task 先原地停住並印一行，
       // 讓 otadl 指令可以單獨驗證「下載 + 暫存 + MD5」這一整段。
-      Serial.println("[OTA] 已暫存完成，轉送階段尚未實作（Task 4）");
+      // 這一行要把「什麼沒發生」講完整：Task 3 的成功不是 slave 的成功。
+      Serial.printf("[OTA] 已暫存完成：%u bytes 已寫入 master 的閒置分區、MD5 已核對；"
+                    "「未轉送、未接觸任何 slave」，目標 %s 的韌體版本沒有任何改變"
+                    "（轉送是 Task 4）\n",
+                    (unsigned)otaDownloaded, otaTargetId);
       otaFinish();
       return;
 
@@ -2177,6 +2187,11 @@ uint8_t otaProgressPercent() {
           slaves[otaTargetIdx].fwMajor == otaVerMajor &&
           slaves[otaTargetIdx].fwMinor == otaVerMinor &&
           slaves[otaTargetIdx].fwPatch == otaVerPatch) {
+        // ⚠ 這裡是全檔**唯一**有資格印「已更新到 x.y.z」的地方 ——
+        //   它的前提是 slave 重開機後**自己回報**的版本三個欄位都對上了。
+        //   回歸清單第 12 項的判準字串就是這一行（見 Task 3 的 C2）。
+        Serial.printf("[OTA] 完成：%s 已更新到 %u.%u.%u\n",
+                      otaTargetId, otaVerMajor, otaVerMinor, otaVerPatch);
         otaFinish();
         return;
       }
@@ -2527,7 +2542,7 @@ commit 訊息必須說明：
 | 0 | **前置：master 與所有 slave 都燒了新韌體** | 協定版本 2 是 flag-day；混版時 slave 會在 30 秒後印失聯並關閉繼電器。**失敗判定** |
 | 1 | `.\flash.ps1 -Model test -Upload` 後跑協定測試，應顯示 41 項全過 | Task 1 的測試 |
 | 2 | 平時（無 OTA）行為與 Phase 2b 完全一致：狀態 10 秒一則、代發輪播、`ALL:*`、配對 | **回歸，失敗判定** |
-| 3 | `otadl <n> <url>` 指向一個真實的 slave `.bin`：序列埠依序出現「解析主機」→「開始下載」→「下載完成 … MD5」 | 只驗證下載段 |
+| 3 | `otadl <n> <url>` 指向一個真實的 slave `.bin`：序列埠依序出現「解析主機」→「開始下載」→「下載完成 … MD5」→「已暫存完成：… 「未轉送、未接觸任何 slave」…」 | 只驗證下載段。**失敗判定**：這一項若出現「已更新到 x.y.z」就是**假綠燈**（本項全程沒有任何 ESP-NOW OTA 封包），判 FAIL |
 | 4 | 同上，**下載全程 slave 端不得出現失聯訊息** | **失敗判定**（決定 1c 的核心） |
 | 5 | 故意給一個不存在的網域：10 秒後重試、共 3 次後 `[OTA] 失敗：dns_fail`，**期間 slave 不失聯** | 驗證非阻塞重試 |
 | 6 | 故意給一個回傳 HTML 的網址：`[OTA] 不是合法的 ESP32 映像` | 驗證 0xE9 檢查 |
@@ -2536,7 +2551,7 @@ commit 訊息必須說明：
 | 9 | 轉送全程（30~90 秒）**其他 slave 一台都不失聯、繼電器不被強制關閉** | **失敗判定，本階段最重要的一條** |
 | 10 | 轉送期間 App／MQTT Explorer 看得到 `ota.phase` 由 `downloading` → `relaying` → `verifying` → `success`，`progress` 遞增 | |
 | 11 | 轉送期間目標 slave 的代發 status 是 `"updating"` 且帶 `ota_progress` | |
-| 12 | slave 重啟後回線，master 印出 `[OTA] 完成：… 已更新到 x.y.z`，`ota.phase` 變 `success` | 驗證版本回檢 |
+| 12 | slave 重啟後回線，master 印出 `[OTA] 完成：… 已更新到 x.y.z`，`ota.phase` 變 `success` | 驗證版本回檢。**這一行只由 Task 4 的 `OTA_VERIFYING` 比對 `slaves[].fwMajor/Minor/Patch` 之後印出**，是「slave 自己回報了新版本」的證據；Task 3 的 `otadl`（第 3 項）不會、也不得印出它 |
 | 13 | **轉送中途把目標 slave 拔電**：master 重試後 `[OTA] 失敗：espnow_fail` 或 `slave_timeout`；**slave 復電後仍是舊韌體、可正常配對與控制** | **不變磚的正面驗證，失敗判定** |
 | 14 | **轉送中途把 master 拔電**：slave 印出 `[OTA] 已中止：超過 30 秒沒收到 OTA 封包`，**開機分區未變動** | **失敗判定** |
 | 15 | 故意送一份 MD5 對不上的映像（改一個位元組）：slave 印出校驗失敗、**重啟後仍是舊韌體** | 驗證 `Update.end(true)` 那道 |
