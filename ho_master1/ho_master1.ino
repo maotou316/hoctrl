@@ -448,7 +448,20 @@ uint8_t  otaTargetMac[6] = { 0 };
 int      otaTargetIdx = -1;
 char     otaUrl[160] = "";
 char     otaHost[80] = "";
+// C3 修正：OTA_RESOLVING 解析出來的 IP 與埠號要留著，之後**直接用 IP 連線** ——
+// 這樣 NetworkClientSecure::connect() 就不會再自己做一次 hostByName()，
+// 「DNS 快取在兩次解析之間失效」那條退化路徑被結構性消除（不是靠機率壓低）。
+// SNI 仍然正確：走的是 connect(ip, port, host, …) 這個帶 host 的多載，
+// ssl_client.cpp 的 mbedtls_ssl_set_hostname() 收到的就是 otaHost。
+IPAddress otaHostIp;
+uint16_t otaPort = 443;
 uint8_t  otaVerMajor = 0, otaVerMinor = 0, otaVerPatch = 0;
+// C4：版本字串解析成功且**不是 0.0.0** 才為真。
+// 用途是給 Task 4 的版本回檢當硬性前提：slave 從沒回報過狀態時 slaves[].fw* 是 0，
+// 若目標版本也是 0.0.0（`otadl` 固定傳的就是它），「版本對上了」會在 slave 還在
+// 重開機的時候就成立 —— 那是假綠燈。**Task 4 不得在 otaHasVersion 為 false 時
+// 宣告成功。**（本 Task 走不到版本回檢，這個旗標現在只被設定、沒有被讀取。）
+bool     otaHasVersion = false;
 char     otaErrCode[20] = "";        // 見 otaErrorName() 的長度約束（最長 16 字元）
 uint8_t  otaSessionId = 0;
 uint32_t otaTotalSize = 0;
@@ -464,6 +477,16 @@ int      otaAttempt = 0;
 // 管轄 —— 那是一個單次可達 100 秒級的阻塞窗口，直接撞破 30 秒鐵則。
 int      otaRedirects = 0;
 const int OTA_MAX_REDIRECTS = 3;
+// 敘述更正 (a)：OTA_DOWNLOADING 的第一次進入原本在**同一輪 loop()** 裡做了
+// GET 與抹除兩個阻塞點（中間有 otaBurst()，沒有實害），所以「一次 loop() 只做
+// 一個阻塞步驟」字面上不成立。現在拆成四個子步驟，一輪只走一個，讓那句話為真。
+enum OtaDlStep : uint8_t {
+  OTA_DL_CONNECT = 0,   // TCP + TLS 握手（≤ 6 + 6 秒，見 C3）
+  OTA_DL_REQUEST,       // begin() + GET()（重用已建立的連線，不再解析 DNS）
+  OTA_DL_ERASE,         // 抹除暫存分區（1~3 秒）
+  OTA_DL_STREAM,        // 串流讀取（非阻塞，每輪最多 4096 bytes）
+};
+OtaDlStep otaDlStep = OTA_DL_CONNECT;
 unsigned long otaPhaseStart = 0;
 unsigned long otaRetryAt = 0;
 unsigned long otaSessionStart = 0;
@@ -2984,6 +3007,28 @@ void otaFinish() {
 // 啟動一次轉送 OTA。呼叫端（Task 5 的 MQTT 指令、序列埠 otadl）負責確認
 // otaPhase == OTA_IDLE；本函式自己也會擋（見第一段）。
 // expectMd5 可為 nullptr／空字串（App 沒指定）；force 用來略過「繼電器正開著」的保護。
+// 解析 https:// 網址，填好 otaHost 與 otaPort。只在 otaStart() 與重定向處呼叫。
+// **擋不住什麼**：不做完整的 URL 驗證。它只確認「https://」開頭、host 非空且放得下、
+// 不含 '@'（帶 userinfo 的網址一律拒絕，fail-closed）、埠號是數字。
+// 路徑本身完全不檢查 —— 那是伺服器的事。
+bool otaParseUrlHost(const char* url) {
+  if (strncmp(url, "https://", 8) != 0) return false;
+  const char* hostStart = url + 8;
+  const char* hostEnd = strpbrk(hostStart, "/:");
+  size_t hostLen = (hostEnd != nullptr) ? (size_t)(hostEnd - hostStart) : strlen(hostStart);
+  if (hostLen == 0 || hostLen >= sizeof(otaHost)) return false;
+  if (memchr(hostStart, '@', hostLen) != nullptr) return false;
+  memcpy(otaHost, hostStart, hostLen);
+  otaHost[hostLen] = '\0';
+  otaPort = 443;
+  if (hostEnd != nullptr && *hostEnd == ':') {
+    int port = atoi(hostEnd + 1);
+    if (port <= 0 || port > 65535) return false;
+    otaPort = (uint16_t)port;
+  }
+  return true;
+}
+
 // M1 修正：把「記下這次指令的目標」收斂成一個函式。
 // 以前每條早退路徑各自 snprintf(otaTargetId, …)，**卻沒有一條更新 otaTargetMac**，
 // 於是失敗回報的 id 是新的、而 otaTargetMac 還停在上一次成功那台 ——
@@ -3058,23 +3103,13 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
     return false;
   }
 
-  // 解析 URL 取出 host（只支援 https://），供 OTA_RESOLVING 預熱 DNS 用
-  if (strncmp(url, "https://", 8) != 0) {
+  // 解析 URL 取出 host 與埠號（只支援 https://），供 OTA_RESOLVING 預熱 DNS 用
+  if (!otaParseUrlHost(url)) {
     otaSetTarget(slaveId, nullptr);
     otaFail("bad_url");
-    Serial.println("[OTA] 只接受 https:// 開頭的網址");
+    Serial.println("[OTA] 網址不可用：只接受 https:// 開頭、host 非空且不含 '@' 的網址");
     return false;
   }
-  const char* hostStart = url + 8;
-  const char* hostEnd = strpbrk(hostStart, "/:");
-  size_t hostLen = (hostEnd != nullptr) ? (size_t)(hostEnd - hostStart) : strlen(hostStart);
-  if (hostLen == 0 || hostLen >= sizeof(otaHost)) {
-    otaSetTarget(slaveId, nullptr);
-    otaFail("bad_url");
-    return false;
-  }
-  memcpy(otaHost, hostStart, hostLen);
-  otaHost[hostLen] = '\0';
 
   otaSetTarget(slaveId, mac);
   otaTargetIdx = idx;
@@ -3087,6 +3122,11 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
   // 只影響序列埠與 Task 4 的 OTA_BEGIN 版本欄位，不影響 MD5 校驗。
   otaVerMajor = otaVerMinor = otaVerPatch = 0;
   sscanf(version, "%hhu.%hhu.%hhu", &otaVerMajor, &otaVerMinor, &otaVerPatch);
+  otaHasVersion = (otaVerMajor != 0 || otaVerMinor != 0 || otaVerPatch != 0);
+  if (!otaHasVersion) {
+    Serial.println("⚠ [OTA] 目標版本是 0.0.0（未指定或解析失敗）：Task 4 的版本回檢"
+                   "**不得**用它宣告成功 —— 沒回報過狀態的 slave 版本欄位本來就是 0.0.0");
+  }
 
   otaHasExpectMd5 = false;
   memset(otaExpectMd5, 0, sizeof(otaExpectMd5));
@@ -3108,6 +3148,7 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
   otaSessionId = (uint8_t)((millis() % 255) + 1);
   otaAttempt = 0;
   otaRedirects = 0;
+  otaDlStep = OTA_DL_CONNECT;
   otaDownloaded = 0;
   otaTotalSize = 0;
   otaTotalChunks = 0;
@@ -3179,232 +3220,307 @@ void updateOtaSession(unsigned long now) {
         return;
       }
       Serial.printf("[OTA] %s → %s\n", otaHost, ip.toString().c_str());
+      // C3：把 IP 留下來，下一階段直接用它連線，不再讓 connect() 自己解析一次。
+      otaHostIp = ip;
       otaAttempt = 0;
       otaRetryAt = 0;
+      otaDlStep = OTA_DL_CONNECT;
       otaPhase = OTA_DOWNLOADING;
       otaPhaseStart = millis();
       return;
     }
 
     case OTA_DOWNLOADING: {
-      // 第一次進來：建立連線、發 GET、確認長度、抹除分區
-      if (otaHttp == nullptr) {
-        if (otaRetryAt != 0 && (long)(now - otaRetryAt) < 0) return;
-        otaAttempt++;
-        if (otaAttempt > OTA_MAX_ATTEMPTS) { otaFail("http_fail"); return; }
+      // 敘述更正 (a)：這一段拆成四個子步驟，**每輪 loop() 只走一個**。
+      // 初版把 GET 與抹除放在同一輪（中間有 otaBurst()，沒有實害），
+      // 但那讓「一次 loop() 只做一個阻塞步驟」這句話字面上不成立 ——
+      // 現在它是真的。四個步驟的阻塞上界：
+      //   CONNECT ≤ 6（TCP select）+ 6（TLS 握手，見 C3）= 12 秒
+      //   REQUEST ≤ 6 秒的**無進度**逾時（見該步驟的「擋不住什麼」）
+      //   ERASE   1~3 秒
+      //   STREAM  非阻塞（只讀 available() 已經到的量）
+      switch (otaDlStep) {
 
-        otaTls = new WiFiClientSecure();
-        otaHttp = new HTTPClient();
-        if (otaTls == nullptr || otaHttp == nullptr) { otaReleaseHttp(); otaFail("low_heap"); return; }
+        case OTA_DL_CONNECT: {
+          if (otaRetryAt != 0 && (long)(now - otaRetryAt) < 0) return;
+          otaAttempt++;
+          if (otaAttempt > OTA_MAX_ATTEMPTS) { otaFail("http_fail"); return; }
 
-        // ⚠ 已知限制：**不驗證伺服器憑證**（沿用 ho_relay2 的做法）。
-        //   也就是說 DNS 汙染或中間人可以餵給 master 任意一份「合法的 ESP32 映像」，
-        //   而下面的 0xE9 魔術碼檢查完全擋不住那種攻擊。唯一的端到端防線是
-        //   App 在 update_slave 帶 md5（otaStart() 的 expectMd5）—— **沒帶就沒有**。
-        otaTls->setInsecure();
-        otaHttp->setConnectTimeout(6000);
-        otaHttp->setTimeout(6000);
-        // ── C1（A 族第 15 次）：**必須關掉函式庫的自動跟隨** ──
-        // 這裡原本是 setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS) +
-        // setRedirectLimit(3)，理由是「把次數上限交給函式庫比 ho_relay2 的
-        // 手寫無限迴圈安全」。次數確實有上限了，**但阻塞時間沒有**：
-        //   HTTPClient::sendRequest() 是 `do { … } while (redirect);`，
-        //   限制 3 代表**一次 GET() 呼叫內最多做 4 次完整連線**；
-        //   而每次 NetworkClientSecure::connect() 都會自己先做一次
-        //   Network.hostByName()，**那段 DNS 不受 setConnectTimeout(6000) 管**
-        //   （lwIP 沒有 timeout 參數，最壞約 15 秒；OTA_RESOLVING 的預熱只暖了
-        //    原始 host，重定向後的新主機是冷的）。
-        //   單一 GET() 的最壞窗口：全部命中快取 ≈ 4×12 = 48 秒；
-        //   一次重定向到冷主機 ≈ 12+27 = 39 秒；最壞 ≈ 4×27 = 108 秒。
-        //   任何一個都遠超過 slave 的 30 秒失聯門檻 →
-        //   **全場 slave 逾時 → 正關著的籠門全部放開**。這是本系統最壞的結果。
-        //   而 GitHub Releases 的下載網址（302 到 objects.githubusercontent.com）
-        //   正是最可能的部署形狀 —— 這不是理論路徑。
-        // 改法：函式庫不跟隨，**由本狀態機自己跟隨**：收到 3xx 就取 Location、
-        // 回到 OTA_RESOLVING 重新預熱新主機的 DNS，再開一次連線。
-        // 這樣每一段都回到「一次 loop() 只做一個阻塞步驟、前後補心跳」的預算內。
-        otaHttp->setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+          otaReleaseHttp();                     // 保險：清掉上一次嘗試的殘留
+          otaTls = new WiFiClientSecure();
+          if (otaTls == nullptr) { otaFail("low_heap"); return; }
 
-        otaBurst("HTTPS 連線與 GET 前");
-        bool begun = otaHttp->begin(*otaTls, otaUrl);
-        int code = begun ? otaHttp->GET() : -1;
-        otaBurst("HTTPS 連線與 GET 後");
+          // ⚠ 已知限制：**不驗證伺服器憑證**（沿用 ho_relay2 的做法）。
+          //   DNS 汙染或中間人可以餵給 master 任意一份「合法的 ESP32 映像」，
+          //   而後面的 0xE9 魔術碼檢查完全擋不住那種攻擊。唯一的端到端防線是
+          //   App 在 update_slave 帶 md5（otaStart() 的 expectMd5）—— **沒帶就沒有**。
+          otaTls->setInsecure();
 
-        // ── C1：自己跟隨重定向（函式庫已被關掉）──
-        // 只認 RFC 這五個碼；Location 必須仍是 https://（降級到 http 一律拒絕）。
-        // 次數用**獨立**的 otaRedirects 計數（ho_relay2 的缺陷正是重定向分支
-        // 不遞增重試計數，於是可以無限繞）；otaAttempt 不受影響，兩者互不吃對方的額度。
-        if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
-            code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT ||
-            code == HTTP_CODE_PERMANENT_REDIRECT) {
-          // getLocation() 讀的是 HTTPClient::_location，它在解析標頭時**無條件**
-          // 填入（HTTPClient.cpp 的 Location 分支不看 _followRedirects），
-          // 所以關掉自動跟隨之後仍然拿得到。_location 在物件生命週期內不會被清空，
-          // 但我們**每次嘗試都 new 一個新的 HTTPClient**，所以不可能讀到上一輪的殘值。
-          String loc = otaHttp->getLocation();
-          otaReleaseHttp();
-          otaRedirects++;
-          if (otaRedirects > OTA_MAX_REDIRECTS) {
-            Serial.printf("[OTA] 重定向超過 %d 次，放棄\n", OTA_MAX_REDIRECTS);
+          // ── C3（A 族第 16 次）：TLS 握手的上界不是 setConnectTimeout 管的 ──
+          // 回去逐行讀了 core 3.3.7 的原始碼（不是照 API 名稱推斷）：
+          //   NetworkClientSecure.cpp:41/69  建構子 handshake_timeout = 120000
+          //   ssl_client.cpp:320             握手迴圈用 handshake_timeout 判逾時
+          //   ssl_client.cpp:109             socket_timeout 只管 TCP connect 的 select
+          //   NetworkClient.cpp:351          setConnectionTimeout(ms) 才寫得到 _timeout
+          //                                  （Stream::setTimeout() 寫的是**另一個**
+          //                                   同名成員，只管 readBytes）
+          // 也就是說：不設 setHandshakeTimeout()，**握手的上界是 120 秒**，
+          // 而全 repo 之前一次都沒設過。那比重定向那條更容易觸發 ——
+          // 不需要伺服器回 3xx，只要握手慢或半死，而 setInsecure() 的握手每次 OTA 必經。
+          // ⚠⚠ setHandshakeTimeout() 的參數單位是**秒**（實作是 *1000），
+          //     setConnectionTimeout() 與 Stream::setTimeout() 是**毫秒**。寫錯一個
+          //     就是 100 分鐘。三行故意排在一起，改的人一眼看得到單位不同。
+          otaTls->setHandshakeTimeout(6);        // 秒！TLS 握手迴圈的上界
+          otaTls->setConnectionTimeout(6000);    // 毫秒：TCP connect 的 select
+          otaTls->setTimeout(6000);              // 毫秒：Stream 的讀取逾時
+
+          // C3：直接用 OTA_RESOLVING 解析好的 IP 連線，**帶著 host 做 SNI**。
+          // 這條多載（ip, port, host, …）在 ssl_client.cpp:296 會把 host 交給
+          // mbedtls_ssl_set_hostname()，所以 CDN 的虛擬主機仍然正確。
+          // 它也是「退化路徑」被消除的地方：connect(host, …) 那條多載會自己再
+          // 呼叫一次 Network.hostByName()，而這條不會。
+          otaBurst("TCP + TLS 握手前");
+          int cres = otaTls->connect(otaHostIp, otaPort, otaHost, nullptr, nullptr, nullptr);
+          otaBurst("TCP + TLS 握手後");
+
+          if (cres != 1) {
+            Serial.printf("[OTA] 連線 %s:%u（%s）失敗，10 秒後重試\n",
+                          otaHost, otaPort, otaHostIp.toString().c_str());
+            otaReleaseHttp();
+            otaDlStep = OTA_DL_CONNECT;
+            otaRetryAt = millis() + OTA_RETRY_GAP_MS;
+            return;
+          }
+          otaDlStep = OTA_DL_REQUEST;
+          return;
+        }
+
+        case OTA_DL_REQUEST: {
+          if (otaTls == nullptr || !otaTls->connected()) {
+            Serial.println("[OTA] 送出請求前連線已斷，10 秒後重試");
+            otaReleaseHttp();
+            otaDlStep = OTA_DL_CONNECT;
+            otaRetryAt = millis() + OTA_RETRY_GAP_MS;
+            return;
+          }
+          otaHttp = new HTTPClient();
+          if (otaHttp == nullptr) { otaReleaseHttp(); otaDlStep = OTA_DL_CONNECT; otaFail("low_heap"); return; }
+          otaHttp->setConnectTimeout(6000);
+          otaHttp->setTimeout(6000);
+          // ── C1（A 族第 15 次）：**必須關掉函式庫的自動跟隨** ──
+          // 初版是 setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS) +
+          // setRedirectLimit(3)，理由是「把次數上限交給函式庫比 ho_relay2 的
+          // 手寫無限迴圈安全」。次數確實有上限了，**但阻塞時間沒有**：
+          //   HTTPClient::sendRequest() 是 `do { … } while (redirect);`，
+          //   限制 3 代表**一次 GET() 呼叫內最多做 4 次完整連線**，
+          //   而每次 NetworkClientSecure::connect(host, …) 都自己先做一次
+          //   Network.hostByName()，**那段 DNS 不受任何 timeout 參數管**。
+          //   單一 GET() 的最壞窗口 48~108 秒 → 全場 slave 逾時 →
+          //   **正關著的籠門全部放開**。而 GitHub Releases 的下載網址
+          //   （302 到 objects.githubusercontent.com）正是最可能的部署形狀。
+          // 改法：函式庫不跟隨，由本狀態機自己跟隨 —— 收到 3xx 就回 OTA_RESOLVING，
+          // 重新預熱新主機的 DNS，再走一次 CONNECT → REQUEST。
+          otaHttp->setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+
+          // begin() 不會關掉我們已經建立的連線，GET() 內的 connect() 看到
+          // connected() 為真就直接重用（HTTPClient.cpp 的 connect() 第一段）——
+          // 這正是「不再有第二次 DNS」的機制。
+          otaBurst("送出 GET 前");
+          bool begun = otaHttp->begin(*otaTls, otaUrl);
+          int code = begun ? otaHttp->GET() : -1;
+          otaBurst("送出 GET 後");
+          // ⚠ 這一步的 6000 是 HTTPClient 讀回應標頭的**無進度**逾時
+          //   （handleHeaderResponse() 每收到資料就重設計時），**不是總時長上界**。
+          //   一台每 5 秒吐一個 byte 的伺服器可以把這個窗口拉到任意長，
+          //   而 OTA_SESSION_MAX_MS 是 loop() 層的檢查、**攔不住單一阻塞呼叫**。
+          //   本 Task 沒有修掉這一條（要修得自己送請求、自己非阻塞讀標頭，
+          //   規模等同再寫一個 Task），**列為已知殘留缺口**。
+
+          // ── C1：自己跟隨重定向 ──
+          // 只認 RFC 這五個碼（回去讀了 HTTPClient.h 的列舉定義）；
+          // Location 必須仍是 https://（降級到 http 一律拒絕）。
+          // 次數用**獨立**的 otaRedirects 計數（ho_relay2 的缺陷正是重定向分支
+          // 不遞增重試計數，於是可以無限繞）；otaAttempt 不受影響。
+          if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
+              code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT ||
+              code == HTTP_CODE_PERMANENT_REDIRECT) {
+            // getLocation() 讀的是 HTTPClient::_location，它在解析標頭時**無條件**
+            // 填入（HTTPClient.cpp 的 Location 分支不看 _followRedirects），
+            // 所以關掉自動跟隨之後仍然拿得到。每次嘗試都 new 一個新的 HTTPClient，
+            // 不可能讀到上一輪的殘值。
+            String loc = otaHttp->getLocation();
+            otaReleaseHttp();
+            otaDlStep = OTA_DL_CONNECT;
+            otaRedirects++;
+            if (otaRedirects > OTA_MAX_REDIRECTS) {
+              Serial.printf("[OTA] 重定向超過 %d 次，放棄\n", OTA_MAX_REDIRECTS);
+              otaFail("http_fail");
+              return;
+            }
+            // ⚠ 相對路徑的 Location（"/path/x.bin"）會被 otaParseUrlHost() 判成
+            //   不可用而失敗。這是刻意的 fail-closed：要支援相對路徑就得自己拼
+            //   base URL，而拼錯的後果是去下載一份不知道是什麼的東西。誤紅可接受。
+            if (loc.length() == 0 || loc.length() >= sizeof(otaUrl) ||
+                !otaParseUrlHost(loc.c_str())) {
+              Serial.printf("[OTA] 碼 %d 的 Location 不可用（空、過長、或不是可解析的 https 網址）：%s\n",
+                            code, loc.c_str());
+              otaFail("bad_url");
+              return;
+            }
+            snprintf(otaUrl, sizeof(otaUrl), "%s", loc.c_str());
+            Serial.printf("[OTA] 碼 %d 重定向（第 %d／%d 次）→ %s\n",
+                          code, otaRedirects, OTA_MAX_REDIRECTS, otaUrl);
+            otaAttempt = 0;
+            otaRetryAt = 0;
+            otaPhase = OTA_RESOLVING;   // 回去預熱新主機的 DNS，不在這裡直接連
+            otaPhaseStart = millis();
+            return;
+          }
+
+          if (code != HTTP_CODE_OK) {
+            Serial.printf("[OTA] GET 失敗，碼 %d，10 秒後重試\n", code);
+            otaReleaseHttp();
+            otaDlStep = OTA_DL_CONNECT;
+            otaRetryAt = millis() + OTA_RETRY_GAP_MS;
+            return;
+          }
+
+          // M2：getSize() 在 chunked 傳輸回 -1。那是「長度未知，本流程不支援」，
+          //     不是「太大」—— 分開報成 http_fail，免得現場照 too_big 去查檔案大小。
+          // M4：上界不再硬編碼 2031616，改問**實際的暫存分區**。
+          //     兩顆板子的 partitions.csv 位元組級相同（app0/app1 各 0x1F0000 =
+          //     2,031,616），所以這個值目前等於 slave 端 bg.totalSize > 2031616 的
+          //     那道檢查；改用分區大小的意義是「分區表改了，這裡自動跟著改」。
+          //     ⚠ 它擋不住 master 與 slave 分區表不一致：master 的槽若比 slave 大，
+          //     超出的檔案會由 **slave** 拒收（誤紅、fail-closed），不會變成假綠燈。
+          int len = otaHttp->getSize();
+          if (len < 0) {
+            Serial.println("[OTA] 伺服器沒給 Content-Length（可能是 chunked），本流程需要事先知道總長");
+            otaReleaseHttp();
+            otaDlStep = OTA_DL_CONNECT;
             otaFail("http_fail");
             return;
           }
-          // ⚠ 相對路徑的 Location（"/path/x.bin"）會被這裡判成不可用而失敗。
-          //   這是刻意的 fail-closed：要支援相對路徑就得自己拼 base URL，
-          //   而拼錯的後果是去下載一份不知道是什麼的東西。誤紅可接受。
-          if (loc.length() == 0 || loc.length() >= sizeof(otaUrl) ||
-              strncmp(loc.c_str(), "https://", 8) != 0) {
-            Serial.printf("[OTA] 碼 %d 的 Location 不可用（空、過長、或不是 https）：%s\n",
-                          code, loc.c_str());
-            otaFail("bad_url");
+          const esp_partition_t* stagePeek = esp_ota_get_next_update_partition(NULL);
+          uint32_t stageMax = (stagePeek != nullptr) ? stagePeek->size : 0;
+          if (len <= 65536 || (uint32_t)len > stageMax) {
+            Serial.printf("[OTA] 韌體長度不合理: %d（暫存分區 %u bytes）\n",
+                          len, (unsigned)stageMax);
+            otaReleaseHttp();
+            otaDlStep = OTA_DL_CONNECT;
+            otaFail("too_big");
             return;
           }
-          // 重新取 host，回到 OTA_RESOLVING 預熱它的 DNS。
-          const char* hs = loc.c_str() + 8;
-          const char* he = strpbrk(hs, "/:");
-          size_t hl = (he != nullptr) ? (size_t)(he - hs) : strlen(hs);
-          if (hl == 0 || hl >= sizeof(otaHost)) { otaFail("bad_url"); return; }
-          memcpy(otaHost, hs, hl);
-          otaHost[hl] = '\0';
-          snprintf(otaUrl, sizeof(otaUrl), "%s", loc.c_str());
-          Serial.printf("[OTA] 碼 %d 重定向（第 %d／%d 次）→ %s\n",
-                        code, otaRedirects, OTA_MAX_REDIRECTS, otaUrl);
-          otaAttempt = 0;
-          otaRetryAt = 0;
-          otaPhase = OTA_RESOLVING;
-          otaPhaseStart = millis();
+          otaTotalSize = (uint32_t)len;
+          otaTotalChunks = (uint16_t)((otaTotalSize + HO_OTA_CHUNK_SIZE - 1) / HO_OTA_CHUNK_SIZE);
+          otaDlStep = OTA_DL_ERASE;
           return;
         }
 
-        if (code != HTTP_CODE_OK) {
-          Serial.printf("[OTA] GET 失敗，碼 %d，10 秒後重試\n", code);
-          otaReleaseHttp();
-          otaRetryAt = millis() + OTA_RETRY_GAP_MS;
+        case OTA_DL_ERASE: {
+          otaBurst("抹除暫存分區前");
+          bool opened = otaStageOpen(otaTotalSize);
+          otaBurst("抹除暫存分區後");
+          if (!opened) { otaReleaseHttp(); otaDlStep = OTA_DL_CONNECT; otaFail("flash_fail"); return; }
+          otaMd5.begin();
+          otaDownloaded = 0;
+          otaDlStep = OTA_DL_STREAM;
+          Serial.printf("[OTA] 開始下載 %u bytes（%u 包）\n",
+                        (unsigned)otaTotalSize, otaTotalChunks);
           return;
         }
 
-        // M2：getSize() 在 chunked 傳輸回 -1。那是「長度未知，本流程不支援」，
-        //     不是「太大」—— 分開報成 http_fail，免得現場照 too_big 去查檔案大小。
-        // M4：上界不再硬編碼 2031616，改問**實際的暫存分區**。
-        //     兩顆板子的 partitions.csv 位元組級相同（app0/app1 各 0x1F0000 =
-        //     2,031,616），所以這個值目前等於 slave 端 bg.totalSize > 2031616 的
-        //     那道檢查；改用分區大小的意義是「分區表改了，這裡自動跟著改」。
-        //     ⚠ 它擋不住 master 與 slave 分區表不一致的情況：master 的槽若比
-        //     slave 大，超出的檔案會由 **slave** 拒收（誤紅、fail-closed），
-        //     不會變成假綠燈。
-        int len = otaHttp->getSize();
-        if (len < 0) {
-          Serial.println("[OTA] 伺服器沒給 Content-Length（可能是 chunked），本流程需要事先知道總長");
-          otaReleaseHttp();
-          otaFail("http_fail");
+        default: {   // OTA_DL_STREAM
+          if (otaHttp == nullptr) {
+            Serial.println("[OTA] 串流階段沒有 HTTP 物件，放棄本次工作階段");
+            otaFail("http_fail");
+            return;
+          }
+          // 每輪最多讀 OTA_DL_BYTES_PER_LOOP，讀完就交還 loop()。
+          // 只讀 available() 說已經到的量，所以 readBytes() 不會等 socket ——
+          // 這一段不吃 mqttPublishBudgetUsed 的名額（那個名額管的是**阻塞式
+          // socket 寫入**，這裡是非阻塞讀）。但同一輪 loop() 仍可能先發生一次
+          // publish 的 10 秒黑箱、再走到這裡，兩者都各自被心跳夾住。
+          WiFiClient* stream = otaHttp->getStreamPtr();
+          // 計畫的範本沒有這道檢查。加它的理由不是理論潔癖：master 在這裡解參考
+          // 空指標會 panic 重開機，而 master 一重開機，20 台 slave 的心跳就一起斷 ——
+          // 30 秒後全部強制關繼電器。用兩行換掉一個「一崩就波及全場」的路徑。
+          if (stream == nullptr) {
+            Serial.println("[OTA] 取不到 HTTP stream，放棄本次工作階段");
+            otaReleaseHttp();
+            otaFail("http_fail");
+            return;
+          }
+          size_t budget = OTA_DL_BYTES_PER_LOOP;
+          uint8_t buf[512];
+          while (budget > 0 && otaDownloaded < otaTotalSize) {
+            int avail = stream->available();
+            if (avail <= 0) break;
+            size_t want = (size_t)avail;
+            if (want > sizeof(buf)) want = sizeof(buf);
+            if (want > budget) want = budget;
+            int got = stream->readBytes(buf, want);
+            if (got <= 0) break;
+            if (!otaStageWrite(buf, (size_t)got)) { otaFail("flash_fail"); return; }
+            otaMd5.add(buf, (size_t)got);
+            otaDownloaded += (uint32_t)got;
+            budget -= (size_t)got;
+          }
+
+          if (otaDownloaded >= otaTotalSize) {
+            if (!otaStageFlush()) { otaFail("flash_fail"); return; }
+            otaMd5.calculate();
+            otaMd5.getBytes(otaImageMd5);
+            otaReleaseHttp();
+
+            char hex[33];
+            for (int i = 0; i < 16; i++) snprintf(hex + i * 2, 3, "%02x", otaImageMd5[i]);
+
+            // 第一個位元組是 ESP32 應用映像的魔術碼。擋掉「下載到一頁 HTML 錯誤頁」
+            // 這類最常見的錯誤，成本一次 read。
+            // ⚠ 它擋不住：(a) 任何一份**合法但不對**的映像 —— 例如 master 自己的韌體、
+            //   別款晶片（C3 vs WROOM）的韌體，首位元組同樣是 0xE9；
+            //   (b) 前 1 byte 正確、後面損毀的檔案（那要靠 MD5，而 MD5 只在 App 有帶時才有）。
+            uint8_t magic = 0;
+            if (!otaStageRead(0, &magic, 1) || magic != 0xE9) {
+              Serial.printf("[OTA] 不是合法的 ESP32 映像（首位元組 0x%02x，應為 0xE9）\n", magic);
+              otaFail("bad_image");
+              return;
+            }
+
+            if (otaHasExpectMd5 && memcmp(otaImageMd5, otaExpectMd5, 16) != 0) {
+              Serial.printf("[OTA] MD5 與指令指定的不符，實算 %s\n", hex);
+              otaFail("md5_mismatch");
+              return;
+            }
+
+            Serial.printf("[OTA] 下載完成 %u bytes，MD5 %s%s\n",
+                          (unsigned)otaDownloaded, hex,
+                          otaHasExpectMd5 ? "（與指令指定的相符）" : "（指令未指定，僅供 ESP-NOW 段校驗）");
+            otaPhase = OTA_STAGED;
+            otaPhaseStart = millis();
+            return;
+          }
+
+          // 逾時判定：連線斷了而且緩衝也空了
+          if (!otaHttp->connected() && stream->available() == 0) {
+            Serial.println("[OTA] 下載中連線中斷，10 秒後重試");
+            otaReleaseHttp();
+            otaDlStep = OTA_DL_CONNECT;
+            otaRetryAt = millis() + OTA_RETRY_GAP_MS;
+            return;
+          }
+          // ⚠ 這條只抓「一個 byte 都沒收到」的完全停擺。**擋不住**「收了一半之後
+          //   停住、但 TCP 連線一直沒斷」的慢速餓死 —— 那種情況要靠上面
+          //   OTA_SESSION_MAX_MS 的 5 分鐘總上限兜底。
+          if (now - otaPhaseStart >= 120000 && otaDownloaded == 0) {
+            Serial.println("[OTA] 下載 120 秒沒有任何資料，放棄");
+            otaReleaseHttp();
+            otaFail("http_fail");
+          }
           return;
         }
-        const esp_partition_t* stagePeek = esp_ota_get_next_update_partition(NULL);
-        uint32_t stageMax = (stagePeek != nullptr) ? stagePeek->size : 0;
-        if (len <= 65536 || (uint32_t)len > stageMax) {
-          Serial.printf("[OTA] 韌體長度不合理: %d（暫存分區 %u bytes）\n",
-                        len, (unsigned)stageMax);
-          otaReleaseHttp();
-          otaFail("too_big");
-          return;
-        }
-        otaTotalSize = (uint32_t)len;
-        otaTotalChunks = (uint16_t)((otaTotalSize + HO_OTA_CHUNK_SIZE - 1) / HO_OTA_CHUNK_SIZE);
-
-        otaBurst("抹除暫存分區前");
-        bool opened = otaStageOpen(otaTotalSize);
-        otaBurst("抹除暫存分區後");
-        if (!opened) { otaReleaseHttp(); otaFail("flash_fail"); return; }
-
-        otaMd5.begin();
-        otaDownloaded = 0;
-        Serial.printf("[OTA] 開始下載 %u bytes（%u 包）\n",
-                      (unsigned)otaTotalSize, otaTotalChunks);
-        return;   // 交還 loop()，下一輪才開始讀
       }
-
-      // 已建立連線：每輪最多讀 OTA_DL_BYTES_PER_LOOP，讀完就交還 loop()。
-      // 只讀 available() 說已經到的量，所以 readBytes() 不會等 socket ——
-      // 這一段不吃 mqttPublishBudgetUsed 的名額（那個名額管的是**阻塞式
-      // socket 寫入**，這裡是非阻塞讀）。但同一輪 loop() 仍可能先發生一次
-      // publish 的 10 秒黑箱、再走到這裡，兩者都各自被心跳夾住。
-      WiFiClient* stream = otaHttp->getStreamPtr();
-      // 計畫的範本沒有這道檢查。加它的理由不是理論潔癖：master 在這裡解參考
-      // 空指標會 panic 重開機，而 master 一重開機，20 台 slave 的心跳就一起斷 ——
-      // 30 秒後全部強制關繼電器。用兩行換掉一個「一崩就波及全場」的路徑。
-      if (stream == nullptr) {
-        Serial.println("[OTA] 取不到 HTTP stream，放棄本次工作階段");
-        otaReleaseHttp();
-        otaFail("http_fail");
-        return;
-      }
-      size_t budget = OTA_DL_BYTES_PER_LOOP;
-      uint8_t buf[512];
-      while (budget > 0 && otaDownloaded < otaTotalSize) {
-        int avail = stream->available();
-        if (avail <= 0) break;
-        size_t want = (size_t)avail;
-        if (want > sizeof(buf)) want = sizeof(buf);
-        if (want > budget) want = budget;
-        int got = stream->readBytes(buf, want);
-        if (got <= 0) break;
-        if (!otaStageWrite(buf, (size_t)got)) { otaFail("flash_fail"); return; }
-        otaMd5.add(buf, (size_t)got);
-        otaDownloaded += (uint32_t)got;
-        budget -= (size_t)got;
-      }
-
-      if (otaDownloaded >= otaTotalSize) {
-        if (!otaStageFlush()) { otaFail("flash_fail"); return; }
-        otaMd5.calculate();
-        otaMd5.getBytes(otaImageMd5);
-        otaReleaseHttp();
-
-        char hex[33];
-        for (int i = 0; i < 16; i++) snprintf(hex + i * 2, 3, "%02x", otaImageMd5[i]);
-
-        // 第一個位元組是 ESP32 應用映像的魔術碼。擋掉「下載到一頁 HTML 錯誤頁」
-        // 這類最常見的錯誤，成本一次 read。
-        // ⚠ 它擋不住：(a) 任何一份**合法但不對**的映像 —— 例如 master 自己的韌體、
-        //   別款晶片（C3 vs WROOM）的韌體，首位元組同樣是 0xE9；
-        //   (b) 前 1 byte 正確、後面損毀的檔案（那要靠 MD5，而 MD5 只在 App 有帶時才有）。
-        uint8_t magic = 0;
-        if (!otaStageRead(0, &magic, 1) || magic != 0xE9) {
-          Serial.printf("[OTA] 不是合法的 ESP32 映像（首位元組 0x%02x，應為 0xE9）\n", magic);
-          otaFail("bad_image");
-          return;
-        }
-
-        if (otaHasExpectMd5 && memcmp(otaImageMd5, otaExpectMd5, 16) != 0) {
-          Serial.printf("[OTA] MD5 與指令指定的不符，實算 %s\n", hex);
-          otaFail("md5_mismatch");
-          return;
-        }
-
-        Serial.printf("[OTA] 下載完成 %u bytes，MD5 %s%s\n",
-                      (unsigned)otaDownloaded, hex,
-                      otaHasExpectMd5 ? "（與指令指定的相符）" : "（指令未指定，僅供 ESP-NOW 段校驗）");
-        otaPhase = OTA_STAGED;
-        otaPhaseStart = millis();
-        return;
-      }
-
-      // 逾時判定：連線斷了而且緩衝也空了
-      if (!otaHttp->connected() && stream->available() == 0) {
-        Serial.println("[OTA] 下載中連線中斷，10 秒後重試");
-        otaReleaseHttp();
-        otaRetryAt = millis() + OTA_RETRY_GAP_MS;
-        return;
-      }
-      // ⚠ 這條只抓「一個 byte 都沒收到」的完全停擺。**擋不住**「收了一半之後
-      //   停住、但 TCP 連線一直沒斷」的慢速餓死 —— 那種情況要靠上面
-      //   OTA_SESSION_MAX_MS 的 5 分鐘總上限兜底。
-      if (now - otaPhaseStart >= 120000 && otaDownloaded == 0) {
-        Serial.println("[OTA] 下載 120 秒沒有任何資料，放棄");
-        otaReleaseHttp();
-        otaFail("http_fail");
-      }
-      return;
     }
 
     case OTA_STAGED:

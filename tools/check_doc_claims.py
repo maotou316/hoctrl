@@ -26,8 +26,10 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
   4. 項數    —— 數原始碼的 check() 呼叫，回頭比對文件寫死的「執行 N 項」
   5. 算式    —— 任何 `(A-1-B-C)/D = [E/D =] F` 的容量算式，逐項對原始碼常數複算
   6. 數值    —— 單獨寫出來的 `maxEntries` N 必須等於算出來的值
-  8. 開機分區 —— `ho_master1.ino` 的**非註釋行**不得出現
+  8. 禁用 API —— `ho_master1.ino` 的**非註釋行**不得出現
                 `esp_ota_set_boot_partition` / `#include <Update.h>` / `Update.begin(`
+                / `setRedirectLimit` / `HTTPC_STRICT_FOLLOW_REDIRECTS`
+                / `HTTPC_FORCE_FOLLOW_REDIRECTS`
   9. LR 掛鉤 —— `otaSessionBusy()` 的呼叫點數量必須仍是 2
                 （readme 宣稱「LR 互斥守衛現在並不存在」，這條讓那句話會過期時吵）
  10. 文件必含 —— 「宣告某道保護不存在」的句子本身不得被刪（方向 9 的另一半）
@@ -113,7 +115,9 @@ HIT_IN_SOURCE = [
     # ── Phase 4 Task 3（master 端暫存下載）──
     ('otadl 指令',           '} else if (verb == "otadl") {'),
     ('otastat 指令',         '} else if (verb == "otastat") {'),
-    ('OTA 只收 https',       '[OTA] 只接受 https:// 開頭的網址'),
+    ('OTA 只收 https',       "[OTA] 網址不可用：只接受 https:// 開頭、host 非空且不含 '@' 的網址"),
+    ('OTA 走 IP 連線（C3）',  'otaTls->connect(otaHostIp, otaPort, otaHost, nullptr, nullptr, nullptr);'),
+    ('OTA 握手逾時（C3）',    'otaTls->setHandshakeTimeout(6);'),
     ('OTA 暫存取閒置分區',    'esp_ota_get_next_update_partition(NULL)'),
     ('OTA 階段名 downloading', 'return "downloading";'),
     # C2 修正後的收尾訊息。**刻意不再拿「已更新到」當錨點** ——
@@ -195,6 +199,12 @@ DOC_MUST_CONTAIN = [
      '「OTA 進行中拒絕切 LR」這道守衛現在並不存在'),
     ('ho_master1/readme.md', 'otadl 不代表 slave 被更新過',
      '兩行都不會出現「已更新到 x.y.z」'),
+    # MJ2：Task 3 最重要的約束原本只寫在 report 裡，readme／plan／腳本零命中。
+    ('ho_master1/readme.md', 'Task 5 之前不得開 MQTT 入口',
+     'Task 5 開 MQTT 入口之前，轉送 OTA 這條路徑不該對外'),
+    ('docs/superpowers/plans/2026-08-17-esp32-phase4-ota-relay.md',
+     'Task 4 版本回檢的三條硬性前提',
+     '不得**沿用會過期的 `otaTargetIdx`'),
 ]
 
 PLAN_FILES = ['docs/superpowers/plans/2026-08-17-esp32-phase4-ota-relay.md']
@@ -358,23 +368,32 @@ def main():
                         failures.append('[算式] %s:%d %s → %s'
                                         % (path, lineno, m.group(0), '；'.join(problems)))
         print('容量算式結構化複算：%d 條' % n_expr)
-    # ── 方向 8：master 絕不切換自己的開機分區（安全鐵則的機械化檢查）──
+    # ── 方向 8：master 的禁用 API 清單（兩條安全鐵則的機械化檢查）──
+    # (1) 絕不切換自己的開機分區；(2) 絕不讓 HTTPClient 自己跟隨重定向。
     # ho_master1.ino 的註釋、ho_master1/readme.md 都寫著「master 不會變磚，
     # 因為全檔沒有一行呼叫 esp_ota_set_boot_partition()，也沒有 include Update.h」。
     # 那是一句**可被機械驗證**的宣稱，所以就驗它 —— 否則它只是一句話。
     #
     # **它擋不住什麼**：
-    #   - 只掃 ho_master1.ino 的**非註釋行**，而且只認這三個字面樣式。
+    #   - 只掃 ho_master1.ino 的**非註釋行**，而且只認清單裡那幾個字面樣式。
     #     透過函式指標、巨集別名或 esp_ota_ops.h 的其他 API（例如
     #     esp_ota_begin/esp_ota_end 這組也會動 otadata）繞過去，它一個都抓不到。
     #   - 它是靜態檢查，不證明執行期真的沒切換分區。
+    #   - 重定向那兩條只擋「函式庫自動跟隨」被加回來，**不保證**我們自己那套
+    #     跟隨邏輯是對的（次數、Location 驗證、回 OTA_RESOLVING 都驗不到）。
     master_src = read('ho_master1/ho_master1.ino')
     code_lines = [(i, ln) for i, ln in enumerate(master_src.splitlines(), 1)
                   if not ln.lstrip().startswith('//')]
-    for pat in ('esp_ota_set_boot_partition', '#include <Update.h>', 'Update.begin('):
+    # setRedirectLimit / STRICT：C1 的錨點原本只驗「DISABLE 那一行還在」，
+    # 而**保留它、後面再加一組 STRICT + setRedirectLimit(3)** 會整份通過 ——
+    # 複審實測過。HIT 只能證明「某行存在」，證明不了「沒有別的行把它推翻」。
+    # 所以把「不得出現」這一側也寫成規則。
+    for pat in ('esp_ota_set_boot_partition', '#include <Update.h>', 'Update.begin(',
+                'setRedirectLimit', 'HTTPC_STRICT_FOLLOW_REDIRECTS',
+                'HTTPC_FORCE_FOLLOW_REDIRECTS'):
         for lineno, line in code_lines:
             if pat in line:
-                failures.append('[開機分區] ho_master1/ho_master1.ino:%d 出現 %s → %s'
+                failures.append('[禁用 API] ho_master1/ho_master1.ino:%d 出現 %s → %s'
                                 % (lineno, pat, line.strip()[:80]))
 
     # ── 方向 9：otaSessionBusy() 的呼叫點數量（Phase 5 技術債的防腐）──
@@ -440,7 +459,7 @@ def main():
                             '它的呼叫點包含 OTA_STAGED（下載＋暫存＋MD5，零 slave 接觸），'
                             '這句話會讓回歸清單第 12 項的判準在第 3 項就成立')
 
-    print('開機分區靜態檢查：ho_master1.ino 非註釋行 %d 行；'
+    print('禁用 API 靜態檢查：ho_master1.ino 非註釋行 %d 行；'
           'otaSessionBusy() 呼叫點 %d 處；文件必含 %d 條'
           % (len(code_lines), n_busy, len(DOC_MUST_CONTAIN)))
 

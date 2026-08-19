@@ -1850,6 +1850,13 @@ commit 訊息必須說明：
 - Modify: `ho_master1/ho_master1.ino`
 
 **Interfaces:**
+> **Task 4 的三條硬性前提（Task 3 的 C4，違反即為假綠燈）**：
+> 1. 版本回檢必須要求 `otaHasVersion`（目標版本不是 0.0.0）
+> 2. 必須用 `findSlave(otaTargetMac)` 重查索引，**不得**沿用會過期的 `otaTargetIdx`
+> 3. 必須要求該台的 `lastSeen` 晚於進入 `OTA_VERIFYING` 的時刻
+>
+> 只有這三條同時成立，才可以印「已更新到 x.y.z」並呼叫 `otaFinish()`。
+
 - Consumes：Task 3 的 `otaPhase` / `otaStageRead()` / `otaFail()` / `otaFinish()` /
   `updateOtaSession()`；Task 1 的協定
 - Produces（Task 5 依賴）：完整可用的轉送流程、`otaProgressPercent()`
@@ -2182,14 +2189,35 @@ uint8_t otaProgressPercent() {
     case OTA_VERIFYING: {
       // slave 重開機後會恢復配對、鎖回 channel，master 的 pollNextSlave()
       // 會問到它的狀態，版本欄位由 HO_PKT_STATE 更新進 slaves[]。
-      if (otaTargetIdx >= 0 && otaTargetIdx < slaveCount &&
-          slaves[otaTargetIdx].online &&
-          slaves[otaTargetIdx].fwMajor == otaVerMajor &&
-          slaves[otaTargetIdx].fwMinor == otaVerMinor &&
-          slaves[otaTargetIdx].fwPatch == otaVerPatch) {
+      //
+      // ⚠⚠ Task 3 的 C4 修正（B 族第 11 次）：這一段初版是
+      //     `slaves[otaTargetIdx].fw* == otaVer*` 就宣告成功，有**兩個假綠燈洞**：
+      //     1. **從沒回報過狀態的 slave，`fw*` 全是 0**（addSlave() 的初值）。
+      //        而 `otadl` 固定傳版本 "0.0.0"、`update_slave` 的版本解析失敗也是
+      //        0.0.0 —— 於是「版本對上了」會在 **slave 還在重開機**、
+      //        甚至根本沒被碰過的時候就成立。
+      //     2. 它讀 `slaves[otaTargetIdx]`，而 `otaTargetIdx` 在 ho_master1.ino
+      //        的宣告處逐字寫著**會過期**（名冊變動時 slaves[] 會往前搬），
+      //        且寫著「唯一的用途是 pollNextSlave() 的跳過判斷、無安全性影響」——
+      //        一旦這裡也用它，那句話就變成假的，而且是拿**別台**的版本宣告成功。
+      //
+      // 三個硬性前提（缺一不可，不得簡化）：
+      //   (a) `otaHasVersion` 為真 —— 目標版本不是 0.0.0（Task 3 已備好這個旗標）
+      //   (b) 用 `findSlave(otaTargetMac)` **重查索引**，不得沿用 otaTargetIdx
+      //   (c) 那台的 `lastSeen` 必須**晚於進入 OTA_VERIFYING 的時刻**
+      //       —— 證明這份版本是「重開機之後才回報的」，不是工作階段開始前的舊值
+      int vIdx = findSlave(otaTargetMac);
+      if (otaHasVersion && vIdx >= 0 &&
+          slaves[vIdx].online &&
+          (long)(slaves[vIdx].lastSeen - otaPhaseStart) > 0 &&
+          slaves[vIdx].fwMajor == otaVerMajor &&
+          slaves[vIdx].fwMinor == otaVerMinor &&
+          slaves[vIdx].fwPatch == otaVerPatch) {
         // ⚠ 這裡是全檔**唯一**有資格印「已更新到 x.y.z」的地方 ——
-        //   它的前提是 slave 重開機後**自己回報**的版本三個欄位都對上了。
-        //   回歸清單第 12 項的判準字串就是這一行（見 Task 3 的 C2）。
+        //   前提是上面三條全部成立。回歸清單第 12 項的判準字串就是這一行。
+        //   **它仍然擋不住**：slave 本來就已經是目標版本（重送同一版）——
+        //   那種情況下 (a)(b)(c) 全成立而韌體其實沒換過。要分辨得比對
+        //   重開機事件本身（例如 slave 的 uptime／開機計數），本階段沒有那個欄位。
         Serial.printf("[OTA] 完成：%s 已更新到 %u.%u.%u\n",
                       otaTargetId, otaVerMajor, otaVerMinor, otaVerPatch);
         otaFinish();
@@ -2236,6 +2264,15 @@ commit 訊息要點名：
 ---
 
 ## Task 5：MQTT `update_slave` 指令、進度回報與容量常數重算
+
+> **⚠ 本 Task 之前，轉送 OTA 這條路徑不該對外（Task 3 的 MJ2）。**
+> Task 3 結束時 `OTA_STAGED` 會直接 `otaFinish()` 把 `otaPhase` 設成
+> **`OTA_SUCCESS`**，而那時只完成「下載＋暫存＋MD5」、**一台 slave 都沒被接觸**。
+> 也就是說：**在 Task 4 把轉送接上之前，只要有人把 `ota.phase` 發到 MQTT，
+> App 就會顯示「更新完成」。** 所以：
+> - Task 3～Task 4 期間，這條路徑**只能由序列埠 `otadl` 觸發**，不得開 MQTT 入口
+> - Task 5 加 `update_slave` 與 `ota` 狀態欄位時，**必須確認 `OTA_STAGED` 已經
+>   接上轉送**（`otaPhase` 不再從 STAGED 直接跳 SUCCESS），否則第一版就會對外發假綠燈
 
 **Files:**
 - Modify: `ho_master1/ho_master1.ino`

@@ -75,6 +75,7 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 | `jsonsize` | **測試用**：用 `buildStatusDoc()` + `measureJson()` 印出「實際會發布的那份 JSON」的大小，與 `statusBuf`／mqtt buffer 對照。不需連上 MQTT |
 | `help` | 顯示說明 |
 | `otadl <n> <url>` | **測試用（Phase 4 Task 3）**：只跑「HTTPS 下載 → 寫進 master 自己的**閒置 OTA 分區**暫存 → 算 MD5」，**不轉送給 slave**（轉送是 Task 4）。收尾印的是 `[OTA] 已暫存完成：… 「未轉送、未接觸任何 slave」…` 與 `[OTA] 工作階段 N 結束（目標 …，階段轉為 success）`，**兩行都不會出現「已更新到 x.y.z」** —— 那句話只由 Task 4 的版本回檢路徑印。（初版這裡是 `[OTA] 完成：%s 已更新到 x.y.z`，每跑一次 `otadl` 就宣稱一次 slave 已更新，是**假綠燈方向**的判準矛盾，已修掉。）會抹除閒置 OTA 分區（不動開機分區，master 不會變磚：全檔沒有任何一行呼叫 `esp_ota_set_boot_partition()`）。**固定帶 `force=true`**，因此**略過**「目標繼電器正開著就拒絕」那道保護。只接受 `https://` 開頭的網址 |
+| `otadl` 的**對外範圍** | **⚠ Task 5 開 MQTT 入口之前，轉送 OTA 這條路徑不該對外。** `OTA_STAGED` 目前直接把 `otaPhase` 設成 `OTA_SUCCESS`，而那時一台 slave 都沒被接觸 —— 只要有人把 `ota.phase` 發到 MQTT，App 就會顯示「更新完成」。所以現階段它**只有序列埠入口、沒有 MQTT 入口**，這是刻意的 |
 | `otastat` | 印出目前 OTA 工作階段的階段（`otaPhaseName()`）、目標、已下載／總位元組數與錯誤碼。工作階段結束回到 `idle` 之後**錯誤碼刻意不清空**，所以還看得到上一次的失敗原因 |
 
 **沒有 `lr on｜off` 這條序列埠指令。** Long Range 的原 Task 6 已整個移到 Phase 5，
