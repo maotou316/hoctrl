@@ -17,7 +17,7 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
     python tools/check_doc_claims.py
 全部通過印 ALL CHECKS PASSED，任何一項失敗以 exit code 1 結束。
 
-**十一個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
+**十三個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
 這個數字自己就是一個判準 —— 初版寫「八個」而實際是九個，
 **一支專門檢查「文件寫死的 N 項」的腳本自己數錯**，所以改動方向時請一起數：
   1. HIT     —— 文件引用的判準字串必須逐字出現在原始碼裡
@@ -34,6 +34,9 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
                 （readme 宣稱「LR 互斥守衛現在並不存在」，這條讓那句話會過期時吵）
  10. 文件必含 —— 「宣告某道保護不存在」的句子本身不得被刪（方向 9 的另一半）
  11. 假綠燈  —— `otaFinish()` 的函式本體不得出現「已更新到」
+ 12. 設定唯一 —— 關鍵 timeout／重定向設定必須**剛好出現一次**且逐字如此
+                （HIT 擋不住「再加一行覆蓋它」，也擋不住「整行被刪掉」）
+ 13. 順序    —— `otaHttp->begin()` 必須排在 `otaTls->connect()` 之前（C5）
 
 **這支腳本擋不住什麼**（必須連著讀）：
   - 它只做**字串／算式比對**。字串對不代表語義對
@@ -205,6 +208,36 @@ DOC_MUST_CONTAIN = [
     ('docs/superpowers/plans/2026-08-17-esp32-phase4-ota-relay.md',
      'Task 4 版本回檢的三條硬性前提',
      '不得**沿用會過期的 `otaTargetIdx`'),
+    # C6：這句話一旦被刪或改回去，Task 4 就會把輪詢範圍寫回含 VERIFYING。
+    ('docs/superpowers/plans/2026-08-17-esp32-phase4-ota-relay.md',
+     'VERIFYING 期間必須繼續輪詢（C6）',
+     '`OTA_VERIFYING` 期間**必須繼續輪詢目標**'),
+]
+
+# ── 方向 12 的表：「必須剛好出現一次、而且逐字長這樣」的設定 ──
+# 複審實測出兩個逃逸，兩個都不是 HIT 擋得住的形狀：
+#   (1) 保留 setHandshakeTimeout(6)、**後面再加一行 setHandshakeTimeout(600)** → 全過
+#   (2) **直接刪掉** setConnectionTimeout(6000) → 全過（_timeout 回到預設 30000，
+#       TCP select 變 30 秒 → 單一窗口 ≥36 秒 → 籠門放開）
+# HIT 只證明「某一行存在」，不證明「沒有第二行推翻它」，也不證明「該設定沒被刪」。
+# 所以這一張表同時驗三件事：API 名稱出現次數 == 1、那一行逐字存在、且都在非註釋行。
+#
+# **它擋不住什麼**：只認列出來的這幾個 API 名稱與字面。改用別的 API 達到同樣效果
+#（例如 connect(host, port, timeout) 那條多載自帶 timeout）它抓不到；
+# 也不驗數值是否合理 —— 把 6 改成 60 仍然只有一次呼叫，**逐字比對才是擋住那個的原因**。
+EXACT_ONCE_IN_MASTER = [
+    ('TLS 握手逾時（C3）', 'setHandshakeTimeout', 'otaTls->setHandshakeTimeout(6);'),
+    ('TCP connect 逾時（C3）', 'setConnectionTimeout', 'otaTls->setConnectionTimeout(6000);'),
+    ('不跟隨重定向（C1）', 'setFollowRedirects',
+     'otaHttp->setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);'),
+    ('走 IP 連線、帶 host 做 SNI（C3）', 'otaTls->connect(',
+     'otaTls->connect(otaHostIp, otaPort, otaHost, nullptr, nullptr, nullptr);'),
+    # C5：begin() 必須剛好一次，且在 OTA_DL_CONNECT 裡（順序由下面的方向 13 驗）
+    ('HTTPClient::begin 只有一處（C5）', 'otaHttp->begin(', 'if (!otaHttp->begin(*otaTls, otaUrl)) {'),
+    # C6：跳過範圍必須止於 OTA_END_SENT。寫成 OTA_VERIFYING 會讓 lastSeen 永遠不前進，
+    # Task 4 的版本回檢永遠不成立 → 回歸清單第 12 項把正確行為判成 FAIL。
+    ('輪詢跳過範圍止於 END_SENT（C6）', 'pollIdx == otaTargetIdx',
+     'if (otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_END_SENT && pollIdx == otaTargetIdx) {'),
 ]
 
 PLAN_FILES = ['docs/superpowers/plans/2026-08-17-esp32-phase4-ota-relay.md']
@@ -459,9 +492,39 @@ def main():
                             '它的呼叫點包含 OTA_STAGED（下載＋暫存＋MD5，零 slave 接觸），'
                             '這句話會讓回歸清單第 12 項的判準在第 3 項就成立')
 
+    # ── 方向 12：關鍵設定必須「剛好一次、逐字如此」──
+    for label, api, exact in EXACT_ONCE_IN_MASTER:
+        n = len([1 for _, line in code_lines if api in line])
+        if n != 1:
+            failures.append('[設定唯一] %s：非註釋行裡 %r 出現 %d 次（必須剛好 1 次）。'
+                            '多一次＝後面那行會覆蓋前面那行；零次＝設定被刪掉、'
+                            '回到函式庫預設值' % (label, api, n))
+        if not any(exact in line for _, line in code_lines):
+            failures.append('[設定唯一] %s：找不到逐字的 %r' % (label, exact))
+
+    # ── 方向 13：C5 的順序不變量（begin() 必須排在 TLS 握手之前）──
+    # HTTPClient.cpp:283 的 beginInternal 尾端：
+    #   `if (_host != the_host && connected()) { _canReuse = false; disconnect(true); }`
+    # 新 HTTPClient 的 _host 是空字串，所以「先握手再 begin()」會**當場把連線拆掉**，
+    # 接著 GET() 自己重連 —— C3 消除的那次 DNS 會整條回來，而且多付一次握手。
+    # 這個順序沒有任何編譯期或執行期訊號，只能靠檢查釘住。
+    #
+    # **它擋不住什麼**：只比對這兩行在檔案裡的先後位置，不理解控制流。
+    # 把 begin() 搬到另一個函式、或用別的方式重連，它都抓不到。
+    src_m = master_src
+    i_begin = src_m.find('if (!otaHttp->begin(*otaTls, otaUrl)) {')
+    i_conn = src_m.find('int cres = otaTls->connect(otaHostIp')
+    if i_begin < 0 or i_conn < 0:
+        failures.append('[順序] 找不到 begin() 或 otaTls->connect() 的錨點，方向 13 無法檢查')
+    elif i_begin > i_conn:
+        failures.append('[順序] otaHttp->begin() 排在 otaTls->connect() **之後**：'
+                        'beginInternal 會因為 _host 不同而 disconnect(true) 把剛握好的 '
+                        'TLS 連線拆掉，GET() 會自己重連並重新做一次 DNS（C5／A 族第 17 次）')
+
     print('禁用 API 靜態檢查：ho_master1.ino 非註釋行 %d 行；'
-          'otaSessionBusy() 呼叫點 %d 處；文件必含 %d 條'
-          % (len(code_lines), n_busy, len(DOC_MUST_CONTAIN)))
+          'otaSessionBusy() 呼叫點 %d 處；文件必含 %d 條；'
+          '設定唯一 %d 條；順序不變量 1 條'
+          % (len(code_lines), n_busy, len(DOC_MUST_CONTAIN), len(EXACT_ONCE_IN_MASTER)))
 
     print('HIT 檢查 %d 項、BANNED 樣式 %d 條 × 檔案 %d 份（含原始碼註釋）；'
           'PLAN 樣式 %d 條 × %d 份'

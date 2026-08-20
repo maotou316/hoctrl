@@ -594,7 +594,15 @@ const size_t STATUS_BASE_MAX_BYTES =
 
 ### 決定 6：OTA 期間的輪詢與 LED
 
-- `pollNextSlave()` 在轉送期間**跳過目標 slave**（它正在忙，且重開機後自然會回報）。
+- `pollNextSlave()` 在轉送期間**跳過目標 slave**（它正在忙）。
+  > **⚠ Task 3 的 C6 更正（B 族第 12 次）：跳過範圍是 `OTA_BEGIN_SENT ~ OTA_END_SENT`，
+  > **不含 `OTA_VERIFYING`**，而且本節原本寫的「重開機後自然會回報」**是假的**。
+  > `ho_slave1.ino` 的 `sendState()` 只有三個呼叫點（收到 `HO_PKT_CMD`、
+  > 收到 `HO_PKT_STATE_REQ`、點動結束），**開機不會自己送**；master 的
+  > `slaves[].lastSeen` 也只在 `HO_PKT_STATE` 分支被寫。
+  > 所以 `OTA_VERIFYING` 期間**必須繼續輪詢目標** —— 那是「它重開機回來了」的
+  > 唯一資料來源。照原本的範圍寫，Task 4 的版本回檢永遠等不到新的 `lastSeen`，
+  > 一律走到 90 秒 `no_return`，**回歸清單第 12 項會把正確行為判成 FAIL**。
   其餘 19 台照常輪詢，代發照常。
 - LED：`updateStatusLed()` 的優先序最前面插入一條
   「**OTA 工作階段進行中 → 快閃 200ms**」，語義與 `ho_relay2` 的更新中指示一致。
@@ -1778,8 +1786,10 @@ void updateOtaSession(unsigned long now) {
 `pollNextSlave()` 開頭加（決定 6）：
 
 ```cpp
-  // 轉送期間跳過目標 slave：它正忙著收韌體，而且重開機後自然會回報狀態
-  if (otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_VERIFYING && pollIdx == otaTargetIdx) {
+  // 轉送期間跳過目標 slave：它正忙著收韌體。
+  // ⚠ 範圍**不含 OTA_VERIFYING**（C6）：slave 開機不會自己送狀態，
+  //   VERIFYING 期間必須繼續輪詢，否則 lastSeen 永遠不前進、版本回檢永遠不成立。
+  if (otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_END_SENT && pollIdx == otaTargetIdx) {
     pollIdx = (pollIdx + 1) % (slaveCount > 0 ? slaveCount : 1);
     return;
   }
@@ -1856,6 +1866,12 @@ commit 訊息必須說明：
 > 3. 必須要求該台的 `lastSeen` 晚於進入 `OTA_VERIFYING` 的時刻
 >
 > 只有這三條同時成立，才可以印「已更新到 x.y.z」並呼叫 `otaFinish()`。
+>
+> **第 3 條有一個前置依賴（Task 3 的 C6）**：`lastSeen` 只由 `HO_PKT_STATE` 更新，
+> 而 slave **開機不會主動送狀態**（`sendState()` 只在收到 CMD／STATE_REQ／點動結束時觸發）。
+> 所以 `pollNextSlave()` 的跳過範圍**必須止於 `OTA_END_SENT`**，
+> 讓 `OTA_VERIFYING` 期間照常輪詢目標 —— 否則第 3 條永遠不成立、
+> 一律走到 90 秒 `no_return`。Task 3 已經把範圍改好，**Task 4 不要改回去**。
 
 - Consumes：Task 3 的 `otaPhase` / `otaStageRead()` / `otaFail()` / `otaFinish()` /
   `updateOtaSession()`；Task 1 的協定

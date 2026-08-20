@@ -1983,17 +1983,30 @@ void pollNextSlave() {
   // 不特別處理「跳過某台」，反正下一輪就會輪到
   if (pollIdx >= n) pollIdx = 0;
 
-  // ── 決定 6：轉送期間跳過目標 slave ──
-  // 它正忙著收韌體，而且重開機後自然會回報狀態。放在游標修正之後、送出之前，
+  // ── 決定 6：轉送期間跳過目標 slave（**不含 OTA_VERIFYING**）──
+  // 它正忙著收韌體，這段期間問它狀態只是徒增碰撞。放在游標修正之後、送出之前，
   // 是因為 pollIdx 是本函式的 static 區域變數（不能在函式開頭就用）。
   //
+  // ⚠⚠ C6（B 族第 12 次）：上一版的範圍寫到 OTA_VERIFYING，並在這裡宣稱
+  //   「重開機後自然會回報狀態」—— **那句話是假的**。回去讀 ho_slave1.ino：
+  //   `sendState()` 只有三個呼叫點（收到 HO_PKT_CMD、收到 HO_PKT_STATE_REQ、
+  //   點動結束），**開機不會自己送**。而 master 這邊 `slaves[].lastSeen`
+  //   只在 onEspNowRecv() 的 HO_PKT_STATE 分支被寫。
+  //   兩件事合起來：VERIFYING 期間若不輪詢目標，就永遠沒有 STATE_REQ、
+  //   永遠沒有 STATE 回來、`lastSeen` 永遠不前進 →
+  //   Task 4 的版本回檢（要求 lastSeen 晚於進入 VERIFYING 的時刻）**永遠不成立**
+  //   → 一律走到 90 秒 no_return → **回歸清單第 12 項照範本忠實實作也永遠印不出
+  //   「已更新到」，實測者會把正確行為判成 FAIL**。
+  //   所以範圍改成 OTA_BEGIN_SENT ~ OTA_END_SENT：**VERIFYING 期間必須繼續輪詢**，
+  //   那正是「證明它重開機回來了」的唯一資料來源。
+  //
   // ⚠ 覆蓋範圍：**本 Task（Task 3）沒有任何路徑會讓 otaPhase 進入
-  //   OTA_BEGIN_SENT ~ OTA_VERIFYING**（那五個階段全部由 Task 4 實作），
+  //   OTA_BEGIN_SENT ~ OTA_END_SENT**（那四個階段全部由 Task 4 實作），
   //   所以這道跳過在本 Task 是**永遠不會成立的死條件**，它現在不擋任何東西。
   //   先寫進來只是為了讓 Task 4 不必回頭改這個函式。
   //   另外它也擋不住「索引過期」：otaTargetIdx 是開始工作階段當下的索引，
   //   名冊若在中途變動，跳過的可能是別台（代價只是多問／少問一次狀態）。
-  if (otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_VERIFYING && pollIdx == otaTargetIdx) {
+  if (otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_END_SENT && pollIdx == otaTargetIdx) {
     pollIdx = (pollIdx + 1) % n;
     return;
   }
@@ -3248,7 +3261,8 @@ void updateOtaSession(unsigned long now) {
 
           otaReleaseHttp();                     // 保險：清掉上一次嘗試的殘留
           otaTls = new WiFiClientSecure();
-          if (otaTls == nullptr) { otaFail("low_heap"); return; }
+          otaHttp = new HTTPClient();
+          if (otaTls == nullptr || otaHttp == nullptr) { otaReleaseHttp(); otaFail("low_heap"); return; }
 
           // ⚠ 已知限制：**不驗證伺服器憑證**（沿用 ho_relay2 的做法）。
           //   DNS 汙染或中間人可以餵給 master 任意一份「合法的 ESP32 映像」，
@@ -3273,6 +3287,48 @@ void updateOtaSession(unsigned long now) {
           otaTls->setHandshakeTimeout(6);        // 秒！TLS 握手迴圈的上界
           otaTls->setConnectionTimeout(6000);    // 毫秒：TCP connect 的 select
           otaTls->setTimeout(6000);              // 毫秒：Stream 的讀取逾時
+
+          otaHttp->setConnectTimeout(6000);
+          otaHttp->setTimeout(6000);
+          // ── C1（A 族第 15 次）：**必須關掉函式庫的自動跟隨** ──
+          // 初版是 setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS) +
+          // setRedirectLimit(3)，理由是「把次數上限交給函式庫比 ho_relay2 的
+          // 手寫無限迴圈安全」。次數確實有上限了，**但阻塞時間沒有**：
+          //   HTTPClient::sendRequest() 是 `do { … } while (redirect);`，
+          //   限制 3 代表**一次 GET() 呼叫內最多做 4 次完整連線**，
+          //   而每次 NetworkClientSecure::connect(host, …) 都自己先做一次
+          //   Network.hostByName()，**那段 DNS 不受任何 timeout 參數管**。
+          //   單一 GET() 的最壞窗口 48~108 秒 → 全場 slave 逾時 →
+          //   **正關著的籠門全部放開**。而 GitHub Releases 的下載網址
+          //   （302 到 objects.githubusercontent.com）正是最可能的部署形狀。
+          // 改法：函式庫不跟隨，由本狀態機自己跟隨 —— 收到 3xx 就回 OTA_RESOLVING，
+          // 重新預熱新主機的 DNS，再走一次 CONNECT → REQUEST。
+          otaHttp->setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+
+          // ── C5（A 族第 17 次）：begin() **必須排在 TLS 連線之前** ──
+          // 上一版把 begin() 放在握手「之後」，結果整套 C3 的修正變成死碼：
+          //   HTTPClient.cpp:283（beginInternal 尾端）
+          //     `if (_host != the_host && connected()) { _canReuse = false; disconnect(true); }`
+          //   而 `new HTTPClient()` 的 `_host` 是**空字串**、剛握完手的 otaTls
+          //   `connected()` 為真 → 條件成立 → disconnect(true) →
+          //   HTTPClient.cpp 的 disconnect(): `_reuse && _canReuse` 為 false → `_client->stop()`。
+          //   **剛建好的 TLS 連線當場被拆掉**，接著 GET() 內的 connect() 看到
+          //   connected() 為 false，走 `_client->connect(_host.c_str(), …)` ——
+          //   **Network.hostByName() 照樣被呼叫**，而且握手要再做一次。
+          //   也就是：DNS 那 15 秒不但沒消除，還從競態變成常態，且多付一次 12 秒握手。
+          // 正確順序：先 begin()（純字串解析、零 I/O，此時 connected() 為 false，
+          // 不會觸發那個 disconnect），再握手。GET() 內的 connect() 第一段看到
+          // connected() 為真就重用（HTTPClient.cpp 的 connect() 開頭），不再解析 DNS。
+          //
+          // **這個順序是 C3 全部成立的前提。** 任何人把 begin() 搬回 GET() 旁邊，
+          // 上面那三句話會同時變成假的，而且**不會有任何編譯錯誤或執行期警告**。
+          if (!otaHttp->begin(*otaTls, otaUrl)) {
+            Serial.println("[OTA] HTTPClient::begin() 失敗（網址不可用）");
+            otaReleaseHttp();
+            otaDlStep = OTA_DL_CONNECT;
+            otaFail("bad_url");
+            return;
+          }
 
           // C3：直接用 OTA_RESOLVING 解析好的 IP 連線，**帶著 host 做 SNI**。
           // 這條多載（ip, port, host, …）在 ssl_client.cpp:296 會把 host 交給
@@ -3303,38 +3359,34 @@ void updateOtaSession(unsigned long now) {
             otaRetryAt = millis() + OTA_RETRY_GAP_MS;
             return;
           }
-          otaHttp = new HTTPClient();
-          if (otaHttp == nullptr) { otaReleaseHttp(); otaDlStep = OTA_DL_CONNECT; otaFail("low_heap"); return; }
-          otaHttp->setConnectTimeout(6000);
-          otaHttp->setTimeout(6000);
-          // ── C1（A 族第 15 次）：**必須關掉函式庫的自動跟隨** ──
-          // 初版是 setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS) +
-          // setRedirectLimit(3)，理由是「把次數上限交給函式庫比 ho_relay2 的
-          // 手寫無限迴圈安全」。次數確實有上限了，**但阻塞時間沒有**：
-          //   HTTPClient::sendRequest() 是 `do { … } while (redirect);`，
-          //   限制 3 代表**一次 GET() 呼叫內最多做 4 次完整連線**，
-          //   而每次 NetworkClientSecure::connect(host, …) 都自己先做一次
-          //   Network.hostByName()，**那段 DNS 不受任何 timeout 參數管**。
-          //   單一 GET() 的最壞窗口 48~108 秒 → 全場 slave 逾時 →
-          //   **正關著的籠門全部放開**。而 GitHub Releases 的下載網址
-          //   （302 到 objects.githubusercontent.com）正是最可能的部署形狀。
-          // 改法：函式庫不跟隨，由本狀態機自己跟隨 —— 收到 3xx 就回 OTA_RESOLVING，
-          // 重新預熱新主機的 DNS，再走一次 CONNECT → REQUEST。
-          otaHttp->setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-
-          // begin() 不會關掉我們已經建立的連線，GET() 內的 connect() 看到
-          // connected() 為真就直接重用（HTTPClient.cpp 的 connect() 第一段）——
-          // 這正是「不再有第二次 DNS」的機制。
+          if (otaHttp == nullptr) {
+            Serial.println("[OTA] 請求階段沒有 HTTP 物件，10 秒後重試");
+            otaReleaseHttp();
+            otaDlStep = OTA_DL_CONNECT;
+            otaRetryAt = millis() + OTA_RETRY_GAP_MS;
+            return;
+          }
+          // begin() 已在 OTA_DL_CONNECT 做完（C5：順序不可調換）。這裡只送請求。
+          // 上面那道 otaTls->connected() 檢查同時是 C5 的執行期守衛：若哪天
+          // 函式庫又在某處把連線拆掉，這裡會看到斷線並走重試，而不是靜默地
+          // 讓 GET() 自己重連、重新解析一次 DNS。
           otaBurst("送出 GET 前");
-          bool begun = otaHttp->begin(*otaTls, otaUrl);
-          int code = begun ? otaHttp->GET() : -1;
+          int code = otaHttp->GET();
           otaBurst("送出 GET 後");
-          // ⚠ 這一步的 6000 是 HTTPClient 讀回應標頭的**無進度**逾時
-          //   （handleHeaderResponse() 每收到資料就重設計時），**不是總時長上界**。
-          //   一台每 5 秒吐一個 byte 的伺服器可以把這個窗口拉到任意長，
-          //   而 OTA_SESSION_MAX_MS 是 loop() 層的檢查、**攔不住單一阻塞呼叫**。
-          //   本 Task 沒有修掉這一條（要修得自己送請求、自己非阻塞讀標頭，
-          //   規模等同再寫一個 Task），**列為已知殘留缺口**。
+          // ⚠ 這一步裡有**兩段**都是「無進度」逾時，不是總時長上界
+          //   （逐行讀完 begin()→GET() 整條呼叫鏈之後的完整清單）：
+          //   (1) sendHeader() → NetworkClientSecure::write() → send_ssl_data()：
+          //       `if ((millis() - last_progress) > socket_timeout) return -1;`
+          //       每寫進去一些就重設 last_progress（ssl_client.cpp）。
+          //   (2) handleHeaderResponse()：
+          //       `if ((millis() - lastDataTime) > _tcpTimeout)`，每收到一行就重設。
+          //   兩者都是「6 秒沒有進度才放棄」，一台每 5 秒吐一個 byte 的伺服器
+          //   可以把窗口拉到任意長，而 OTA_SESSION_MAX_MS 是 loop() 層的檢查、
+          //   **攔不住單一阻塞呼叫**。本 Task 沒有修（要修得自己送請求、自己
+          //   非阻塞讀標頭，規模等同再寫一個 Task），**列為已知殘留缺口**。
+          //   ⚠ 更正：這**不是**本韌體唯一的無上界窗口 —— publishJsonDoc() 上方
+          //   早就寫著 NetworkClient::write() 的 10 秒「不是硬上限」（部分寫入
+          //   會把重試計數重置）。無上界的窗口至少有三處。
 
           // ── C1：自己跟隨重定向 ──
           // 只認 RFC 這五個碼（回去讀了 HTTPClient.h 的列舉定義）；
