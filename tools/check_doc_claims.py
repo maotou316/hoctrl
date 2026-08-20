@@ -132,7 +132,14 @@ HIT_IN_SOURCE = [
 
 # ── 方向 3：協定測試的項數必須與文件的判準一致 ──
 # 文件寫死「執行 N 項」當判準，程式卻是執行期累加 —— 兩者靠人工同步過一次就會漂。
-EXPECTED_TEST_COUNT_DOC = 'docs/phase4-flag-day-upgrade.md'
+# B 族第 13 次：plan 的回歸清單第 1 項寫「應顯示 41 項全過」、:877 也寫 41，
+# 而實際是 57（腳本自己數得出來）。方向 4 本來就是為抓這個而生的，
+# **卻只掃 phase4-flag-day-upgrade.md、掃不到 plan** —— 覆蓋缺口，不是判準錯。
+# 現在改成掃一整組文件。
+EXPECTED_TEST_COUNT_DOCS = [
+    'docs/phase4-flag-day-upgrade.md',
+    'docs/superpowers/plans/2026-08-17-esp32-phase4-ota-relay.md',
+]
 
 # ── 方向 2（BANNED）：被取代的舊值不得再以「現行事實」的樣子出現在文件裡 ──
 #
@@ -309,15 +316,23 @@ def main():
     test_src = read('ho_espnow_test/ho_espnow_test.ino')
     body = test_src.split('void check(bool cond', 1)[1]
     n_checks = len(re.findall(r'\bcheck\(', body))
-    doc = read(EXPECTED_TEST_COUNT_DOC)
-    doc_counts = set(re.findall(r'執行 (\d+) 項，失敗 0 項', doc))
-    doc_counts |= set(re.findall(r'項數\*\*不是 (\d+)\*\*', doc))
-    doc_counts |= set(re.findall(r'這 (\d+) 項全部是', doc))
-    bad_counts = {c for c in doc_counts if int(c) != n_checks}
-    if bad_counts:
-        failures.append('[項數] 原始碼有 %d 個 check()，但 %s 寫成 %s'
-                        % (n_checks, EXPECTED_TEST_COUNT_DOC, sorted(bad_counts)))
-    print('協定測試項數：原始碼 %d、文件 %s' % (n_checks, sorted(doc_counts)))
+    # **它擋不住什麼**：只認下面這五種措辭。用別的句型寫同一個數字
+    # （「總共四十一項」「41/41 通過」）一樣抓不到。
+    doc_counts = set()
+    for docpath in EXPECTED_TEST_COUNT_DOCS:
+        doc = read(docpath)
+        found = set(re.findall(r'執行 (\d+) 項，失敗 0 項', doc))
+        found |= set(re.findall(r'項數\*\*不是 (\d+)\*\*', doc))
+        found |= set(re.findall(r'這 (\d+) 項全部是', doc))
+        found |= set(re.findall(r'應顯示 (\d+) 項全過', doc))
+        found |= set(re.findall(r'協定測試由 \d+ 項增為 (\d+) 項', doc))
+        doc_counts |= found
+        bad = {c for c in found if int(c) != n_checks}
+        if bad:
+            failures.append('[項數] 原始碼有 %d 個 check()，但 %s 寫成 %s'
+                            % (n_checks, docpath, sorted(bad)))
+    print('協定測試項數：原始碼 %d、文件 %s（掃 %d 份）'
+          % (n_checks, sorted(doc_counts), len(EXPECTED_TEST_COUNT_DOCS)))
 
     # ── 容量算式獨立複算 ──
     # **每一個數字都從原始碼解析出來**，不從文件抄、也不寫死在這支腳本裡。
@@ -502,28 +517,62 @@ def main():
         if not any(exact in line for _, line in code_lines):
             failures.append('[設定唯一] %s：找不到逐字的 %r' % (label, exact))
 
-    # ── 方向 13：C5 的順序不變量（begin() 必須排在 TLS 握手之前）──
-    # HTTPClient.cpp:283 的 beginInternal 尾端：
-    #   `if (_host != the_host && connected()) { _canReuse = false; disconnect(true); }`
-    # 新 HTTPClient 的 _host 是空字串，所以「先握手再 begin()」會**當場把連線拆掉**，
-    # 接著 GET() 自己重連 —— C3 消除的那次 DNS 會整條回來，而且多付一次握手。
-    # 這個順序沒有任何編譯期或執行期訊號，只能靠檢查釘住。
+    # ── 方向 13：**一組**順序不變量 —— 全部必須排在 otaTls->connect() 之前 ──
     #
-    # **它擋不住什麼**：只比對這兩行在檔案裡的先後位置，不理解控制流。
-    # 把 begin() 搬到另一個函式、或用別的方式重連，它都抓不到。
+    # X1（A 族第 18 次）：方向 12 只驗「剛好一次、逐字如此」，
+    # 所以 `setConnectionTimeout(6000)` **一字不改、只搬到 connect() 之後**
+    # → 13 個方向全過，而執行期 `_timeout` 還是建構子的 30000
+    # → TCP select 30 秒 ＋ 握手 6 秒 ＝ **36 秒單一阻塞呼叫 → 籠門放開**。
+    # 那正是 M20 想擋的後果，改用「搬位置」達成。
+    # **同一個 commit 才剛因為 C5 學到「順序沒有任何編譯期／執行期訊號」，
+    # 卻沒把那個維度套到隔壁的設定上** —— 這次一起釘。
+    #
+    # 三條不變量（都必須在 `otaTls->connect(...)` 那一行之前）：
+    #   1. begin()               —— 之後才呼叫會被 beginInternal 的 disconnect(true) 拆線
+    #                               （HTTPClient.cpp:283，_host 是空字串 → 條件成立）
+    #   2. setConnectionTimeout  —— 之後才設，TCP select 用的是預設 30000
+    #   3. setHandshakeTimeout   —— 之後才設，握手用的是預設 120000
+    #
+    # **它擋不住什麼**（三項，逐項寫明）：
+    #   - **它比的是「文字在檔案裡的先後」，不是控制流。** 把設定包進一個更早出現、
+    #     但執行時走不到的分支，它照樣過（本腳本自己的 X2 逃逸就是這個形狀）。
+    #   - 只認下面這幾個字面錨點。改用別的多載或把設定搬進 helper 呼叫，它抓不到。
+    #   - **比對範圍限定在 `case OTA_DL_CONNECT:` 這個區塊內**（見下方），
+    #     所以「helper 的定義寫在 updateOtaSession() 後面」這種**執行順序正確的重構
+    #     不會再誤觸**（那是上一版全檔比對的缺陷）；但把**呼叫本身**搬出區塊仍會叫 ——
+    #     那時它是**中斷器**：請人回來確認新寫法仍然滿足三條不變量，再更新這張表。
     src_m = master_src
-    i_begin = src_m.find('if (!otaHttp->begin(*otaTls, otaUrl)) {')
-    i_conn = src_m.find('int cres = otaTls->connect(otaHostIp')
-    if i_begin < 0 or i_conn < 0:
-        failures.append('[順序] 找不到 begin() 或 otaTls->connect() 的錨點，方向 13 無法檢查')
-    elif i_begin > i_conn:
-        failures.append('[順序] otaHttp->begin() 排在 otaTls->connect() **之後**：'
-                        'beginInternal 會因為 _host 不同而 disconnect(true) 把剛握好的 '
-                        'TLS 連線拆掉，GET() 會自己重連並重新做一次 DNS（C5／A 族第 17 次）')
+    blk_start = src_m.find('case OTA_DL_CONNECT: {')
+    blk_end = src_m.find('case OTA_DL_REQUEST: {')
+    if blk_start < 0 or blk_end < 0 or blk_end < blk_start:
+        failures.append('[順序] 找不到 OTA_DL_CONNECT 區塊，方向 13 無法檢查')
+    else:
+        blk = src_m[blk_start:blk_end]
+        i_conn = blk.find('int cres = otaTls->connect(otaHostIp')
+        ORDER_BEFORE_CONNECT = [
+            ('HTTPClient::begin（C5）', 'if (!otaHttp->begin(*otaTls, otaUrl)) {',
+             'beginInternal 會因為 _host 不同而 disconnect(true) 把剛握好的 TLS 連線拆掉，'
+             'GET() 會自己重連並重新做一次 DNS'),
+            ('setConnectionTimeout（X1）', 'otaTls->setConnectionTimeout(6000);',
+             'TCP connect 的 select 會用建構子預設的 30000 → 單一阻塞 30+6=36 秒 → 籠門放開'),
+            ('setHandshakeTimeout（X1）', 'otaTls->setHandshakeTimeout(6);',
+             'TLS 握手會用建構子預設的 120000 → 單一阻塞 120 秒 → 籠門放開'),
+        ]
+        if i_conn < 0:
+            failures.append('[順序] OTA_DL_CONNECT 區塊裡找不到 otaTls->connect() 錨點')
+        else:
+            for label, needle, why in ORDER_BEFORE_CONNECT:
+                i = blk.find(needle)
+                if i < 0:
+                    failures.append('[順序] OTA_DL_CONNECT 區塊裡找不到 %s 的錨點 %r'
+                                    % (label, needle))
+                elif i > i_conn:
+                    failures.append('[順序] %s 排在 otaTls->connect() **之後**：%s'
+                                    % (label, why))
 
     print('禁用 API 靜態檢查：ho_master1.ino 非註釋行 %d 行；'
           'otaSessionBusy() 呼叫點 %d 處；文件必含 %d 條；'
-          '設定唯一 %d 條；順序不變量 1 條'
+          '設定唯一 %d 條；順序不變量 3 條（皆須早於 otaTls->connect()）'
           % (len(code_lines), n_busy, len(DOC_MUST_CONTAIN), len(EXACT_ONCE_IN_MASTER)))
 
     print('HIT 檢查 %d 項、BANNED 樣式 %d 條 × 檔案 %d 份（含原始碼註釋）；'

@@ -3489,7 +3489,11 @@ void updateOtaSession(unsigned long now) {
             return;
           }
           // 每輪最多讀 OTA_DL_BYTES_PER_LOOP，讀完就交還 loop()。
-          // 只讀 available() 說已經到的量，所以 readBytes() 不會等 socket ——
+          // 只讀 available() 說已經到的量，所以 readBytes() 不會等 socket。
+          // ⚠ 這句話真正的依據是 **ssl_client.cpp:84** ——
+          //   `fcntl(socket, F_SETFL, … | O_NONBLOCK)`，而**全 repo 沒有任何一處把它清掉**。
+          //   否則 SO_RCVTIMEO 會讓每次讀取先白吃一段逾時。
+          //   （不是「緩衝大小」擋住的，前幾版註釋把原因寫錯了。）
           // 這一段不吃 mqttPublishBudgetUsed 的名額（那個名額管的是**阻塞式
           // socket 寫入**，這裡是非阻塞讀）。但同一輪 loop() 仍可能先發生一次
           // publish 的 10 秒黑箱、再走到這裡，兩者都各自被心跳夾住。

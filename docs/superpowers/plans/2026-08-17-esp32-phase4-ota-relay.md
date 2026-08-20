@@ -874,7 +874,7 @@ HoCmdPayload 解讀，cmd 欄位剛好落在 0/1/2 就會實際動作繼電器�
   OTA_DATA 封包總長 7+3+240=250 貼滿 ESP-NOW 上限）
 - HoOtaStatus 錯誤碼
 
-協定測試由 32 項增為 41 項，新增「type 被竄改時拒收」「seq 被竄改時拒收」
+協定測試由 32 項增為 57 項，新增「type 被竄改時拒收」「seq 被竄改時拒收」
 與 OTA 結構大小的編譯期一致性檢查。
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
@@ -2593,7 +2593,7 @@ commit 訊息必須說明：
 | # | 項目 | 重點 |
 |---|---|---|
 | 0 | **前置：master 與所有 slave 都燒了新韌體** | 協定版本 2 是 flag-day；混版時 slave 會在 30 秒後印失聯並關閉繼電器。**失敗判定** |
-| 1 | `.\flash.ps1 -Model test -Upload` 後跑協定測試，應顯示 41 項全過 | Task 1 的測試 |
+| 1 | `.\flash.ps1 -Model test -Upload` 後跑協定測試，應顯示 57 項全過 | Task 1 的測試。**這個數字由 `tools/check_doc_claims.py` 的方向 4 直接數 `ho_espnow_test.ino` 的 `check()` 呼叫算出**，不要手寫更新 —— 初版寫 41（Task 1 當時的預估），實際是 57，照舊值驗收會把正確行為判成 FAIL（B 族第 13 次） |
 | 2 | 平時（無 OTA）行為與 Phase 2b 完全一致：狀態 10 秒一則、代發輪播、`ALL:*`、配對 | **回歸，失敗判定** |
 | 3 | `otadl <n> <url>` 指向一個真實的 slave `.bin`：序列埠依序出現「解析主機」→「開始下載」→「下載完成 … MD5」→「已暫存完成：… 「未轉送、未接觸任何 slave」…」 | 只驗證下載段。**失敗判定**：這一項若出現「已更新到 x.y.z」就是**假綠燈**（本項全程沒有任何 ESP-NOW OTA 封包），判 FAIL |
 | 4 | 同上，**下載全程 slave 端不得出現失聯訊息** | **失敗判定**（決定 1c 的核心） |
