@@ -17,7 +17,7 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
     python tools/check_doc_claims.py
 全部通過印 ALL CHECKS PASSED，任何一項失敗以 exit code 1 結束。
 
-**十四個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
+**十五個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
 這個數字自己就是一個判準 —— 初版寫「八個」而實際是九個，
 **一支專門檢查「文件寫死的 N 項」的腳本自己數錯**，所以改動方向時請一起數：
   1. HIT     —— 文件引用的判準字串必須逐字出現在原始碼裡
@@ -37,10 +37,13 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
  12. 設定唯一 —— 關鍵 timeout／重定向設定必須**剛好出現一次**且逐字如此
                 （HIT 擋不住「再加一行覆蓋它」，也擋不住「整行被刪掉」）
  13. 順序    —— `otaHttp->begin()` 必須排在 `otaTls->connect()` 之前（C5）
- 14. 轉送燈號 —— Task 4 的兩個假燈號出口：`已更新到` 在非註釋行**剛好一次**且
-                只長在 `OTA_VERIFYING` 區塊裡（三條硬性前提逐字齊全、且該區塊
-                不得出現會過期的 `otaTargetIdx`）；`OTA_END_SENT` 區塊必須逐字
-                含「收到 READY 就繼續等」與「連 blockBase／mask 一起檢查」兩道
+ 14. 轉送燈號 —— Task 4 的兩個假燈號出口。**存在性、位置、以及「不得多開一條
+                析取」三個維度一起驗**（只驗存在性會被「一字不改、只搬位置」
+                整份繞過 —— A 族第 18、19 次）
+ 15. 轉送送出點 —— 送給 OTA 目標的單播必須全部經由 `otaTxToTarget()`（CR1）：
+                `espNowSendToEx(otaTargetMac` 在非註釋行剛好一次，且
+                `groupNoteUnicastAck()` 裡的 `otaUnicastRecently()` 守衛排在
+                寫入 `groupDelivered[]` 之前
 
 **這支腳本擋不住什麼**（必須連著讀）：
   - 它只做**字串／算式比對**。字串對不代表語義對
@@ -146,7 +149,13 @@ HIT_IN_SOURCE = [
     # 這一條同時是「END_SENT 逾時不得改回 otaFail()」的中斷器：改回去的話
     # 這句話會被刪掉，HIT 當場變紅（理由見該處的長註釋，兩種單封丟包的假紅燈）。
     ('轉送：校驗結果逾時改判版本', '[OTA] 10 秒沒收到校驗結果（OTA_END 或它的回覆掉了一封），改用版本回檢判定：等它重開機回報版本'),
-    ('轉送：安靜版送出',      'espNowSendToEx(otaTargetMac, HO_PKT_OTA_DATA, pkt, sizeof(dh) + dataLen, false);'),
+    # CR1 之後所有送給目標的單播都走 otaTxToTarget()（方向 15 驗那個「所有」）
+    ('轉送：資料包走統一送出點', 'return otaTxToTarget(HO_PKT_OTA_DATA, pkt, sizeof(dh) + dataLen, false);'),
+    ('轉送：統一送出點蓋時間戳', 'otaUnicastAt = millis();'),
+    ('CR1：群組歸因守衛',      'if (otaUnicastRecently(desAddr)) {'),
+    ('CR1：群組指令期間轉送讓開', '[OTA] 群組指令進行中，轉送讓開（安全指令優先於 OTA；計時器一併暫停）'),
+    ('MJ3：心跳佇列滿要重試',   '⚠ [心跳] 送出佇列滿，這一則沒進佇列；不推進計時器，下一輪 loop() 立刻重試'),
+    ('MJ4：送出失敗彙總',       '[OTA] 轉送期間單播送出失敗 %u 次（累計，每 5 秒彙總一行）'),
     ('轉送：收包 log 排除 ACK', 'if (header.type != HO_PKT_OTA_ACK) {'),
 ]
 
@@ -619,6 +628,13 @@ def main():
     #   - **它擋不住「重送同一版」**：slave 本來就是目標版本時，(a)(b)(c) 全部
     #     成立而韌體其實沒換過。要分辨得比對重開機事件本身（uptime／開機計數），
     #     本階段的 HoStatePayload 沒有那個欄位 —— 這是已知缺口，不是本檢查的漏網。
+    #   - **位置維度只驗「文字先後」，不驗控制流**（與方向 13 同一個限制）：
+    #     把成功出口包進一個更晚出現、但執行時先走到的分支，它照樣過。
+    #   - **`||` 的禁令只涵蓋 OTA_VERIFYING 區塊**。同樣的加寬手法用在
+    #     OTA_END_SENT（例如把成功判定寫成「OK 或 base 對」）它抓不到；
+    #     那一段目前靠的是兩條逐字錨點，**覆蓋比 VERIFYING 弱，照實記在這裡**。
+    #   - 它不驗數值：把 90000 改成 1、把三段版本比成別的變數，只要字面在、
+    #     順序對、沒有 `||`，它一個字都不會說。
     # 區塊要在 **updateOtaSession() 的函式本體內**找：otaPhaseName() 也有一個
     # 逐項列出同一組列舉的 switch，`case OTA_SUCCESS:` 在它裡面**更早**出現，
     # 直接全檔 find() 會切出一段負長度而誤報「找不到」。
@@ -638,6 +654,20 @@ def main():
             return None
         return ota_fn[i:j]
 
+    # ── A 族第 19 次的補課：**位置維度** ──
+    # 方向 13 存在的唯一理由就寫著 A-18「一字不改、只搬位置」，
+    # 而方向 14 的第一版在同一支腳本往下 60 行**又只驗存在性**。
+    # 複審實測出兩個存活的加寬突變，兩個都不是「刪掉某一行」：
+    #   W1：四個逐字錨點一字不改、「已更新到」仍剛好一次，
+    #       **只把成功出口搬到守衛之前** → 只要目標還在名冊上就宣告已更新
+    #   W2'：三條前提原封不動，把版本相等換成
+    #       `verOk = (三段相符) || (now - otaPhaseStart >= 60000)`
+    #       → **等 60 秒就綠、完全不看版本**
+    # 所以這一版加三件事：(甲) 錨點必須**按順序**出現；
+    # (乙) **版本三段比對本身**列進必含清單（前一版沒釘它，
+    #      而那正是「版本回檢」四個字的全部內容）；
+    # (丙) **OTA_VERIFYING 區塊的非註釋行不得出現 `||`** ——
+    #      那一段的判定按設計是純合取，任何析取都等於多開一條綠燈路徑。
     n_upgraded = len([1 for _, line in code_lines if '已更新到' in line])
     if n_upgraded != 1:
         failures.append('[轉送燈號] 「已更新到」在 ho_master1.ino 的非註釋行出現 %d 次'
@@ -647,21 +677,64 @@ def main():
 
     verifying = block_of('case OTA_VERIFYING: {', 'case OTA_SUCCESS:', 'OTA_VERIFYING')
     if verifying is not None:
-        VERIFY_MUST = [
+        # **順序與計數一律在「去掉註釋行」的版本上做**。註釋裡本來就會逐字引用
+        # 這些判斷式（解釋「為什麼一定要有這一條」的說明必須寫得出那一行），
+        # 拿含註釋的原文比先後，等於讓一句說明就能決定順序檢查的結果。
+        verifying = chr(10).join(ln for ln in verifying.split(chr(10))
+                                 if not ln.lstrip().startswith('//'))
+        # **這張表同時是順序表**：由上而下就是要求的出現順序。
+        # 守衛的每一段都必須排在「印出已更新到」與 otaFinish() 之前 —— 那正是 W1 的破口。
+        VERIFY_ORDERED = [
             ('(b) 用 MAC 重查索引', 'int vIdx = findSlave(otaTargetMac);'),
             ('(a) 目標版本不是 0.0.0', 'if (otaHasVersion && vIdx >= 0 &&'),
+            ('線上判定', 'slaves[vIdx].online &&'),
             ('(c) lastSeen 晚於進入 VERIFYING 的時刻',
              '(long)(slaves[vIdx].lastSeen - otaPhaseStart) > 0 &&'),
+            ('版本比對 major', 'slaves[vIdx].fwMajor == otaVerMajor'),
+            ('版本比對 minor', 'slaves[vIdx].fwMinor == otaVerMinor'),
+            ('版本比對 patch', 'slaves[vIdx].fwPatch == otaVerPatch'),
             ('成功路徑印出回歸清單第 12 項的判準字串', '[OTA] 完成：%s 已更新到 %u.%u.%u'),
+            ('成功收尾', 'otaFinish();'),
         ]
-        for label, needle in VERIFY_MUST:
-            if needle not in verifying:
+        prev_i, prev_label = -1, None
+        for label, needle in VERIFY_ORDERED:
+            i = verifying.find(needle)
+            if i < 0:
                 failures.append('[轉送燈號] OTA_VERIFYING 區塊少了 %s 的逐字錨點：%r'
                                 % (label, needle))
+                continue
+            if i < prev_i:
+                failures.append('[轉送燈號] OTA_VERIFYING 的 %s 排在 %s **之前**：'
+                                '守衛的每一段都必須早於「已更新到」與 otaFinish()，'
+                                '否則只要把成功出口搬到守衛前面就能繞過整組前提'
+                                '（A 族第 18／19 次的形狀）' % (label, prev_label))
+            prev_i, prev_label = i, label
+
+        # otaFinish() 在本區塊只能有一個呼叫點（多一個＝多一條成功出口）
+        n_fin = len([1 for ln in verifying.split(chr(10))
+                     if not ln.lstrip().startswith('//') and 'otaFinish();' in ln])
+        if n_fin != 1:
+            failures.append('[轉送燈號] OTA_VERIFYING 區塊的 otaFinish() 呼叫點有 %d 個'
+                            '（必須剛好 1 個）' % n_fin)
+
         for lineno, line in code_lines:
             if 'otaTargetIdx' in line and line in verifying:
                 failures.append('[轉送燈號] OTA_VERIFYING 區塊用了會過期的 otaTargetIdx：'
                                 'ho_master1.ino:%d %s' % (lineno, line.strip()[:80]))
+
+        # (丙) 禁止析取：版本回檢按設計是純合取，任何 `||` 都是多開的綠燈路徑。
+        # **這一條才是擋住 W2' 的主力** —— 逐字錨點只是剛好因為尾巴含 `) {` 而
+        # 附帶抓到（那是意外覆蓋，不是設計；M10 當初成立也是同一個意外，照實記）。
+        for ln in verifying.split(chr(10)):
+            if ln.lstrip().startswith('//'):
+                continue
+            if '||' in ln:
+                failures.append('[轉送燈號] OTA_VERIFYING 區塊出現 `||`：%s'
+                                '／版本回檢按設計是純合取，析取等於多開一條綠燈路徑'
+                                '（例如把版本相等換成「或已經等了 60 秒」）。'
+                                '若真的需要析取，那是**中斷器**：請先確認新寫法沒有'
+                                '放寬任何一條硬性前提，再更新這條規則'
+                                % ln.strip()[:80])
 
     end_sent = block_of('case OTA_END_SENT: {', 'case OTA_VERIFYING: {', 'OTA_END_SENT')
     if end_sent is not None:
@@ -675,6 +748,50 @@ def main():
             if needle not in end_sent:
                 failures.append('[轉送燈號] OTA_END_SENT 區塊少了 %s 的逐字錨點：%r'
                                 % (label, needle))
+
+    # ── 方向 15：轉送送出點的結構不變量（CR1）──
+    #
+    # onEspNowSent() 跑在 WiFi task，**無條件**把每一則 MAC 層 ACK 交給
+    # groupNoteUnicastAck() 當群組指令的送達證據。Task 4 是第一個「對單一 slave 的
+    # MAC 持續送單播」的功能，所以前一輪排進佇列、尚未完成的 OTA_DATA 回呼會落在
+    # 本輪剛開的歸因閂裡 → 假的 "grp":1，而且**補送迴圈整台跳過**那台
+    #（依建構必然 relay==0、門正開著的那一台）。
+    #
+    # 修法的結構面是「所有送給目標的單播都經由 otaTxToTarget()，由它蓋時間戳」。
+    # 這條規則驗的就是那個「所有」：
+    #   (1) `espNowSendToEx(otaTargetMac` 在非註釋行**剛好一次**（就是 otaTxToTarget 裡那行）
+    #   (2) groupNoteUnicastAck() 裡有 otaUnicastRecently() 守衛，
+    #       且**排在寫入 groupDelivered[] 之前**
+    #
+    # **它擋不住什麼**：
+    #   - 只認 `espNowSendToEx(otaTargetMac` 這個字面。有人先把 MAC 複製到別的變數
+    #     再送（`espNowSendToEx(mac, …)`）它抓不到。
+    #   - 它不驗時間戳蓋在送出**之前**（那是順序，且錨點都在同一行內）。
+    #   - **它完全不驗併發**：兩個 task 之間沒有鎖，正確性靠「單一寫者 + volatile」
+    #     的約定，**原理上無法用字串比對或黑箱測試證明**。
+    n_direct = len([1 for _, line in code_lines if 'espNowSendToEx(otaTargetMac' in line])
+    if n_direct != 1:
+        failures.append('[轉送送出點] `espNowSendToEx(otaTargetMac` 在非註釋行出現 %d 次'
+                        '（必須剛好 1 次，就是 otaTxToTarget() 裡那一行）。'
+                        '多一次＝有一條送出點沒有蓋 otaUnicastAt 時間戳，'
+                        '那一處的 MAC 層 ACK 會冒名頂替群組指令的送達證據，'
+                        '而補送迴圈會整台跳過那台 slave（CR1）' % n_direct)
+    gi = master_src.find('void groupNoteUnicastAck(')
+    gj = master_src.find('void groupSendUnicast(')
+    if gi < 0 or gj < 0 or gj < gi:
+        failures.append('[轉送送出點] 找不到 groupNoteUnicastAck() 的函式範圍，方向 15 無法檢查')
+    else:
+        gblk = master_src[gi:gj]
+        i_guard = gblk.find('if (otaUnicastRecently(desAddr)) {')
+        i_write = gblk.find('groupDelivered[i] = true;')
+        if i_guard < 0:
+            failures.append('[轉送送出點] groupNoteUnicastAck() 少了 CR1 守衛的逐字錨點：'
+                            "'if (otaUnicastRecently(desAddr)) {'")
+        elif i_write < 0:
+            failures.append('[轉送送出點] groupNoteUnicastAck() 裡找不到 groupDelivered[] 的寫入點')
+        elif i_guard > i_write:
+            failures.append('[轉送送出點] CR1 守衛排在 groupDelivered[] 寫入**之後**：'
+                            '那等於先把假的送達證據記下去再檢查')
 
     print('禁用 API 靜態檢查：ho_master1.ino 非註釋行 %d 行；'
           'otaSessionBusy() 呼叫點 %d 處；文件必含 %d 條；'
