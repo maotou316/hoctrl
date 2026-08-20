@@ -29,7 +29,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - RESET 按鈕: GPIO 1
   - 板載 LED: GPIO 3
   - 面板 LED: GPIO 0
-  - 繼電器按鈕: GPIO 4
+  - 繼電器按鈕: GPIO 4 與 GPIO 7（兩支同時驅動，單一韌體通吃兩版板子）
+    - PCB 絲印 341305A_P25_250814 → 實際接 GPIO 7；341305A_Y176_250318 → 實際接 GPIO 4
+    - 兩支腳都在 `setup()` 第一行由 `initRelayPins()` 拉低，避免未初始化的腳浮空導致 MOS 誤導通、繼電器恆閉燒毀設備
 - **開發板設定**:
   - USB CDC On Boot: Enabled
   - CPU Frequency: 160MHz (WiFi)
@@ -71,6 +73,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **AP 模式**: 當 WiFi 未連線時自動啟動
   - 提供 Web 介面進行設定
   - 同時啟動 BLE 配對模式
+  - ⚠ **這一條只適用 hoRelay1。hoRelay2 沒有 AP 模式**（連 `WebServer.h` 都沒 include）：
+    它的 `bleConfigMode` 只在 `setup()` 讀到「EEPROM 沒存 SSID」時才設為 true，
+    `loop()` 裡沒有任何 fallback。SSID 被改掉或 AP 永久消失時，唯一的復原手段是實體長按 5 秒。
+    詳見 `.claude/rules/wifi-mqtt-reconnect-antipatterns.md` 的「已知未處理」
 
 ### 3. MQTT 通訊架構
 
@@ -138,12 +144,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### 5. LED 狀態指示
 
-| 狀態 | LED 行為 |
-|------|----------|
-| 韌體更新中 | 快速閃爍 (200ms) |
-| AP 模式 | 慢速閃爍 (1000ms) |
-| 正常運作 | 恆亮 |
-| WiFi 未連接 | 閃爍 |
+hoRelay2 的實際行為（`blinkLED()`）：
+
+| 狀態 | 判斷條件 | LED 行為 |
+|------|----------|----------|
+| BLE 配對模式（含長按清除設定後） | `bleConfigMode` | 快閃 200ms（`PAIRING_BLINK`），**不熄燈** |
+| WiFi 未連接 | `WiFi.status() != WL_CONNECTED` | 快閃 300ms（`QUICK_BLINK`），30 秒後熄燈省電 |
+| WiFi 已連、MQTT 未連 | — | 一長二短 |
+| WiFi 與 MQTT 都已連上 | — | 熄燈 |
+| 長按重置確認中 | `isBlinking`（在 `loop()` 直接控腳，繞過 `blinkLED()`） | 閃爍 250ms（`BLINK_INTERVAL`），確認後長亮 0.7 秒 |
+
+配對模式 200ms 與 WiFi 未連接 300ms 刻意取不同值，肉眼可分辨兩種狀態。
+
+hoRelay2 的 `isUpdating` **不會**影響 LED（韌體更新中沿用當下的連線狀態閃法）；
+「韌體更新中 200ms 快閃」是 hoRelay1 的行為。
 
 ### 6. Web 管理介面
 
@@ -222,8 +236,30 @@ arduino-cli upload -p COM3 --fqbn esp32:esp32:esp32c3 ho_relay2
 - JSON 文件大小通常設為 200 bytes
 
 ### 長按重置功能
-- BOOT 按鈕長按 3 秒 → LED 閃爍 3 秒
-- 在閃爍期間再按第二按鈕 → 清除設定並重啟
+
+hoRelay2（BOOT GPIO 9 或 RESET GPIO 1 任一顆，總共按住 5 秒）：
+- 按住滿 3 秒（`LONG_PRESS_TIME`）→ LED 以 250ms 週期閃爍（`BLINK_INTERVAL`）
+- 閃爍期間**持續按住**再 2 秒（`BLINK_CONFIRM_TIME`）→ LED 長亮 0.7 秒（`CONFIRM_SOLID_TIME`）→ 清除 EEPROM 並重啟
+- 中途放開即取消，計時歸零
+- WiFi 連線等待期間共用 `waitForResetConfirm()`，行為與正常運作時一致
+  （1.7.0 之前另有 `interruptibleDelay()` 也共用它，該函式已隨 WiFi 重連重寫一併移除）
+
+hoRelay1 / hoRelay3 仍為舊行為（長按 3 秒 → 閃爍 3 秒 → 確認重置）。
+
+hoRelay2 另有**開機按鈕自檢**（`checkStuckButtons()`）：開機取樣 500ms，整段都是 LOW 的腳
+判定為短路／未接，本次開機停用其重置功能。防止一顆壞按鈕造成「開機即清除設定 → 重啟 →
+再清除」的無限迴圈（2026-08-14 實際發生過，RESET 按鈕 GPIO 1 內部短路）。
+副作用：「按住按鈕再上電」會被擋掉，放開後重新上電即恢復。
+詳見 `.claude/rules/button-pin-stuck-low.md`。
+
+### hoRelay2 開機瞬間繼電器短暫通電（硬體限制）
+
+上電時繼電器會短暫通電再斷掉，**這是硬體限制、韌體無法根治**，不要再嘗試用軟體解決。
+
+- **成因**: GPIO 4/7 是 ESP32-C3 的 JTAG 腳（MTMS/MTDO），reset 後由 ROM 配置、不保證為低電位；上電到第一行使用者程式之間約 200~500ms 的空窗，韌體管不到
+- **已做的緩解**: `initRelayPins()` 放在 `setup()` 第一行（早於 `Serial.begin()`），把窗口壓到只剩 ROM 空窗。**修改 `setup()` 時務必保持它在第一行**
+- **根治方式**: 需硬體在 MOS gate 對地加 10kΩ 下拉電阻，下一版 layout 補上
+- 詳見 `ho_relay2/readme.md` 的「已知硬體限制」章節
 
 ### Web 介面開發
 - 使用 Bootstrap CDN (5.3.3)
