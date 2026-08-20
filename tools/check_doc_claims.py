@@ -17,7 +17,7 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
     python tools/check_doc_claims.py
 全部通過印 ALL CHECKS PASSED，任何一項失敗以 exit code 1 結束。
 
-**十五個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
+**十八個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
 這個數字自己就是一個判準 —— 初版寫「八個」而實際是九個，
 **一支專門檢查「文件寫死的 N 項」的腳本自己數錯**，所以改動方向時請一起數：
   1. HIT     —— 文件引用的判準字串必須逐字出現在原始碼裡
@@ -44,6 +44,17 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
                 `espNowSendToEx(otaTargetMac` 在非註釋行剛好一次，且
                 `groupNoteUnicastAck()` 裡的 `otaUnicastRecently()` 守衛排在
                 寫入 `groupDelivered[]` 之前
+
+ 16 終局階段  —— 三個終局階段不得被合併回一個 `"success"`（Task 5 的第一責任）：
+                名單**從 `otaPhaseIsFinal()` 解析**，每個都要在 `otaPhaseName()`
+                與「停留 30 秒再回 idle」的 case 群組裡；兩個收尾函式各剛好一個
+                呼叫點；`otaFinishStagedOnly()` 必須長在 `if (otaStageOnly) {` 裡，
+                而那個分支不得出現 `otaFinish()`
+ 17 slave 正面證據 —— `otaSlaveVerified = true;` 剛好一處，且必須排在
+                「HO_OTA_OK ＋ base ＋ mask 三項齊備」之後（"verifying" 與
+                "unconfirmed" 唯一的分野，**一字不改只搬位置**就能造假）
+ 18 代發 updating —— `publishSlaveStatus()` 的 `isOtaTarget` 必須用 `otaTargetMac`
+                比對，不得用宣告處寫著「會過期」的 `otaTargetIdx`
 
 **這支腳本擋不住什麼**（必須連著讀）：
   - 它只做**字串／算式比對**。字串對不代表語義對
@@ -162,8 +173,23 @@ HIT_IN_SOURCE = [
     ('MJ3：心跳只在成功進佇列時才推進計時器', 'if (sendHeartbeat()) lastBeat = now;'),
     ('MJ6：讓開期間三個計時器都要順延', 'otaSessionStart += paused;'),
     ('MJ7：OTA_VERIFYING 不受 5 分鐘總上限管',
-     'if (otaPhase != OTA_SUCCESS && otaPhase != OTA_FAILED && otaPhase != OTA_VERIFYING &&'),
+     'if (!otaPhaseIsFinal() && otaPhase != OTA_VERIFYING &&'),
     ('轉送：收包 log 排除 ACK', 'if (header.type != HO_PKT_OTA_ACK) {'),
+    # ── Phase 4 Task 5（MQTT 入口、進度回報）──
+    # 這一組全部圍繞同一件事：**App 拿到的每一個狀態字串都要對應真實發生的事**。
+    ('Task 5：update_slave 指令', '} else if (message.startsWith("update_slave:")) {'),
+    ('Task 5：update_slave 一律不是 stageOnly', 'otaStart(id, url, ver, md5, force, false);'),
+    ('Task 5：fakeota 指令', '} else if (verb == "fakeota") {'),
+    ('Task 5：ota 物件的 phase 走查表函式，不得寫死字串', 'ota["phase"]    = otaPhaseName();'),
+    ('Task 5：OTA 期間發布週期縮短為 5 秒',
+     'return (otaPhase != OTA_IDLE) ? 5000UL : 10000UL;'),
+    ('Task 5：階段轉換立刻補發，進度變化不補發',
+     'if (otaStatusDirty || now - lastStatusPub > masterStatusIntervalMs()) {'),
+    ('Task 5：只暫存的收尾訊息（零 slave 接觸）',
+     '[OTA] 工作階段 %u 結束（目標 %s，階段轉為 staged_only：只到 master 暫存區，未接觸任何 slave）'),
+    ('Task 5：staged_only 階段名', 'case OTA_STAGED_OK:      return "staged_only";'),
+    ('Task 5：沒有 slave 正面證據時報 unconfirmed',
+     'case OTA_VERIFYING:      return otaSlaveVerified ? "verifying" : "unconfirmed";'),
 ]
 
 # ── 方向 3：協定測試的項數必須與文件的判準一致 ──
@@ -504,9 +530,11 @@ def main():
     #   4. **它會誘使人為了讓數字好看而不重構**。發現這種壓力時，
     #      正確的反應是改期望值＋改文件，不是放棄重構。
     n_busy = len([1 for _, line in code_lines if 'otaSessionBusy(' in line])
-    if n_busy != 3:
-        failures.append('[LR 掛鉤] otaSessionBusy() 的非註釋出現次數是 %d（期望 3：'
-                        '定義 1 處 + otaStart() 重入檢查 1 處 + otaRelayStaged() 重入檢查 1 處）。'
+    if n_busy != 6:
+        failures.append('[LR 掛鉤] otaSessionBusy() 的非註釋出現次數是 %d（期望 6：'
+                        '定義 1 處 + otaStart() 1 處 + otaRelayStaged() 1 處 + '
+                        'update_slave 2 處（拒絕重入、格式錯誤不得殺掉進行中的工作階段）'
+                        ' + updateStatusLed() 1 處）。'
                         '若是 Phase 5 補上了 LR 互斥守衛，請同時更新 '
                         'ho_master1/readme.md 那段「守衛現在並不存在」的敘述'
                         '與本檢查的期望值' % n_busy)
@@ -873,10 +901,147 @@ def main():
             failures.append('[轉送送出點] CR1 守衛排在 groupDelivered[] 寫入**之後**：'
                             '那等於先把假的送達證據記下去再檢查')
 
+    # ── 方向 16：三個終局階段不得被合併回一個 "success"（Task 5 的第一責任）──
+    #
+    # Task 3 的 MJ2 逐字寫著：`otadl` 的成功**只到「下載＋暫存＋MD5」，一台 slave
+    # 都沒被碰過**，而 Task 5 一開 MQTT 入口，那個階段值就會直接送到 App 顯示成
+    # 「更新完成」。Task 5 的作法是讓那條路徑走自己的終局階段 OTA_STAGED_OK
+    #（對 App 是 "staged_only"），與版本回檢成功的 "success" 分開。
+    #
+    # 這一條驗三件事：
+    #   (1) **完整性**：otaPhaseIsFinal() 列出的每一個階段，都必須在
+    #       otaPhaseName() 有自己的 case（否則 App 讀到的是 fallback 的 "idle"），
+    #       也必須在「停留 30 秒再回 idle」那個 case 群組裡（否則永遠不回 idle）。
+    #       **名單從原始碼解析，不寫死在這支腳本裡** —— 寫死等於再開一個
+    #       「加了階段但驗證沒跟上」的缺口。
+    #   (2) **兩個收尾函式各自剛好一個呼叫點**。
+    #   (3) **位置**：otaFinishStagedOnly() 必須長在 `if (otaStageOnly) {` 分支裡，
+    #       而那個分支裡**不得**出現 otaFinish() —— 「把 otaFinishStagedOnly() 換回
+    #       otaFinish()」正是這個 Task 存在的理由，也是最容易被「順手簡化」掉的一行。
+    #
+    # **它擋不住什麼**：
+    #   - 它不檢查字串**內容**是否誠實。有人把 "staged_only" 改成 "success"，
+    #     方向 1 的逐字錨點會叫，但若同時改掉錨點就通得過 —— 那時擋住的是人不是腳本。
+    #   - 它比對的是**文字位置**，不是控制流（與方向 13／14 同一個限制）。
+    #   - 它不驗 otaStageOnly 這個旗標本身有沒有被正確設定（那是 otaStart() 的
+    #     呼叫端責任，靠方向 1 的 `otaStart(id, url, ver, md5, force, false);` 錨點）。
+    final_phases = []
+    m_final = re.search(r'bool otaPhaseIsFinal\(\) \{(.*?)\n\}', master_src, re.S)
+    if not m_final:
+        failures.append('[終局階段] 找不到 otaPhaseIsFinal() 的函式本體，方向 16 無法檢查')
+    else:
+        final_phases = sorted(set(re.findall(r'OTA_[A-Z_]+', m_final.group(1))))
+        if len(final_phases) < 2:
+            failures.append('[終局階段] otaPhaseIsFinal() 解析出 %s，少於 2 個 —— '
+                            '解析樣式可能已經對不上函式寫法' % final_phases)
+        name_fn = master_src.split('const char* otaPhaseName() {', 1)
+        dwell_i = ota_fn.find('case OTA_SUCCESS:') if ota_fn else -1
+        dwell_j = ota_fn.find('otaPhase = OTA_IDLE;', dwell_i) if dwell_i >= 0 else -1
+        dwell = ota_fn[dwell_i:dwell_j] if (dwell_i >= 0 and dwell_j > dwell_i) else ''
+        if len(name_fn) < 2:
+            failures.append('[終局階段] 找不到 otaPhaseName() 的定義，方向 16 無法檢查')
+        elif not dwell:
+            failures.append('[終局階段] 找不到「停留 30 秒再回 idle」的 case 群組'
+                            '（錨點 case OTA_SUCCESS: → otaPhase = OTA_IDLE;）')
+        else:
+            name_body = name_fn[1].split('\n}', 1)[0]
+            for ph in final_phases:
+                if ('case %s:' % ph) not in name_body:
+                    failures.append('[終局階段] %s 是終局階段，但 otaPhaseName() 沒有它的 case：'
+                                    'App 會讀到 fallback 的 "idle"，等於一個真的發生過的'
+                                    '終局狀態對外完全隱形' % ph)
+                if ('case %s:' % ph) not in dwell:
+                    failures.append('[終局階段] %s 是終局階段，但不在「停留 30 秒再回 idle」'
+                                    '的 case 群組裡：otaPhase 會永遠卡在它上面，'
+                                    'App 的 ota.phase 再也不會回到 idle' % ph)
+    for label, needle, want in (
+            ('零 slave 接觸的收尾', 'otaFinishStagedOnly();', 1),
+            ('版本回檢成功的收尾', 'otaFinish();', 1)):
+        n = len([1 for _, line in code_lines if needle in line])
+        if n != want:
+            failures.append('[終局階段] %s %r 的非註釋呼叫點有 %d 個（必須剛好 %d 個）。'
+                            '多一個＝多一條宣告結束的路徑；零個＝那條路徑改接到別的收尾了'
+                            % (label, needle, n, want))
+    staged_i = ota_fn.find('if (otaStageOnly) {') if ota_fn else -1
+    staged_j = ota_fn.find('HoOtaBeginPayload bg;', staged_i) if staged_i >= 0 else -1
+    if staged_i < 0 or staged_j < staged_i:
+        failures.append('[終局階段] 找不到 OTA_STAGED 的 stageOnly 分支'
+                        '（錨點 if (otaStageOnly) { → HoOtaBeginPayload bg;）')
+    else:
+        staged_blk = '\n'.join(ln for ln in ota_fn[staged_i:staged_j].split('\n')
+                               if not ln.lstrip().startswith('//'))
+        if 'otaFinishStagedOnly();' not in staged_blk:
+            failures.append('[終局階段] otadl 的 stageOnly 分支裡找不到 otaFinishStagedOnly()：'
+                            '那條路徑一台 slave 都沒碰過，不得與版本回檢成功共用收尾')
+        if 'otaFinish();' in staged_blk:
+            failures.append('[終局階段] otadl 的 stageOnly 分支裡出現 otaFinish()：'
+                            '它會把階段設成 OTA_SUCCESS，而那條路徑只完成「下載＋暫存＋MD5」，'
+                            '**一台 slave 都沒被接觸過** —— App 會顯示「更新完成」'
+                            '（Task 3 的 MJ2 逐字警告過的假綠燈）')
+
+    # ── 方向 17：「slave 親口說校驗通過」這件事的唯一產生點 ──
+    #
+    # Task 4 把 OTA_VERIFYING 的入口從「必須收到 HO_OTA_OK」放寬成「END 送出後
+    # 10 秒沒回應也進來」。於是同一個階段底下混著兩種事實：有 slave 正面證據的，
+    # 與**一封回應都沒收到**的。otaSlaveVerified 是兩者對外唯一的分野
+    #（"verifying" vs "unconfirmed"）。
+    #
+    # 這一條驗：設成 true 的地方**剛好一處**，而且必須排在
+    # 「(HO_OTA_OK, base==totalChunks, mask==0xFFFF) 三項齊備」的判斷**之後**。
+    # 搬到那個 if 之外 ＝ 對 App 宣稱一件沒發生的事，而且**一字不改、只搬位置**
+    #（A 族第 18 次的形狀）—— 所以位置要單獨驗。
+    #
+    # **它擋不住什麼**：
+    #   - 它只認直接指派的字面。用別的變數轉一手（`bool v = true; otaSlaveVerified = v;`）
+    #     它抓不到。
+    #   - 它比對文字先後，不驗控制流。
+    #   - 它**完全不影響狀態機**：即使 otaSlaveVerified 是 false，那條路徑一樣會走
+    #     版本回檢、一樣可能走到 "success"。這一條保護的是「回報的字串誠不誠實」，
+    #     不是「有沒有多開一條綠燈」（多開綠燈那一側由方向 14 顧）。
+    n_verified = len([1 for _, line in code_lines if 'otaSlaveVerified = true;' in line])
+    if n_verified != 1:
+        failures.append('[slave 正面證據] `otaSlaveVerified = true;` 的非註釋指派有 %d 處'
+                        '（必須剛好 1 處，就在 OTA_END_SENT 收到 HO_OTA_OK 那個分支裡）。'
+                        '多一處＝有第二條路徑在宣稱「slave 說它校驗通過了」' % n_verified)
+    if end_sent is not None:
+        e_ok = end_sent.find('otaAckBase == otaTotalChunks && otaAckBits == 0xFFFF')
+        e_set = end_sent.find('otaSlaveVerified = true;')
+        if e_set < 0:
+            failures.append('[slave 正面證據] OTA_END_SENT 區塊裡找不到 '
+                            '`otaSlaveVerified = true;`：那是 "verifying" 與 "unconfirmed" '
+                            '唯一的分野，搬出這個區塊就沒有任何東西保證它只在有證據時為真')
+        elif e_ok < 0 or e_set < e_ok:
+            failures.append('[slave 正面證據] `otaSlaveVerified = true;` 排在'
+                            '「HO_OTA_OK ＋ base ＋ mask 三項齊備」的判斷**之前**：'
+                            '那等於在還沒確認證據之前就先宣告有證據')
+    if 'otaSlaveVerified ? "verifying" : "unconfirmed"' not in master_src:
+        failures.append('[slave 正面證據] otaPhaseName() 不再用 otaSlaveVerified 區分'
+                        '"verifying"／"unconfirmed"：沒有 slave 正面證據的那條路徑'
+                        '會對 App 宣稱 slave 已經回報校驗通過')
+
+    # ── 方向 18：代發狀態的 "updating" 判定不得用會過期的索引 ──
+    #
+    # plan Task 5 Step 3 的範本寫的是 `idx == otaTargetIdx`，而 otaTargetIdx 的宣告處
+    # 逐字寫著「會過期」（unpairSlave() 會把 slaves[] 往前搬）。用過期索引會把**另一台**
+    # 的代發狀態蓋成 "updating" —— 那台若其實已經離線，App 看到的是「更新中」而不是
+    # 「離線」，等於用一個進行中的假象蓋掉一個真實的壞消息。
+    # 本檔的慣例是「真相一律以 otaTargetMac 為準」，這裡把它釘住。
+    #
+    # **它擋不住什麼**：只認這一行的字面。它不驗 otaTargetMac 本身是不是對的，
+    # 也不驗這段判斷在 publishSlaveStatus() 的哪個位置。
+    if 'bool isOtaTarget = (memcmp(slaves[idx].mac, otaTargetMac, 6) == 0) &&' not in master_src:
+        failures.append('[代發 updating] publishSlaveStatus() 的 isOtaTarget 不再用 '
+                        'otaTargetMac 比對：改用 otaTargetIdx 會在名冊變動後把**別台**'
+                        '的狀態蓋成 "updating"（開錯門的 MAC 版，本專案已因索引式慣例出過）')
+
     print('禁用 API 靜態檢查：ho_master1.ino 非註釋行 %d 行；'
           'otaSessionBusy() 呼叫點 %d 處；文件必含 %d 條；'
           '設定唯一 %d 條；順序不變量 3 條（皆須早於 otaTls->connect()）'
           % (len(code_lines), n_busy, len(DOC_MUST_CONTAIN), len(EXACT_ONCE_IN_MASTER)))
+    print('終局階段（方向 16）：otaPhaseIsFinal() 解析出 %s，'
+          '每個都回頭比對 otaPhaseName() 與「停留 30 秒再回 idle」的 case 群組；'
+          'otaSlaveVerified = true 指派 %d 處（方向 17）'
+          % (final_phases or '解析失敗', n_verified))
 
     print('HIT 檢查 %d 項、BANNED 樣式 %d 條 × 檔案 %d 份（含原始碼註釋）；'
           'PLAN 樣式 %d 條 × %d 份'

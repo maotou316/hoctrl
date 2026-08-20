@@ -163,7 +163,13 @@ TRANSCRIBED_FROM_INO = [
     ('MJ6：讓開期間三個計時器都要順延（少一個就會被吃掉重試額度）',
      '      otaPhaseStart += paused;\n      otaWaitStart += paused;\n      otaSessionStart += paused;'),
     ('MJ7：OTA_VERIFYING 不受 5 分鐘總上限管',
-     'otaPhase != OTA_SUCCESS && otaPhase != OTA_FAILED && otaPhase != OTA_VERIFYING &&'),
+     'if (!otaPhaseIsFinal() && otaPhase != OTA_VERIFYING &&'),
+    # ── Task 5：本模擬的 'SUCCESS_STAGED' 之所以是一個**獨立的**終局階段，
+    #    對應的是韌體這一行。改回 otaFinish() 就等於 otadl 也報 "success"，
+    #    而那條路徑一台 slave 都沒碰過（Task 3 的 MJ2）。
+    #    位置與呼叫點數量由 tools/check_doc_claims.py 的方向 16 另外釘住。
+    ('STAGED：stageOnly 走自己的收尾，不與版本回檢成功共用 "success"',
+     'otaFinishStagedOnly();'),
     ('MJ3：心跳只在成功進佇列時才推進計時器',
      'if (sendHeartbeat()) lastBeat = now;'),
     ('END_SENT：OTA_END 沒進佇列要每輪重試（只重試「沒離開 master」那一種）',

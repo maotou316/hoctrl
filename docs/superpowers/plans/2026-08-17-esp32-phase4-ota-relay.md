@@ -2355,6 +2355,29 @@ const size_t STATUS_BASE_MAX_BYTES =
   ota["error"]    = otaErrCode;
 ```
 
+> **⚠ Task 5 執行後的更正（2026-08-20）—— 三個終局階段不得共用一個 `"success"`：**
+>
+> 本 Step 的範本只列出 `ota` 物件的五個欄位，**沒有處理 Task 3 的 MJ2 硬性前提**：
+> `otadl` 的 `stageOnly` 路徑當時直接 `otaFinish()` → `OTA_SUCCESS`，而那條路徑
+> **一台 slave 都沒被接觸過**。MQTT 入口一開，App 就會把它顯示成「更新完成」。
+> 「MQTT 入口只送 `stageOnly=false`」不構成保護 —— 序列埠的 `otadl` 在入口開了
+> 之後照樣可以被下，而 `ota` 是全域單一份。
+>
+> 實作因此新增了兩個對外字串（**兩個方向都是讓 App 少宣稱一點**）：
+>
+> | phase | 意義 |
+> |---|---|
+> | `"staged_only"` | 只下載到 master 暫存區、MD5 已核對，**零 slave 接觸**（`OTA_STAGED_OK`，走 `otaFinishStagedOnly()`） |
+> | `"verifying"` | 已整份轉送完，**slave 親口回報校驗通過**，等它重開機回線 |
+> | `"unconfirmed"` | 已送出 `OTA_END` 但一封回應都沒收到，改用版本回檢兜底：**沒有任何 slave 正面證據**（Task 4 放寬入口的那一條） |
+> | `"success"` | 版本回檢的三條硬性前提全部成立 |
+>
+> 兩者的長度都是 11 字元，仍在 `STATUS_OTA_MAX_BYTES` 假設的 12 字元之內。
+> 機械檢查：`tools/check_doc_claims.py` 方向 16（終局階段名單從 `otaPhaseIsFinal()`
+> 解析，回頭比對 `otaPhaseName()` 與「停留 30 秒回 idle」的 case 群組；
+> 兩個收尾函式各剛好一個呼叫點）與方向 17（`otaSlaveVerified = true;` 剛好一處、
+> 且必須排在「`HO_OTA_OK` ＋ base ＋ mask 三項齊備」之後）。
+
 - [ ] **Step 3: 目標 slave 的代發狀態標成 `updating`**
 
 `publishSlaveStatus()` 內，`doc["status"]` 那行改成：
@@ -2372,6 +2395,20 @@ const size_t STATUS_BASE_MAX_BYTES =
 ```
 
 > 這份 doc 約 250 bytes，遠低於 `statusBuf` 3072，不觸及任何容量常數。
+
+> **⚠ Task 5 執行後的更正（2026-08-20）—— 本 Step 的範本有兩處不能照抄：**
+>
+> 1. **`idx == otaTargetIdx` 不能用。** `otaTargetIdx` 的宣告處逐字寫著「會過期」
+>    （`unpairSlave()` 會把 `slaves[]` 往前搬），而**同一份計畫的 Task 4 前提 (b)
+>    正是「不得沿用會過期的 `otaTargetIdx`」** —— 兩處自相矛盾。照抄的後果是名冊
+>    變動後把**另一台**的代發狀態蓋成 `"updating"`：那台若其實已經離線，App 看到的
+>    是「更新中」而不是「離線」，等於用一個進行中的假象蓋掉一個真實的壞消息。
+>    實作改成 `memcmp(slaves[idx].mac, otaTargetMac, 6) == 0`（全 0 的 MAC 對不上
+>    任何一台，fail-closed），並由 `tools/check_doc_claims.py` 方向 18 釘住。
+> 2. **`otaPhase` 不是只有 `success`／`failed` 兩個終局值了。** Task 5 另外加了
+>    `OTA_STAGED_OK`（對 App 是 `"staged_only"`），見下方 Step 2 的更正框。
+>    範本裡 `otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_VERIFYING` 這個範圍
+>    仍然正確 —— 新階段刻意排在列舉最後，不影響任何有序比較。
 
 - [ ] **Step 4: 發布節奏**
 
@@ -2491,6 +2528,13 @@ void fakeOtaForCapacityTest() {
 > **量測時 `phase` 會是 `"idle"`（4 字元）而不是最壞的 12 字元**，
 > 兩者差 8 bytes。實作者在 report 記錄 `jsonsize` 結果時**必須把這 8 bytes 加回去**
 > 再與 3072 比較，並在 `fakeota` 的說明裡寫明這一點。
+
+> **⚠ Task 5 執行後的更正（2026-08-20）**：範本要求「`otaPhase` 設成
+> `OTA_DOWNLOADING` 再立刻改回 `OTA_IDLE`」，實作**刻意連碰都不碰 `otaPhase`** ——
+> 那兩行之間是一個真實的窗口（`updateOtaSession()` 會因為 `otaHttp == nullptr`
+> 走進重試路徑），而被量的本來就是 `buildStatusDoc()` 組出來的字串、不是狀態機。
+> 代價是量到的 `phase` 是 `"idle"`（4 字元）——**這一點範本本來就要求把 8 bytes
+> 加回去**，實作把這句話寫進了 `fakeota` 自己的輸出與 `printHelp()`。
 
 - [ ] **Step 8: 編譯與容量驗證**
 

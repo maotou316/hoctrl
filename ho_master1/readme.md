@@ -72,12 +72,16 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 | `ch <n>` | 測試用：切換 channel，驗證 slave 重掃 |
 | `droppeer <n>` | **測試用**：刪掉第 n 台的 ESP-NOW peer 但**保留名冊條目**，製造「在名冊上卻送不出單播」。回歸清單 8e 專用。不寫 NVS、不動名冊內容，重開機或重新配對即恢復。**傷害面**：App 對那台的個別開／關會**靜默失敗**到重開機為止；群組關門仍有效（主指令走廣播×3），但它會被誠實記成未送達 |
 | `fakeslaves <n>` | **測試用**：把名冊灌成 n 台假 slave，量狀態 JSON 容量用。MAC 是 `AA:BB:CC:DD:EE:<i>`，**`<i>` 是迴圈索引 0…n−1（不是 n）**，所以 `fakeslaves 20` 產生的 ID 是 `hoban-aabbccddee00` … `hoban-aabbccddee13`（**十六進位**）。**不寫 NVS**、**不註冊 ESP-NOW peer**。灌入後 `fakeSlavesActive` 會鎖住 `saveSlaves()` 直到重開機，避免假 MAC 經由後續的 pair／unpair 流程寫進 NVS 汙染真實名冊。**⚠ 若當下已連上 broker，master 會在約 0.75 秒後開始把這 n 台以 `retain=true` 發上去，而那些 topic 重開機後不會被覆蓋、永久留在 broker 上** —— 清除步驟見 `docs/phase2b-regression-checklist.md` 第 3 項結尾 |
+| `fakeota` | **測試用**（Phase 4 Task 5）：把 `ota` 物件灌成最壞值（最長 target／最長錯誤碼／`progress` 100／`size` 2031616），**不啟動任何工作階段、不寫 NVS**。驗證順序是 `fakeslaves 20` → `fakeota` → `jsonsize`。**⚠ 量到的 `phase` 是 `"idle"`（4 字元）而不是上界假設的 12 字元，記錄結果時必須把 8 bytes 加回去再與 `statusBuf` 比較** |
 | `jsonsize` | **測試用**：用 `buildStatusDoc()` + `measureJson()` 印出「實際會發布的那份 JSON」的大小，與 `statusBuf`／mqtt buffer 對照。不需連上 MQTT |
+
+> **`update_slave` 與 `ota` 狀態欄位的完整格式、每個 `phase`／`error` 值的語義，以及 App 該怎麼呈現，由 Task 6 補進本文件。** 在那之前，唯一權威來源是 `ho_master1.ino` 裡 `otaPhaseName()` 上方那張表與 `buildStatusDoc()` 的 `ota` 區塊。
+> **一句話版本**：`"staged_only"` ＝只下載到 master 暫存區、**零 slave 接觸**；`"verifying"` ＝ slave 親口回報整份校驗通過；`"unconfirmed"` ＝轉送完但**沒有任何 slave 正面證據**，正在用版本回檢兜底；`"success"` ＝版本回檢三條硬性前提全部成立。
 | `help` | 顯示說明 |
 | `otadl <n> <url>` | **測試用（Phase 4 Task 3）**：只跑「HTTPS 下載 → 寫進 master 自己的**閒置 OTA 分區**暫存 → 算 MD5」，**不轉送給 slave**（轉送要另外下 `otarelay`）。收尾印的是 `[OTA] 已暫存完成：… 「未轉送、未接觸任何 slave」…` 與 `[OTA] 工作階段 N 結束（目標 …，階段轉為 success）`，**兩行都不會出現「已更新到 x.y.z」** —— 那句話只由 Task 4 的版本回檢路徑印。（初版這裡是 `[OTA] 完成：%s 已更新到 x.y.z`，每跑一次 `otadl` 就宣稱一次 slave 已更新，是**假綠燈方向**的判準矛盾，已修掉。）會抹除閒置 OTA 分區（不動開機分區，master 不會變磚：全檔沒有任何一行呼叫 `esp_ota_set_boot_partition()`）。**固定帶 `force=true`**，因此**略過**「目標繼電器正開著就拒絕」那道保護。只接受 `https://` 開頭的網址 |
 | `otarelay <n> [版本] [force]` | **測試用（Phase 4 Task 4）**：把**已經在暫存分區裡**的那份韌體轉送給第 n 台（不下載、不碰網路），所以**要先跑過一次 `otadl`**；重開機後暫存資訊就沒了，會被拒絕（fail-closed，不去猜 flash 裡殘留的是什麼）。**轉送成功那台會重新開機**：繼電器會斷一次，而 C3 板開機瞬間還會短暫通電 —— 所以目標的 `relay != 0` 時**預設拒絕**，要做得在指令尾端加 `force`。**版本參數省略等同 `0.0.0`**，那會讓版本回檢的第 (a) 條前提不成立，**即使 slave 真的更新成功也必定走到 90 秒 `no_return`**（指令會先印警告）。⚠ 它不檢查暫存區裡那份映像到底是不是 slave 的韌體：拿 `otadl` 下載一份 **master** 的韌體再轉送出去，MD5 會過、分區會切換，那台 slave 重開機後會跑 master 的程式，只能拆下來接 USB 重燒 |
 | 轉送期間的**群組指令行為**（Task 4，務必照這個寫清單） | 兩件事都是刻意的：**(1) 轉送在群組安全指令期間整個讓開** —— `updateOtaSession()` 看到 `groupCmdActive()` 就直接 return，並把 `otaPhaseStart`／`otaWaitStart`／`otaSessionStart` 一起往後移（不移的話一次 6 秒的群組 job 會吃掉 8 輪區塊重試額度，把一場好好的轉送判成 `espnow_fail`）。序列埠會印 `[OTA] 群組指令進行中，轉送讓開…` 與 `[OTA] 群組指令收工，轉送恢復…`。**(2) 轉送期間，目標那一台在群組指令裡一律被記成「未送達」** —— `onEspNowSent()` 分不出這則 MAC 層 ACK 是哪一封封包的，而轉送每輪都在送單播，所以 `groupNoteUnicastAck()` 對那台一律拒絕歸因（`otaUnicastRecently()`）。**那是誤紅，不是「指令沒送到」**；補送迴圈會因此持續重送給它，對「一次要全部關」是正向的。**不修這一條的話是假綠燈＋補送整台跳過**，而那台依建構必然 `relay == 0`（門開著、正是 `ALL:ON` 要去關的那一台） |
-| 轉送 OTA 的**對外範圍** | **⚠ Task 5 開 MQTT 入口之前，轉送 OTA 這條路徑不該對外。** `otadl` 走的 `stageOnly` 路徑在 `OTA_STAGED` 直接把 `otaPhase` 設成 `OTA_SUCCESS`，而那時一台 slave 都沒被接觸 —— 只要有人把 `ota.phase` 發到 MQTT，App 就會顯示「更新完成」。所以現階段兩條指令都**只有序列埠入口、沒有 MQTT 入口**，這是刻意的。（Task 4 之後 `OTA_STAGED` 不再永遠是終點：`otarelay` 會從那裡接著送 `OTA_BEGIN`。兩條路徑靠 `otaStageOnly` 這個旗標分流） |
+| 轉送 OTA 的**對外範圍** | Task 3 立下的硬性前提是：**⚠ Task 5 開 MQTT 入口之前，轉送 OTA 這條路徑不該對外。** 理由是當時 `otadl` 走的 `stageOnly` 路徑在 `OTA_STAGED` 直接把 `otaPhase` 設成 `OTA_SUCCESS`，而那時一台 slave 都沒被接觸 —— 只要有人把 `ota.phase` 發到 MQTT，App 就會顯示「更新完成」。**Task 5 開入口的同時把那個成因拆掉了**：`stageOnly` 改走 `otaFinishStagedOnly()`，終局階段是 `OTA_STAGED_OK`（對 App 是 `"staged_only"`），與版本回檢成功的 `"success"` 分開。序列埠的 `otadl` 在 MQTT 入口開了之後**照樣可以被下**，所以「MQTT 入口只送 `stageOnly=false`」本身不構成保護 —— 真正的保護是那兩條路徑有兩個不同的對外字串（`tools/check_doc_claims.py` 方向 16）。 |
 | `otastat` | 印出目前 OTA 工作階段的階段（`otaPhaseName()`）、目標、已下載／總位元組數與錯誤碼。工作階段結束回到 `idle` 之後**錯誤碼刻意不清空**，所以還看得到上一次的失敗原因 |
 
 **沒有 `lr on｜off` 這條序列埠指令。** Long Range 的原 Task 6 已整個移到 Phase 5，
@@ -85,13 +89,14 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 
 > **Phase 5 的技術債（本文件不宣稱已解決）**：Phase 4 Task 3 留了一個具名掛鉤點
 > `otaSessionBusy()`，供 Phase 5 在切換 LR 之前查詢「現在是不是有 OTA 工作階段」。
-> **但目前的呼叫端只有兩處，而且兩處都是「同時只能有一個工作階段」的重入檢查
->（`otaStart()` 與 Task 4 的 `otaRelayStaged()`），也就是說
-> 「OTA 進行中拒絕切 LR」這道守衛現在並不存在。** 它現階段之所以不出事，
+> **但目前的呼叫端有五處，沒有一處與 LR 有關**：`otaStart()`／`otaRelayStaged()`
+> 的重入檢查、Task 5 `update_slave` 的兩處（拒絕重入、以及「格式錯誤不得殺掉
+> 進行中的工作階段」），以及 `updateStatusLed()` 的「工作階段進行中就快閃」。
+> **也就是說「OTA 進行中拒絕切 LR」這道守衛現在並不存在。** 它現階段之所以不出事，
 > 只是因為 master 根本還沒有切 LR 的路徑；Phase 5 一加上去，缺口立刻成立。
 >
-> （`tools/check_doc_claims.py` 的方向 9 把這個呼叫點數量釘成 **3**＝定義 1 處
-> ＋ 上述兩處重入檢查。數字變動時它會停下來要人回頭改這一段敘述 ——
+> （`tools/check_doc_claims.py` 的方向 9 把這個呼叫點數量釘成 **6**＝定義 1 處
+> ＋ 上述五處呼叫。數字變動時它會停下來要人回頭改這一段敘述 ——
 > 它是**中斷器不是守衛**：它保證有人動了會被看見，不保證動的方向是對的。）
 
 `fakeslaves` 與 `droppeer` 兩條是**破壞性測試工具**，只在序列埠可達（需要實體 USB），

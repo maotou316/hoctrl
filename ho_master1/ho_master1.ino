@@ -354,17 +354,20 @@ const size_t STATUS_BASE_WITHOUT_GROUP_OTA_MAX_BYTES = 480;
 //    後來因為 review M1 又移除，見 appendGroupResult() 上方的說明。）
 const size_t STATUS_GROUP_MAX_BYTES = 120;
 
-// (c) "ota" 物件的上界。**這是預留額度，目前沒有任何程式碼會發出這個物件** ——
-// Task 5 才會實作。預留而不是等到那時再算，是因為「等到那時」正是 (a) 的
+// (c) "ota" 物件的上界。**Phase 4 Task 5 起這個物件真的會被發出**
+//（buildStatusDoc() 無條件加它，OTA_IDLE 時也在，只是內容是空的）。
+// Task 1 先把額度預留下來、而不是等到 Task 5 再算，是因為「等到那時」正是 (a) 的
 // 640 被吃光卻沒人發現的成因。逐項實算取自 plan 決定 4.2：
 //   `"ota":{` 7 ＋ `"target":"hoban-aabbccddeeff",` 30 ＋ `"phase":"<最長 12 字元>",` 23
 //   ＋ `"progress":100,` 15 ＋ `"size":2031616,` 15 ＋ `"error":"<最長 16 字元>"` 26
 //   ＋ `},` 2 = 118，取 128。
 //
-// **它擋不住什麼**：這只是「預算保留」，不是對 Task 5 實作的檢查。
-// 若 Task 5 的 phase／error 字串超過 12／16 字元，這個常數不會自己變大，
+// **它擋不住什麼**：這只是「預算上界」，不是對 otaPhaseName()／otaErrCode 的檢查。
+// 若哪天 phase／error 字串超過 12／16 字元，這個常數不會自己變大，
 // static_assert 也抓不到 —— plan 決定 4.2 因此要求那兩個字串必須走查表函式、
 // 不得是自由格式 String，並用 `fakeota` + `jsonsize` 實測。
+// Task 5 現行最長的 phase 字串是 11 字元（"downloading"／"unconfirmed"／
+// "staged_only"），最長的 error 是 13 字元（"slave_timeout"），兩者都在上界之內。
 const size_t STATUS_OTA_MAX_BYTES = 128;
 
 const size_t STATUS_BASE_MAX_BYTES =
@@ -437,6 +440,18 @@ enum OtaPhase : uint8_t {
   OTA_VERIFYING,       // 等 slave 重開機後回報新版本（Task 4）
   OTA_SUCCESS,
   OTA_FAILED,
+  // ── Task 5 新增的第三個終局階段：「只暫存到 master，零 slave 接觸」──
+  // 它存在的唯一理由是**不要把三件不同的事合併成一個 "success"**。
+  // Task 3 的 MJ2 逐字寫著：`otadl` 的成功只到「下載＋暫存＋MD5」，
+  // 一台 slave 都沒被碰過；Task 5 一開 MQTT 入口，那個 "success" 就會直接
+  // 送到 App 顯示成「更新完成」。序列埠的 otadl 在 MQTT 入口開了之後**照樣存在**，
+  // 所以「MQTT 入口只送 stageOnly=false」不構成保護 —— 只要有人在現場下一次
+  // otadl，App 就會讀到同一個 ota 物件。
+  //
+  // **刻意排在列舉最後**：本檔有三處對 otaPhase 做**有序**比較
+  //（`>= OTA_BEGIN_SENT && <= OTA_END_SENT` 兩處、`< OTA_BEGIN_SENT` 一處），
+  // 插在中間會靜默改變那三處的涵蓋範圍。新增階段時請沿用這個位置慣例。
+  OTA_STAGED_OK,
 };
 
 OtaPhase otaPhase = OTA_IDLE;
@@ -542,6 +557,26 @@ unsigned long otaWaitStart = 0;  // 送出查詢的時刻，OTA_ACK_TIMEOUT_MS �
 // OTA_END 有沒有成功進到本機的送出佇列。**只涵蓋「沒離開 master」那一種失敗**，
 // 詳見 OTA_END_SENT 開頭的長註釋。
 bool     otaEndQueued = false;
+// ── Task 5：本次工作階段有沒有收到 slave **親口說的**「整份校驗通過」──
+// 只在 OTA_END_SENT 收到 (HO_OTA_OK, base=totalChunks, mask=0xFFFF) 那一處設 true，
+// 每次工作階段起手（otaStart()／otaRelayStaged()）設回 false。
+//
+// 為什麼需要它：Task 4 把 OTA_VERIFYING 的入口從「必須收到 OTA_OK」放寬成
+// 「END 送出後 10 秒沒回應也進來」（那是為了消滅兩種單封丟包造成的假紅燈）。
+// 於是「verifying」這個階段名底下混著兩種完全不同的事實：
+//   (甲) slave 親口回報整份校驗通過，正在重開機   → 有正面證據
+//   (乙) 一封回應都沒收到，只是改用版本回檢兜底   → **零 slave 正面證據**
+// 對 App 而言把 (乙) 也叫「verifying」等於宣稱一件沒發生的事，所以 otaPhaseName()
+// 用這個旗標把 (乙) 報成 "unconfirmed"。
+//
+// **它擋不住什麼**：它只影響**回報的字串**，不影響狀態機。(乙) 一樣會走版本回檢、
+// 一樣可能走到 "success" —— 那是 Task 4 刻意的取捨（誤紅可接受、誤綠不可接受，
+// 但這一筆兩邊都動到），這個旗標只是不讓那件事被**說成**已經有 slave 證據。
+bool     otaSlaveVerified = false;
+// ── Task 5：階段轉換後要不要在這一輪 loop() 立刻補發一次 master 狀態 ──
+// 進度變化**不**設它（274 個區塊每塊發一次，最壞每次 publish 吃 10 秒級的
+// socket 阻塞，直接撞破 slave 的 30 秒失聯門檻）；只有階段轉換與指令被拒絕才設。
+bool     otaStatusDirty = false;
 // ── 以下四個由 ESP-NOW callback（**WiFi task**）寫、由 loop() 讀 ──
 // 沿用本檔 slaves[] 既有的無鎖慣例：callback 只搬旗標，一切判斷與後續送出都在 loop()。
 // otaAckPending **最後**才設為 true，讓 loop() 讀到旗標時另外三個值已經寫好。
@@ -1007,6 +1042,22 @@ unsigned long wifiDownSince = 0;   // 0 表示目前是連線狀態，尚未開�
 
 void updateStatusLed(unsigned long now) {
   if (blinkActive) return;   // 一次性閃爍進行中，暫時讓出 LED
+
+  // ── OTA 工作階段進行中：快閃 200ms（Phase 4 Task 5）──
+  // 語義與 ho_relay2 的更新中指示一致。優先權放在 BLE 配網之上 ——
+  // OTA 只會在已連網的狀態下發生，兩者實際上不會同時成立；放最前面是為了讓
+  // 「這台正在做一件會讓某台 slave 重開機的事」一眼可見。
+  //
+  // 用 otaSessionBusy() 而不是 `otaPhase != OTA_IDLE`：三個終局階段還會停留
+  // 30 秒才回 idle，那段時間已經沒有任何危險動作在進行，不該再快閃。
+  //
+  // **它擋不住什麼**：LED 只講 master 自己在忙，**完全不代表目標 slave 的狀態**。
+  // 現場要判斷那台有沒有被更新，判準是序列埠的「已更新到 x.y.z」或 App 的
+  // ota.phase == "success"，不是這顆燈。
+  if (otaSessionBusy()) {
+    setLeds((now / 200) % 2 == 0);
+    return;
+  }
 
   if (bleConfigMode) {
     setLeds((now / 1000) % 2 == 0);
@@ -2454,6 +2505,9 @@ void printHelp() {
   Serial.println("                 不寫 NVS、不動名冊內容，重開機或重新配對即恢復");
   Serial.println("  fakeslaves <n> 測試用：把名冊灌成 n 台假 slave，實測容量（不寫 NVS；");
   Serial.println("                 灌入後到重開機前，pair／unpair 會被擋下，避免假 MAC 寫進 NVS）");
+  Serial.println("  fakeota       測試用：把 ota 欄位灌成最壞值（不啟動工作階段、不寫 NVS），");
+  Serial.println("                 配合 fakeslaves 20 → fakeota → jsonsize 實測容量；");
+  Serial.println("                 量到的 phase 是 idle（4 字元），記錄時要加回 8 bytes");
   Serial.println("  jsonsize      測試用：印出目前狀態 JSON 的實際大小");
   Serial.println("  otadl <n> <url>  測試用：只下載並暫存韌體，不轉送（會抹除 master 的閒置 OTA 分區，");
   Serial.println("                 不動開機分區；固定略過『繼電器正開著就拒絕』的保護）");
@@ -2651,6 +2705,8 @@ void handleSerialCommand(const String& line) {
                   otaErrCode[0] ? otaErrCode : "無");
   } else if (verb == "fakeslaves") {
     fakeSlavesForCapacityTest(arg);
+  } else if (verb == "fakeota") {
+    fakeOtaForCapacityTest();
   } else if (verb == "jsonsize") {
     printStatusJsonSize();
   } else if (verb == "help") {
@@ -3126,22 +3182,46 @@ void otaBurst(const char* stage) {
 // ⚠ 這兩張表的字串長度是 STATUS_OTA_MAX_BYTES 這個容量常數的前提：
 //    phase 最長 12 字元、error 最長 16 字元。新增字串時不得超過，
 //    否則 master 狀態 JSON 的上界推算會失真（見 STATUS_OTA_MAX_BYTES 宣告處）。
+//
+// ── Task 5：這張表是 App 唯一會看到的 OTA 事實來源，所以**三件不同的事
+//    必須是三個不同的字串**（plan Task 5 的第一責任）──
+//   "staged_only" ＝ 檔案下載到 master 的閒置分區、MD5 已核對，**零 slave 接觸**
+//                    （序列埠 otadl 的終點。目標 slave 的韌體一個位元都沒變）
+//   "verifying"   ＝ 已整份轉送完，**slave 親口回報校驗通過**，等它重開機回線
+//   "unconfirmed" ＝ 已送出 OTA_END 但一封回應都沒收到，改用版本回檢兜底：
+//                    **沒有任何 slave 的正面證據**（見 otaSlaveVerified）
+//   "success"     ＝ 版本回檢的三條硬性前提全部成立（見 case OTA_VERIFYING）
+// 把它們合併成一個 "success" 就是 Task 3 的 MJ2 逐字警告過的假綠燈。
 const char* otaPhaseName() {
   switch (otaPhase) {
     case OTA_IDLE:           return "idle";
     case OTA_RESOLVING:      return "resolving";
     case OTA_ERASING:        return "erasing";
-    case OTA_DOWNLOADING:    return "downloading";   // 11 字元，目前最長
+    case OTA_DOWNLOADING:    return "downloading";   // 11 字元
     case OTA_STAGED:         return "staged";
     case OTA_BEGIN_SENT:     return "begin_sent";
     case OTA_RELAYING:       return "relaying";
     case OTA_WAIT_BLOCK_ACK: return "relaying";      // 對 App 而言與 relaying 同義
     case OTA_END_SENT:       return "finishing";
-    case OTA_VERIFYING:      return "verifying";
+    case OTA_VERIFYING:      return otaSlaveVerified ? "verifying" : "unconfirmed";
     case OTA_SUCCESS:        return "success";
     case OTA_FAILED:         return "failed";
+    case OTA_STAGED_OK:      return "staged_only";   // 11 字元
   }
   return "idle";
+}
+
+// 「這一輪工作階段已經結束」。三個終局階段各自代表一件**不同**的事，
+// 但對「還在不在忙」這個問題而言是同一類，所以收斂成一個具名函式 ——
+// 散在各處的 `phase != A && phase != B` 只要漏掉一個新終局階段，
+// master 就會永遠認為自己在忙、拒絕之後所有的 update_slave。
+//
+// ⚠ 新增終局階段時要一起做三件事：加進這裡、加進 otaPhaseName()、
+//   加進 updateOtaSession() 那個「停留 30 秒再回 idle」的 case 群組。
+//   tools/check_doc_claims.py 的方向 16 會從本函式的函式體解析出階段名單，
+//   逐一回頭比對後兩者 —— 漏掉任何一個都會當場變紅。
+bool otaPhaseIsFinal() {
+  return otaPhase == OTA_SUCCESS || otaPhase == OTA_FAILED || otaPhase == OTA_STAGED_OK;
 }
 
 // 錯誤碼一律用這組固定字串（**最長 16 字元**）：
@@ -3161,16 +3241,18 @@ const char* otaErrorName() { return otaErrCode; }
 // Phase 5 要加「OTA 進行中拒絕切換 Long Range」的互斥，需要一個可以問
 // 「現在是不是有工作階段」的具名函式。這裡先把它建好，讓 Phase 5 有地方掛。
 //
-// ⚠ 誠實聲明：**目前的呼叫端只有兩處，而且兩處都是「同時只能有一個工作階段」
-//   的重入檢查**：otaStart() 與 Task 4 的 otaRelayStaged()
-//   （可用 grep -n "otaSessionBusy" 驗證：定義 1 處 ＋ 呼叫 2 處 ＝ 3 行；
+// ⚠ 誠實聲明：**目前的呼叫端有五處，沒有一處與 Long Range 有關**：
+//   otaStart()／otaRelayStaged() 的重入檢查、Task 5 的 update_slave **兩處**
+//   （拒絕重入、以及「格式錯誤不得殺掉進行中的工作階段」），
+//   以及 updateStatusLed() 的「工作階段進行中就快閃」
+//   （可用 grep -n "otaSessionBusy" 驗證：定義 1 處 ＋ 呼叫 5 處 ＝ 6 行；
 //    tools/check_doc_claims.py 的方向 9 把這個數字釘住）。也就是說：
 //   - 現在 master 端**完全沒有**「OTA 進行中拒絕切 LR」的保護
 //   - 現在 master 端也**沒有**任何切換 LR 的路徑（longRangeEnabled 只被讀、沒被寫），
 //     所以現階段不會出事；但 Phase 5 一加上切換路徑，缺口立刻成立
 // TODO(Phase 5)：LR 切換的進入點必須先問 otaSessionBusy()，為真就拒絕並回報原因。
 bool otaSessionBusy() {
-  return otaPhase != OTA_IDLE && otaPhase != OTA_SUCCESS && otaPhase != OTA_FAILED;
+  return otaPhase != OTA_IDLE && !otaPhaseIsFinal();
 }
 
 // 取得閒置的 OTA 分區當暫存區。
@@ -3336,6 +3418,9 @@ uint8_t otaProgressPercent() {
     return (uint8_t)((uint64_t)otaDownloaded * 100 / otaTotalSize);
   }
   if (otaPhase == OTA_SUCCESS) return 100;
+  // OTA_STAGED_OK：100% 指的是**暫存**做完了，不是 slave 更新完了。
+  // 「100% 到底是什麼的 100%」由 phase 欄位回答（"staged_only"），不由這個數字回答。
+  if (otaPhase == OTA_STAGED_OK) return 100;
   if (otaTotalChunks == 0) return 0;
   return (uint8_t)((uint32_t)otaBlockBase * 100 / otaTotalChunks);
 }
@@ -3351,10 +3436,30 @@ void otaFail(const char* errCode) {
   otaReleaseHttp();
   otaPhase = OTA_FAILED;
   otaPhaseStart = millis();
+  otaStatusDirty = true;   // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
   Serial.printf("[OTA] 失敗：%s（目標 %s）\n", otaErrCode, otaTargetId);
   // 實際的 MQTT 發布由 loop() 的狀態排程處理，這裡不直接 publish
   //（本函式在 Task 4 之後也可能由 onEspNowRecv() 的 WiFi task 路徑間接觸發，
   //  而「ESP-NOW callback 不得發 MQTT」是本專案的硬性約束）
+}
+
+// ── Task 5：只暫存到 master 的收尾（序列埠 otadl 的終點）──
+// **與 otaFinish() 分成兩支函式，而不是共用一支帶參數的**：這兩條路徑對 App
+// 說的是兩件完全不同的事，而 Task 3 的 MJ2 逐字警告過「合併之後 App 會顯示
+// 更新完成」。分成兩支之後，「把 otadl 的出口改成宣告成功」不再是改一個參數，
+// 而是要把整個函式呼叫換掉 —— tools/check_doc_claims.py 的方向 16 正是釘這個。
+//
+// **它擋不住什麼**：它不檢查暫存區裡那份映像是什麼，也不保證之後的 otarelay
+// 一定會被下。它只保證「這一條路徑不會對外宣稱任何 slave 被更新過」。
+void otaFinishStagedOnly() {
+  otaReleaseHttp();
+  otaPhase = OTA_STAGED_OK;
+  otaPhaseStart = millis();
+  otaErrCode[0] = '\0';
+  otaStatusDirty = true;   // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
+  Serial.printf("[OTA] 工作階段 %u 結束（目標 %s，階段轉為 staged_only："
+                "只到 master 暫存區，未接觸任何 slave）\n",
+                otaSessionId, otaTargetId);
 }
 
 void otaFinish() {
@@ -3362,6 +3467,7 @@ void otaFinish() {
   otaPhase = OTA_SUCCESS;
   otaPhaseStart = millis();
   otaErrCode[0] = '\0';
+  otaStatusDirty = true;   // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
   // ⚠ C2（B 族第 10 次，且是**第一次往假綠燈方向**）：這裡原本印
   //   「[OTA] 完成：%s 已更新到 x.y.z」。但 otaFinish() 是「工作階段結束」的
   //   共用收尾，而它在 Task 3 唯一的呼叫點（OTA_STAGED）只代表「下載＋暫存＋MD5
@@ -3369,9 +3475,10 @@ void otaFinish() {
   //   而 plan 的回歸清單第 12 項正是拿那一行當「slave 真的更新了」的判準。
   //   「已更新到 x.y.z」這句話**只能由版本回檢路徑（OTA_VERIFYING 比對
   //   slaves[].fw*）印出**，別處一律不得出現。
-  //   **Task 4 之後 otaFinish() 有兩個呼叫點**：OTA_STAGED 的 stageOnly 分支
-  //  （otadl，零 slave 接觸）與 OTA_VERIFYING 的版本回檢成功路徑。
-  //   前者仍然**不得**宣稱 slave 被更新過 —— 所以這句話留在原地，
+  //   **Task 5 之後 otaFinish() 只剩一個呼叫點**：OTA_VERIFYING 的版本回檢成功路徑。
+  //   otadl 那條零 slave 接觸的路徑改走 otaFinishStagedOnly()，階段是 OTA_STAGED_OK
+  //  （對 App 是 "staged_only"），不再與這裡共用 "success"。這句警語仍然留在原地 ——
+  //   它擋的是「日後有人又把某條沒碰過 slave 的路徑接回這裡」，
   //   由 tools/check_doc_claims.py 的方向 11（otaFinish() 本體不得出現「已更新到」）
   //   與方向 14（「已更新到」全檔非註釋行剛好一次、且只在 OTA_VERIFYING 區塊、
   //   且排在三條前提**之後**）兩道一起釘住。
@@ -3527,6 +3634,8 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
   otaStageOnly = stageOnly;
   otaBeginAttempt = 0;
   otaEndQueued = false;
+  otaSlaveVerified = false;   // 新工作階段：還沒有任何 slave 的正面證據
+  otaStatusDirty = true;      // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
   otaAckPending = false;
   otaTxFailCount = 0;
   otaTxFailShown = 0;
@@ -3616,6 +3725,8 @@ bool otaRelayStaged(int n, const char* version, bool force) {
   otaStageOnly = false;
   otaBeginAttempt = 0;
   otaEndQueued = false;
+  otaSlaveVerified = false;   // 新工作階段：還沒有任何 slave 的正面證據
+  otaStatusDirty = true;      // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
   otaAckPending = false;
   otaTxFailCount = 0;
   otaTxFailShown = 0;
@@ -3668,7 +3779,7 @@ void updateOtaSession(unsigned long now) {
   //   代價：一次工作階段的絕對上界由 300 秒變成 300 + 90 ＝ **390 秒**。
   //   **它擋不住什麼**：VERIFYING 仍然可能空等滿 90 秒（那是誠實的 no_return）；
   //   而 300 秒對下載＋轉送那一段的兜底一個字都沒放寬。
-  if (otaPhase != OTA_SUCCESS && otaPhase != OTA_FAILED && otaPhase != OTA_VERIFYING &&
+  if (!otaPhaseIsFinal() && otaPhase != OTA_VERIFYING &&
       now - otaSessionStart >= OTA_SESSION_MAX_MS) {
     otaFail(otaPhase < OTA_BEGIN_SENT ? "http_fail" : "slave_timeout");
     return;
@@ -4076,6 +4187,7 @@ void updateOtaSession(unsigned long now) {
             Serial.printf("[OTA] 下載完成 %u bytes，MD5 %s%s\n",
                           (unsigned)otaDownloaded, hex,
                           otaHasExpectMd5 ? "（與指令指定的相符）" : "（指令未指定，僅供 ESP-NOW 段校驗）");
+            otaStatusDirty = true;   // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
             otaPhase = OTA_STAGED;
             otaPhaseStart = millis();
             return;
@@ -4105,14 +4217,17 @@ void updateOtaSession(unsigned long now) {
     case OTA_STAGED: {
       // stageOnly（序列埠 otadl）：原地收尾並印一行，讓「下載 + 暫存 + MD5」
       // 這一整段可以單獨驗證。
-      // ⚠ 這條路徑的 "success" **不代表任何 slave 被更新過**，
-      //   只代表 master 把檔案抓下來、寫進暫存分區、MD5 算完了。
+      // ⚠ 這條路徑**不代表任何 slave 被更新過**，只代表 master 把檔案抓下來、
+      //   寫進暫存分區、MD5 算完了。**Task 5 起它的終局階段是 OTA_STAGED_OK**
+      //   （App 讀到 "staged_only"），不再與版本回檢成功共用 "success" ——
+      //   MQTT 入口一開，這個 ota 物件就是 App 唯一的事實來源，而序列埠的 otadl
+      //   在那之後照樣可以被下（Task 3 的 MJ2）。
       if (otaStageOnly) {
         Serial.printf("[OTA] 已暫存完成：%u bytes 已寫入 master 的閒置分區、MD5 已核對；"
                       "「未轉送、未接觸任何 slave」，目標 %s 的韌體版本沒有任何改變"
                       "（要轉送請下 otarelay）\n",
                       (unsigned)otaDownloaded, otaTargetId);
-        otaFinish();
+        otaFinishStagedOnly();
         return;
       }
 
@@ -4341,6 +4456,13 @@ void updateOtaSession(unsigned long now) {
         if (otaAckStatus == HO_OTA_OK &&
             otaAckBase == otaTotalChunks && otaAckBits == 0xFFFF) {
           Serial.println("[OTA] slave 校驗通過，正在重新啟動，等它回線確認版本");
+          // ⚠ 全檔**唯一**把 otaSlaveVerified 設成 true 的地方，而且必須在
+          //   「(HO_OTA_OK, base==totalChunks, mask==0xFFFF) 三項齊備」的分支裡。
+          //   它是 "verifying"（有 slave 正面證據）與 "unconfirmed"（沒有）
+          //   這兩個回報字串的唯一分野；搬到上面那個 if 之外就等於對 App 宣稱
+          //   一件沒發生的事。tools/check_doc_claims.py 的方向 17 釘住位置與次數。
+          otaSlaveVerified = true;
+          otaStatusDirty = true;   // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
           otaPhase = OTA_VERIFYING;
           // **這裡用 millis() 而不是 now**（Task 3 的其他階段也一律如此）。
           // now 是 loop() 開頭取的時間戳，而 updateOtaSession() 排在 loop() 尾端 ——
@@ -4388,6 +4510,9 @@ void updateOtaSession(unsigned long now) {
       if (now - otaPhaseStart >= 10000) {
         Serial.println("[OTA] 10 秒沒收到校驗結果（OTA_END 或它的回覆掉了一封），"
                        "改用版本回檢判定：等它重開機回報版本");
+        // otaSlaveVerified 刻意**維持 false**：這條路徑一封 slave 的回應都沒收到，
+        // App 應該看到 "unconfirmed" 而不是 "verifying"（見 otaSlaveVerified 宣告處）。
+        otaStatusDirty = true;   // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
         otaPhase = OTA_VERIFYING;
         otaPhaseStart = millis();
       }
@@ -4448,7 +4573,11 @@ void updateOtaSession(unsigned long now) {
 
     case OTA_SUCCESS:
     case OTA_FAILED:
+    case OTA_STAGED_OK:
       // 停留 30 秒讓 App 讀得到結果，之後回到 idle。
+      // ⚠ 這個 case 群組必須涵蓋 otaPhaseIsFinal() 列出的**每一個**階段：漏掉一個，
+      //   那個階段就永遠不會回到 OTA_IDLE，App 的 ota.phase 會一直卡在終局值上
+      //   （方向 16 會從 otaPhaseIsFinal() 解析名單回頭比對這裡）。
       // otaErrCode 刻意不清空：回到 idle 之後 otastat 仍看得到上一次的失敗原因。
       if (now - otaPhaseStart >= 30000) {
         otaPhase = OTA_IDLE;
@@ -5055,6 +5184,29 @@ void buildStatusDoc(JsonDocument& doc) {
   dev["free_heap"] = (uint32_t)ESP.getFreeHeap();
 
   appendGroupResult(doc);
+
+  // ── OTA 進度（Phase 4 Task 5）──
+  // 刻意做成**單一頂層物件**而不是每筆 slave 條目的欄位：一次只跑一台
+  //（見 otaSessionBusy() 的併發保護），本來就不需要 per-slave 欄位；
+  // 而加進 slaves[] 會讓 SLAVE_ENTRY_MAX_BYTES 與 static_assert 失真 ——
+  // 常數沒跟著新欄位變大時，static_assert 會拿舊常數繼續通過，
+  // 保護看起來還在、實際已經失效（plan 決定 4.1）。
+  //
+  // ⚠ 這五個欄位的最壞位元組數就是 STATUS_OTA_MAX_BYTES（128）的實算內容，
+  //   加欄位必須回頭重算那個常數。
+  //
+  // **phase 是 App 唯一該拿來判斷「發生了什麼」的欄位**，progress 只是進度條：
+  //   staged_only ＝ 只下載到 master 暫存區，**零 slave 接觸**（progress 100 是暫存的 100%）
+  //   unconfirmed ＝ 轉送完但沒有任何 slave 的正面證據，正在用版本回檢兜底
+  //   success     ＝ 版本回檢三條硬性前提全部成立
+  //   （完整語義見 otaPhaseName() 上方那張表）
+  JsonObject ota = doc["ota"].to<JsonObject>();
+  ota["target"]   = otaTargetId;
+  ota["phase"]    = otaPhaseName();
+  ota["progress"] = otaProgressPercent();
+  ota["size"]     = otaTotalSize;
+  ota["error"]    = otaErrCode;
+
   appendSlavesArray(doc);
 }
 
@@ -5068,6 +5220,21 @@ void publishStatus() {
   JsonDocument doc;
   buildStatusDoc(doc);
   publishJsonDoc(topic.c_str(), doc, true);
+}
+
+// ── master 狀態的發布週期（Phase 4 Task 5）──
+// OTA 期間由 10 秒縮短為 5 秒，工作階段結束自動回到 10 秒。
+//
+// 刻意「不」在每個區塊完成時額外發布：274 個區塊若每塊發一次，
+// 每次 publish() 最壞是 10 秒級的 socket 阻塞（見 publishJsonDoc() 上方對
+// setSocketTimeout() 的完整更正），直接撞破 slave 的 30 秒失聯門檻 ——
+// 那等於為了讓進度條漂亮而把正關著的籠門放開。進度靠 5 秒週期呈現就夠，
+// **階段轉換**則由 otaStatusDirty 立刻補一次（那是 App 真正需要即時知道的事）。
+//
+// 用 otaPhase != OTA_IDLE 而不是 otaSessionBusy()：三個終局階段（success／failed／
+// staged_only）也要維持 5 秒，讓 App 有機會在 30 秒的停留視窗裡讀到結果。
+unsigned long masterStatusIntervalMs() {
+  return (otaPhase != OTA_IDLE) ? 5000UL : 10000UL;
 }
 
 // ── 代發 slave 狀態（Phase 2b Task 3）──
@@ -5132,7 +5299,29 @@ void publishSlaveStatus(int idx) {
 
   JsonDocument doc;
   doc["device_id"] = id;
-  doc["status"] = slaves[idx].online ? "online" : "offline";
+  // ── 轉送期間對 App 顯示 "updating"（Phase 4 Task 5）──
+  // 語義沿用 ho_relay2 對一般設備的既有用法，讓 slave 在 App 眼裡仍是普通設備。
+  //
+  // ⚠ **這裡刻意用 MAC 比對，不用 plan 範本寫的 `idx == otaTargetIdx`**：
+  //   otaTargetIdx 的宣告處逐字寫著「會過期」（unpairSlave() 會把 slaves[] 往前搬，
+  //   WiFi task 收到 HO_PKT_UNPAIR 也會動它）。用過期的索引會把**另一台**的狀態
+  //   蓋成 "updating" —— 那台若其實已經離線，App 看到的是「更新中」而不是「離線」，
+  //   等於用一個進行中的假象蓋掉一個真實的壞消息。全檔的慣例是
+  //   「真相一律以 otaTargetMac 為準」，這裡照做。
+  //   otaTargetMac 在目標解析失敗時是全 0（見 otaSetTarget()），對不上任何一台，
+  //   所以這個判斷是 fail-closed 的。
+  //
+  // **它擋不住什麼**：範圍只涵蓋 OTA_BEGIN_SENT ~ OTA_VERIFYING。下載半段
+  //（resolving／downloading／staged）目標仍顯示 online／offline —— 那是誠實的，
+  //   因為那段時間 master 一個位元都還沒送給它。
+  bool isOtaTarget = (memcmp(slaves[idx].mac, otaTargetMac, 6) == 0) &&
+                     (otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_VERIFYING);
+  if (isOtaTarget) {
+    doc["status"] = "updating";
+    doc["ota_progress"] = otaProgressPercent();
+  } else {
+    doc["status"] = slaves[idx].online ? "online" : "offline";
+  }
   doc["version"] = ver;
   doc["model"] = "hoSlave1";
   doc["via"] = getDeviceId();
@@ -5324,6 +5513,39 @@ void fakeSlavesForCapacityTest(int n) {
                  "名冊混有假 MAC，一旦觸發存檔就會寫進 NVS 汙染真實名冊（已由 saveSlaves() 擋下）");
 }
 
+// ── 容量實測測試工具（Phase 4 Task 5）──
+// 把 ota 物件灌成「最壞情況」的內容，配合 fakeslaves 20 + jsonsize 實測整份
+// master 狀態 JSON 的真實大小。**這一步不可省略** —— 沒有它就無法在只有 1~2 台
+// 實體 slave 的情況下證明「20 台 slave ＋ OTA 進度」放得下。
+//
+// ⚠ 刻意「不」啟動任何實際工作階段：只填欄位值，otaPhase 一個字都不動。
+//   （plan 的範本原本要把 otaPhase 設成 OTA_DOWNLOADING 再立刻改回 OTA_IDLE，
+//    那會在兩行之間開一個窗口 —— 若中間發生任何事，updateOtaSession() 會因為
+//    otaHttp == nullptr 走進重試路徑。既然量的是 buildStatusDoc() 組出來的字串、
+//    不是狀態機的行為，那就連碰都不要碰它。）
+//
+// ⚠⚠ **量到的 phase 是 "idle"（4 字元），不是最壞的 12 字元** ——
+//    兩者差 8 bytes（`"idle"` vs `"<12 字元>"`）。記錄 jsonsize 的結果時
+//    **必須把這 8 bytes 加回去**再與 statusBuf 比較。
+//    （現行最長的 phase 字串其實是 11 字元，所以「加 8」還多留 1 byte 的保守量。）
+//
+// **它擋不住什麼**：它量的是「這一刻的 slaves[] ＋ 最壞的 ota 物件」。
+// 基礎欄位（SSID、自訂伺服器名稱、IP）仍是這台測試板的實際值，通常遠短於
+// STATUS_BASE_WITHOUT_GROUP_OTA_MAX_BYTES 的預算 —— 所以實測餘裕是**樂觀值**，
+// 真正必須成立的是 static_assert 用常數算出來的悲觀上界。
+// 它也**不寫 NVS**（只動 RAM 裡的 ota 欄位），與 fakeSlavesActive 的約束不衝突。
+void fakeOtaForCapacityTest() {
+  snprintf(otaTargetId, sizeof(otaTargetId), "hoban-aabbccddeeff");
+  snprintf(otaErrCode, sizeof(otaErrCode), "slave_timeout");   // 目前最長的錯誤碼（13 字元）
+  otaTotalSize = 2031616;
+  otaTotalChunks = HO_OTA_MAX_CHUNKS;
+  otaBlockBase = otaTotalChunks;      // 讓 otaProgressPercent() 回 100（3 位數，最壞）
+  Serial.println("[測試] ota 欄位已灌成最壞值（未啟動工作階段），請接著執行 jsonsize");
+  Serial.println("       正確的驗證順序：fakeslaves 20 → fakeota → jsonsize");
+  Serial.println("⚠ [測試] jsonsize 量到的 phase 是 \"idle\"（4 字元）而非最壞的 12 字元，"
+                 "記錄結果時要把 8 bytes 加回去再與 statusBuf 比較");
+}
+
 // 印出目前狀態 JSON 的實際大小，與各層預算比對
 void printStatusJsonSize() {
   JsonDocument doc;
@@ -5492,6 +5714,64 @@ void handleMasterCommand(const String& message) {
       unpairAllPending = true;
       Serial.printf("[配對] 開始清空名冊，共 %d 台（每輪 loop 拆一台）\n", slaveCount);
     }
+  } else if (message.startsWith("update_slave:")) {
+    // ── 轉送 OTA 的 MQTT 入口（Phase 4 Task 5）──
+    // 規格：update_slave:{"id":"hoban-...","version":"1.0.1","url":"https://..."}
+    // 另有兩個選用欄位：
+    //   "md5"  ：32 字元十六進位。有帶的話 master 會在轉送「之前」核對下載到的映像，
+    //            這是目前唯一能涵蓋 HTTPS 那一段的完整性保護（憑證未驗證，見已知限制）。
+    //   "force"：true 時略過「目標繼電器正開著」的保護。OTA 一定會讓 slave 重開機，
+    //            繼電器必然歸零 —— 對一台正把籠門保持關閉的設備而言等於遠端開門。
+    //
+    // ⚠ **這條指令一律傳 stageOnly=false**（最後一個參數）。傳 true 的話下載完會
+    //   停在 OTA_STAGED_OK，App 會看到 "staged_only" 而目標一個位元都沒變 ——
+    //   那不是假綠燈（字串是誠實的），但 App 送了 update_slave 卻沒有任何 slave
+    //   被更新，語義上是這條指令沒做它答應的事。
+    String body = message.substring(13);
+    JsonDocument cmd;
+    DeserializationError err = deserializeJson(cmd, body);
+    if (err) {
+      Serial.printf("[OTA] update_slave 的 JSON 解析失敗: %s\n", err.c_str());
+      snprintf(otaErrCode, sizeof(otaErrCode), "bad_json");
+      // ⚠ 這裡刻意**不**呼叫 otaFail()：它會 otaReleaseHttp() 並把 otaPhase 蓋成
+      //   OTA_FAILED，若此刻正好有工作階段在跑，一則格式錯誤的指令就能把它殺掉。
+      //   進行中就只留錯誤碼（下面的 busy 分支同理），閒置中才翻成 OTA_FAILED。
+      if (!otaSessionBusy()) {
+        otaPhase = OTA_FAILED;
+        otaPhaseStart = millis();
+      }
+      otaStatusDirty = true;
+      return;
+    }
+    const char* id  = cmd["id"]  | "";
+    const char* url = cmd["url"] | "";
+    const char* ver = cmd["version"] | "0.0.0";
+    const char* md5 = cmd["md5"] | "";
+    bool force = cmd["force"] | false;
+
+    if (otaSessionBusy()) {
+      // **刻意不覆蓋 otaTargetId** —— 那個欄位要留著讓 App 看到「正在忙誰」。
+      // 也不動 otaPhase：進行中的工作階段的階段值是它自己的真相。
+      //
+      // ⚠ 已知的粗糙處，照實寫在這裡：otaErrCode 是**單一全域欄位**，所以這一下
+      //   會讓 App 讀到「phase=relaying 而 error=busy」的組合，直到那個工作階段
+      //   結束時 otaFinish() 把它清掉為止。方向是誤紅（App 可能把進行中的工作階段
+      //   顯示成有錯誤），不是誤綠。要修得徹底得把「指令被拒絕」與「工作階段錯誤」
+      //   拆成兩個欄位，那會動到 STATUS_OTA_MAX_BYTES 的實算，留給後續階段。
+      Serial.printf("[OTA] 已有工作階段進行中（目標 %s，階段 %s），忽略本次指令\n",
+                    otaTargetId, otaPhaseName());
+      snprintf(otaErrCode, sizeof(otaErrCode), "busy");
+    } else if (strlen(id) == 0 || strlen(url) == 0) {
+      Serial.println("[OTA] update_slave 缺少 id 或 url");
+      snprintf(otaErrCode, sizeof(otaErrCode), "bad_json");
+      otaPhase = OTA_FAILED;
+      otaPhaseStart = millis();
+    } else {
+      // 其餘所有拒絕理由（不在名冊／離線／heap 不足／繼電器正開著／網址不合法）
+      // 都由 otaStart() 自己用 otaFail() 填錯誤碼，這裡不重複判斷。
+      otaStart(id, url, ver, md5, force, false);
+    }
+    otaStatusDirty = true;
   } else if (message.startsWith("LR:")) {
     // Task 6 實作，先給一個明確的回應而不是掉進「未知指令」
     Serial.println("[LR] 指令尚未實作（Task 6）");
@@ -5788,7 +6068,13 @@ void loop() {
       // 讓它先走完，代價只是狀態發布晚幾輪（健康網路下是毫秒級）。
       controlSubscribeScheduler();
 
-      if (now - lastStatusPub > 10000) {   // 每 10 秒發一次狀態，master 還要發心跳與輪詢 slave，比 ho_relay2 的 3 秒寬鬆
+      // 平時每 10 秒發一次狀態（master 還要發心跳與輪詢 slave，比 ho_relay2 的
+      // 3 秒寬鬆），OTA 期間縮短為 5 秒；階段轉換由 otaStatusDirty 立刻補一次。
+      // ⚠ otaStatusDirty 只在**這裡**清除。它不是「有事要發」的通用旗標，
+      //   而是「OTA 階段剛剛轉換過」的一次性補發 —— 其他地方要發狀態請直接
+      //   呼叫 publishStatus()（那條路徑不受本節流管轄）。
+      if (otaStatusDirty || now - lastStatusPub > masterStatusIntervalMs()) {
+        otaStatusDirty = false;
         lastStatusPub = now;
         publishStatus();
       }
