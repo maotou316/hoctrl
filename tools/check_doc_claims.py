@@ -17,7 +17,7 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
     python tools/check_doc_claims.py
 全部通過印 ALL CHECKS PASSED，任何一項失敗以 exit code 1 結束。
 
-**十三個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
+**十四個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
 這個數字自己就是一個判準 —— 初版寫「八個」而實際是九個，
 **一支專門檢查「文件寫死的 N 項」的腳本自己數錯**，所以改動方向時請一起數：
   1. HIT     —— 文件引用的判準字串必須逐字出現在原始碼裡
@@ -37,6 +37,10 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
  12. 設定唯一 —— 關鍵 timeout／重定向設定必須**剛好出現一次**且逐字如此
                 （HIT 擋不住「再加一行覆蓋它」，也擋不住「整行被刪掉」）
  13. 順序    —— `otaHttp->begin()` 必須排在 `otaTls->connect()` 之前（C5）
+ 14. 轉送燈號 —— Task 4 的兩個假燈號出口：`已更新到` 在非註釋行**剛好一次**且
+                只長在 `OTA_VERIFYING` 區塊裡（三條硬性前提逐字齊全、且該區塊
+                不得出現會過期的 `otaTargetIdx`）；`OTA_END_SENT` 區塊必須逐字
+                含「收到 READY 就繼續等」與「連 blockBase／mask 一起檢查」兩道
 
 **這支腳本擋不住什麼**（必須連著讀）：
   - 它只做**字串／算式比對**。字串對不代表語義對
@@ -128,6 +132,22 @@ HIT_IN_SOURCE = [
     ('OTA 暫存完成訊息',     '「未轉送、未接觸任何 slave」，目標 %s 的韌體版本沒有任何改變'),
     ('OTA 工作階段結束訊息',  '[OTA] 工作階段 %u 結束（目標 %s，階段轉為 success）'),
     ('OTA 自己跟隨重定向',    'otaHttp->setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);'),
+    # ── Phase 4 Task 4（master 端轉送引擎）──
+    # 這幾條是 Task 6 的回歸清單會拿來當判準的序列埠字串，先在這裡釘住，
+    # 免得日後改措辭時清單靜靜過期（B 族的標準形狀）。
+    ('otarelay 指令',        '} else if (verb == "otarelay") {'),
+    ('轉送：送出 BEGIN',      '[OTA] 已送出 OTA_BEGIN 給 %s（第 %d／%d 次），等待回應'),
+    ('轉送：slave 就緒',      '[OTA] slave 已就緒，開始轉送'),
+    ('轉送：進度',            '[OTA] 轉送進度 %u%%（%u/%u 包）'),
+    ('轉送：送出 END',        '[OTA] 全部區塊已送達，已送出 OTA_END，等待校驗結果'),
+    ('轉送：校驗通過',        '[OTA] slave 校驗通過，正在重新啟動，等它回線確認版本'),
+    ('轉送：版本回檢成功',    '[OTA] 完成：%s 已更新到 %u.%u.%u'),
+    ('轉送：回線逾時',        '[OTA] 等待 %s 回線 90 秒逾時，它可能沒有開起來'),
+    # 這一條同時是「END_SENT 逾時不得改回 otaFail()」的中斷器：改回去的話
+    # 這句話會被刪掉，HIT 當場變紅（理由見該處的長註釋，兩種單封丟包的假紅燈）。
+    ('轉送：校驗結果逾時改判版本', '[OTA] 10 秒沒收到校驗結果（OTA_END 或它的回覆掉了一封），改用版本回檢判定：等它重開機回報版本'),
+    ('轉送：安靜版送出',      'espNowSendToEx(otaTargetMac, HO_PKT_OTA_DATA, pkt, sizeof(dh) + dataLen, false);'),
+    ('轉送：收包 log 排除 ACK', 'if (header.type != HO_PKT_OTA_ACK) {'),
 ]
 
 # ── 方向 3：協定測試的項數必須與文件的判準一致 ──
@@ -465,9 +485,9 @@ def main():
     #   4. **它會誘使人為了讓數字好看而不重構**。發現這種壓力時，
     #      正確的反應是改期望值＋改文件，不是放棄重構。
     n_busy = len([1 for _, line in code_lines if 'otaSessionBusy(' in line])
-    if n_busy != 2:
-        failures.append('[LR 掛鉤] otaSessionBusy() 的非註釋出現次數是 %d（期望 2：'
-                        '定義 1 處 + otaStart() 重入檢查 1 處）。'
+    if n_busy != 3:
+        failures.append('[LR 掛鉤] otaSessionBusy() 的非註釋出現次數是 %d（期望 3：'
+                        '定義 1 處 + otaStart() 重入檢查 1 處 + otaRelayStaged() 重入檢查 1 處）。'
                         '若是 Phase 5 補上了 LR 互斥守衛，請同時更新 '
                         'ho_master1/readme.md 那段「守衛現在並不存在」的敘述'
                         '與本檢查的期望值' % n_busy)
@@ -569,6 +589,92 @@ def main():
                 elif i > i_conn:
                     failures.append('[順序] %s 排在 otaTls->connect() **之後**：%s'
                                     % (label, why))
+
+    # ── 方向 14：轉送半段的兩個假燈號出口（Task 4）──
+    #
+    # 方向 11 只釘住 otaFinish() 不得宣稱「已更新到」，那是**下載半段**的假綠燈。
+    # 轉送半段還有兩個獨立的出口，兩個都不是 HIT 擋得住的形狀：
+    #
+    #   (甲) `OTA_VERIFYING` 的版本回檢。三條硬性前提缺任何一條都會製造假綠燈：
+    #        (a) otaHasVersion —— 目標版本是 0.0.0 時，會對上「從沒回報過狀態」
+    #            的 slave 的預設 fw*=0，**第一輪就成立**而 slave 還在重開機
+    #        (b) findSlave(otaTargetMac) 重查 —— otaTargetIdx 的宣告處逐字寫著
+    #            「會過期」，用它等於拿**別台**的版本宣告成功（開錯門的 MAC 版）
+    #        (c) lastSeen 必須晚於進入 VERIFYING 的時刻 —— 否則用的是工作階段
+    #            開始前的舊值
+    #   (乙) `OTA_END_SENT` 收到 ACK 之後的分流。缺第一道是**假紅燈**
+    #        （晚到的查詢回覆帶 READY，而 slave 其實已校驗通過正在重開機）；
+    #        缺第二道是**假綠燈**（只看 status 的話，查詢回覆與「校驗通過」
+    #        在 slave 端曾經逐位元組相同 —— 已在產生端消滅，這裡是第二層）。
+    #
+    # **它擋不住什麼**（逐項）：
+    #   - 只認下面這幾個逐字錨點。把同一個判斷改寫成別的等價寫法
+    #     （例如把三條前提抽進一個 helper 函式）它會叫，而那時它是**中斷器**：
+    #     請人回來確認新寫法仍然滿足三條前提，再更新這張表。
+    #   - 它比對的是**文字**，不是控制流。三條前提若被寫成 `||` 而不是 `&&`，
+    #     逐字錨點仍然命中（錨點含 `&&`，所以這一種其實會被抓到，但
+    #     「把整段包進一個永遠為真的 if」這類結構性繞過抓不到）。
+    #   - 它不驗執行期：`lastSeen` 是不是真的由重開機後的回報寫進去的，
+    #     字串比對一個字都證明不了。
+    #   - **它擋不住「重送同一版」**：slave 本來就是目標版本時，(a)(b)(c) 全部
+    #     成立而韌體其實沒換過。要分辨得比對重開機事件本身（uptime／開機計數），
+    #     本階段的 HoStatePayload 沒有那個欄位 —— 這是已知缺口，不是本檢查的漏網。
+    # 區塊要在 **updateOtaSession() 的函式本體內**找：otaPhaseName() 也有一個
+    # 逐項列出同一組列舉的 switch，`case OTA_SUCCESS:` 在它裡面**更早**出現，
+    # 直接全檔 find() 會切出一段負長度而誤報「找不到」。
+    fn_i = master_src.find('void updateOtaSession(unsigned long now) {')
+    fn_j = master_src.find(chr(10) + '}' + chr(10), fn_i) if fn_i >= 0 else -1
+    ota_fn = master_src[fn_i:fn_j] if (fn_i >= 0 and fn_j > fn_i) else ''
+    if not ota_fn:
+        failures.append('[轉送燈號] 找不到 updateOtaSession() 的函式本體，方向 14 無法檢查')
+
+    def block_of(start_anchor, end_anchor, label):
+        i = ota_fn.find(start_anchor)
+        j = ota_fn.find(end_anchor)
+        if i < 0 or j < 0 or j < i:
+            failures.append('[轉送燈號] updateOtaSession() 裡找不到 %s 區塊'
+                            '（錨點 %r → %r），方向 14 無法檢查'
+                            % (label, start_anchor, end_anchor))
+            return None
+        return ota_fn[i:j]
+
+    n_upgraded = len([1 for _, line in code_lines if '已更新到' in line])
+    if n_upgraded != 1:
+        failures.append('[轉送燈號] 「已更新到」在 ho_master1.ino 的非註釋行出現 %d 次'
+                        '（必須剛好 1 次，且只能長在 OTA_VERIFYING 的版本回檢裡）。'
+                        '0 次＝Task 4 的版本回檢還沒寫、或成功路徑不再印出回歸清單第 12 項的判準字串；'
+                        '2 次以上＝有第二條路徑在宣稱 slave 已更新' % n_upgraded)
+
+    verifying = block_of('case OTA_VERIFYING: {', 'case OTA_SUCCESS:', 'OTA_VERIFYING')
+    if verifying is not None:
+        VERIFY_MUST = [
+            ('(b) 用 MAC 重查索引', 'int vIdx = findSlave(otaTargetMac);'),
+            ('(a) 目標版本不是 0.0.0', 'if (otaHasVersion && vIdx >= 0 &&'),
+            ('(c) lastSeen 晚於進入 VERIFYING 的時刻',
+             '(long)(slaves[vIdx].lastSeen - otaPhaseStart) > 0 &&'),
+            ('成功路徑印出回歸清單第 12 項的判準字串', '[OTA] 完成：%s 已更新到 %u.%u.%u'),
+        ]
+        for label, needle in VERIFY_MUST:
+            if needle not in verifying:
+                failures.append('[轉送燈號] OTA_VERIFYING 區塊少了 %s 的逐字錨點：%r'
+                                % (label, needle))
+        for lineno, line in code_lines:
+            if 'otaTargetIdx' in line and line in verifying:
+                failures.append('[轉送燈號] OTA_VERIFYING 區塊用了會過期的 otaTargetIdx：'
+                                'ho_master1.ino:%d %s' % (lineno, line.strip()[:80]))
+
+    end_sent = block_of('case OTA_END_SENT: {', 'case OTA_VERIFYING: {', 'OTA_END_SENT')
+    if end_sent is not None:
+        END_MUST = [
+            ('收到 READY 要繼續等（少了它＝假紅燈）',
+             'if (otaAckStatus == HO_OTA_READY) {'),
+            ('成功判定連 blockBase 與 mask 一起檢查（少了它＝只看 status 的假綠燈）',
+             'otaAckBase == otaTotalChunks && otaAckBits == 0xFFFF'),
+        ]
+        for label, needle in END_MUST:
+            if needle not in end_sent:
+                failures.append('[轉送燈號] OTA_END_SENT 區塊少了 %s 的逐字錨點：%r'
+                                % (label, needle))
 
     print('禁用 API 靜態檢查：ho_master1.ino 非註釋行 %d 行；'
           'otaSessionBusy() 呼叫點 %d 處；文件必含 %d 條；'

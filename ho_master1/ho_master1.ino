@@ -508,6 +508,57 @@ static uint8_t otaStageBuf[4096];    // esp_partition_write 需要 4-byte 對齊
 size_t   otaStageFill = 0;
 uint32_t otaStageOffset = 0;
 
+// ── 轉送引擎（Phase 4 Task 4、計畫決定 2）──
+// 固定視窗 16 包的 block-ACK ＋ bitmap 選擇性重傳。狀態只有 (blockBase, mask, retry) 三組。
+uint16_t otaBlockBase  = 0;      // 目前區塊第一包的 chunkIndex
+uint16_t otaSendMask   = 0;      // bit i = blockBase+i「還要送」
+uint16_t otaAckMask    = 0;      // slave 回報已收到的 bitmap（保留給診斷，推進判斷用 otaAckBits）
+int      otaBlockRetry = 0;      // 同一個區塊已經整塊重送幾輪
+int      otaPollCount  = 0;      // 同一個區塊已經重發幾次查詢
+// BEGIN 的重送次數。**刻意不與 otaBlockRetry 共用**：OTA_STAGED 每次進來都會把
+// otaBlockRetry 歸零（那是「新區塊從頭算」的正確行為），而 OTA_BEGIN_SENT 的重送
+// 路徑正是「回 OTA_STAGED 再送一次 BEGIN」—— 共用的話計數器每輪被歸零，
+// 「最多 5 次」永遠不成立，會一路重送 BEGIN 到 5 分鐘總上限，而且錯誤碼會落在
+// otaPhase < OTA_BEGIN_SENT 那一側被報成 "http_fail"（把現場診斷導向 WiFi／HTTP，
+// 真正該查的是那台 slave）。這個計數器只在 otaStart() 與 otarelay 起手時歸零。
+int      otaBeginAttempt = 0;
+// true = 只跑下載半段（序列埠 otadl），到 OTA_STAGED 就原地收尾，**一台 slave 都不碰**。
+// false = 下載完就接著轉送。Task 5 的 MQTT update_slave 一律傳 false。
+// 這個旗標存在的理由：Task 4 之後 OTA_STAGED 不再是終點，而 otadl 的說明與
+// ho_master1/readme.md 都寫著「它不會接觸任何 slave」—— 沒有這個旗標，
+// 那兩句話會在本 Task 靜靜變成假的（而且是往「以為只是下載、其實籠門被重開機打開」
+// 的方向假）。
+bool     otaStageOnly = true;
+unsigned long otaWaitStart = 0;  // 送出查詢的時刻，OTA_ACK_TIMEOUT_MS 由它起算
+// ── 以下四個由 ESP-NOW callback（**WiFi task**）寫、由 loop() 讀 ──
+// 沿用本檔 slaves[] 既有的無鎖慣例：callback 只搬旗標，一切判斷與後續送出都在 loop()。
+// otaAckPending **最後**才設為 true，讓 loop() 讀到旗標時另外三個值已經寫好。
+//
+// **它擋不住什麼**：這不是原子操作。第二封 ACK 在 loop() 讀完旗標、還沒讀完三個值
+// 之間到達時，讀到的可能是兩封混合的值。後果一律落在「這一輪推進判斷不成立」→
+// 走查詢／重送（誤紅方向，成本是一次來回），不會讓區塊被誤判為已收齊：
+// 推進要 (base 相符 && mask 全滿)，而兩封 ACK 的 base 只會相等或往前。
+volatile bool     otaAckPending = false;
+volatile uint16_t otaAckBase    = 0;
+volatile uint16_t otaAckBits    = 0;
+volatile uint8_t  otaAckStatus  = 0;
+
+const unsigned long OTA_ACK_TIMEOUT_MS  = 400;   // 送完查詢後等 ACK（ESP-NOW 單向典型 2~4ms）
+const int           OTA_POLL_MAX        = 3;     // 同一個區塊最多重發 3 次查詢（成本各 1 包）
+const int           OTA_BLOCK_MAX_RETRY = 8;     // 同一個區塊最多整塊重送 8 輪（成本各 16 包）
+const int           OTA_BEGIN_MAX_TRY   = 5;     // OTA_BEGIN 最多送 5 次（每次間隔 3 秒）
+// 每次 loop() 最多送幾包。
+//
+// 為什麼用「每輪固定包數」而不是「追蹤 in-flight 計數」：
+// in-flight 要在 loop() 遞增、在 onEspNowSent()（WiFi task）遞減，那是一組
+// 跨 task 的 read-modify-write 競態。改成固定配額之後完全沒有共享可變狀態，
+// 而 ESP_ERR_ESPNOW_NO_MEM 本身就是完美的背壓訊號 —— 佇列滿就這輪不送，
+// 下一輪 loop() 再試，自然貼著硬體的實際速率跑。
+//
+// 對心跳的影響：每輪 2 包 × 250 bytes，實測級的送出耗時 < 5ms，
+// 遠小於 maintainEspNow() 的 1 秒心跳週期（計畫決定 1(b) 的表）。
+const int OTA_SEND_PER_LOOP = 2;
+
 // 配對模式
 unsigned long pairingStartTime = 0;
 const unsigned long PAIRING_TIMEOUT = 60000;  // 60 秒
@@ -2327,6 +2378,9 @@ void printHelp() {
   Serial.println("  jsonsize      測試用：印出目前狀態 JSON 的實際大小");
   Serial.println("  otadl <n> <url>  測試用：只下載並暫存韌體，不轉送（會抹除 master 的閒置 OTA 分區，");
   Serial.println("                 不動開機分區；固定略過『繼電器正開著就拒絕』的保護）");
+  Serial.println("  otarelay <n> [版本] [force]  測試用：把暫存分區裡那份韌體轉送給第 n 台");
+  Serial.println("                 （要先跑過 otadl；轉送成功那台會重開機，繼電器會斷一次，");
+  Serial.println("                  省略版本＝0.0.0，版本回檢必定走到 90 秒 no_return）");
   Serial.println("  otastat       印出目前 OTA 工作階段的階段與進度");
   Serial.println("  help          顯示這份說明");
 }
@@ -2473,13 +2527,45 @@ void handleSerialCommand(const String& line) {
       } else {
         char id[20];
         hoFormatDeviceId(slaves[n].mac, id);
-        otaStart(id, u.c_str(), "0.0.0", nullptr, true);
+        // 最後一個參數 stageOnly=true：下載完停在暫存，不轉送（轉送請用 otarelay）。
+        otaStart(id, u.c_str(), "0.0.0", nullptr, true, true);
       }
     }
+  } else if (verb == "otarelay") {
+    // 測試用：把暫存分區裡那份韌體轉送給指定 slave（不下載、不碰網路）。
+    // 用法：otarelay <slave 編號> [版本 x.y.z] [force]
+    //   版本：省略等同 0.0.0，那會讓版本回檢的第 (a) 條前提不成立、
+    //         **必定**走到 90 秒 no_return（otaRelayStaged() 會印警告）
+    //   force：略過「目標繼電器正開著就拒絕」那道保護
+    int sp = argStr.indexOf(' ');
+    String nStr = (sp < 0) ? argStr : argStr.substring(0, sp);
+    String rest = (sp < 0) ? String("") : argStr.substring(sp + 1);
+    rest.trim();
+    int n = 0;
+    if (!parseIndexArg(nStr, n)) {
+      Serial.println("用法：otarelay <slave 編號> [版本 x.y.z] [force]");
+    } else {
+      // 剩下的參數不分先後：長得像 x.y.z 的當版本，"force" 當覆寫旗標。
+      String ver = "0.0.0";
+      bool force = false;
+      while (rest.length() > 0) {
+        int q = rest.indexOf(' ');
+        String tok = (q < 0) ? rest : rest.substring(0, q);
+        rest = (q < 0) ? String("") : rest.substring(q + 1);
+        rest.trim();
+        if (tok == "force") {
+          force = true;
+        } else if (tok.length() > 0) {
+          ver = tok;
+        }
+      }
+      otaRelayStaged(n, ver.c_str(), force);
+    }
   } else if (verb == "otastat") {
-    Serial.printf("[OTA] 階段=%s 目標=%s 進度=%u/%u bytes 錯誤=%s\n",
+    Serial.printf("[OTA] 階段=%s 目標=%s 下載=%u/%u bytes 區塊=%u/%u 包 進度=%u%% 錯誤=%s\n",
                   otaPhaseName(), otaTargetId,
                   (unsigned)otaDownloaded, (unsigned)otaTotalSize,
+                  otaBlockBase, otaTotalChunks, otaProgressPercent(),
                   otaErrCode[0] ? otaErrCode : "無");
   } else if (verb == "fakeslaves") {
     fakeSlavesForCapacityTest(arg);
@@ -2520,8 +2606,20 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
 
   char senderId[20];
   hoFormatDeviceId(info->src_addr, senderId);
-  Serial.printf("[ESP-NOW] 收到 type=0x%02x seq=%u 來自 %s rssi=%d\n",
-                header.type, header.seq, senderId, info->rx_ctrl->rssi);
+  // ⚠ Task 4：這一行原本無條件印。轉送期間 slave 每個區塊至少回一封 OTA_ACK，
+  //   1 MB 韌體是 274 個區塊（加上查詢與重傳會更多）→ 270+ 行純雜訊，
+  //   把序列埠洗到看不見「[OTA] 轉送進度」與任何錯誤。所以排除 OTA_ACK。
+  //   **Task 6 寫回歸清單時要以修改後的行為為準**：轉送期間**不會**出現
+  //   「[ESP-NOW] 收到 type=0x23」這種行，那是刻意的，不是收不到 ——
+  //   進度改看每 40 個區塊一行的「[OTA] 轉送進度」。
+  //
+  // **它擋不住什麼**：這只是降噪，不是任何一種保護。被藏起來的是「這封 ACK
+  //   從哪台來、rssi 多少」——要診斷弱訊號下的 ACK 回程，得看區塊重試那幾行，
+  //   這裡看不到。也擋不住別種型別的封包把序列埠洗版。
+  if (header.type != HO_PKT_OTA_ACK) {
+    Serial.printf("[ESP-NOW] 收到 type=0x%02x seq=%u 來自 %s rssi=%d\n",
+                  header.type, header.seq, senderId, info->rx_ctrl->rssi);
+  }
 
   if (header.type == HO_PKT_PAIR_REQ) {
     HoPairAckPayload ack;
@@ -2666,6 +2764,32 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     }
     return;
   }
+
+  if (header.type == HO_PKT_OTA_ACK && payloadLen >= sizeof(HoOtaAckPayload)) {
+    // 本函式跑在 **WiFi task**。這裡「只」搬旗標，一切判斷與後續送出都交給 loop()。
+    // 在這裡直接送下一個區塊，等於從另一個 task 動 ESP-NOW 與暫存分區，是明確的競態
+    //（與本檔「ESP-NOW callback 不得發 MQTT」同一條理由）。
+    //
+    // 兩道過濾都在這裡做完，讓 loop() 拿到的旗標必定屬於本工作階段的目標：
+    //   1. 來源 MAC 必須是 otaTargetMac —— 沒有工作階段時它是全 0（otaSetTarget()
+    //      的失敗路徑會清成全 0），全 0 不是任何一台 slave 的 MAC，所以這道
+    //      同時擋住「沒有工作階段時的殘留 ACK」。
+    //   2. sessionId 必須相符 —— 擋掉上一場失敗留下的殘留封包。
+    //
+    // **它擋不住什麼**：協定沒有加密也沒有 nonce，錄下一封真的 ACK 重放進來
+    //   這裡分不出來（ho_slave1.ino 的 otaSendAck() 上方也載明了同一件事）。
+    //   它也不做去重：同一封 ACK 到兩次會覆寫旗標兩次，後果見 otaAckPending 宣告處。
+    if (memcmp(info->src_addr, otaTargetMac, 6) != 0) return;
+    HoOtaAckPayload ak;
+    memcpy(&ak, payload, sizeof(ak));
+    if (ak.sessionId != otaSessionId) return;
+    otaAckBase   = ak.blockBase;
+    otaAckBits   = ak.mask;
+    otaAckStatus = ak.status;
+    // **這一行必須排在最後**：loop() 讀到 otaAckPending 為真時，上面三個值才保證已寫好。
+    otaAckPending = true;
+    return;
+  }
 }
 
 // 送出回呼（**WiFi task context**，不是 loop()）。
@@ -2682,20 +2806,34 @@ void onEspNowSent(const wifi_tx_info_t* txInfo, esp_now_send_status_t status) {
 }
 
 // ── 送出封包 ──
-bool espNowSendTo(const uint8_t mac[6], HoPacketType type,
-                  const void* payload, size_t len) {
+// verbose=false 的版本供 OTA 大量送出使用：轉送一份 1 MB 韌體要送 4400 包，
+// 其中一部分必然遇到 ESP_ERR_ESPNOW_NO_MEM（ESP-NOW 傳送佇列滿）。
+// 那是**正常的背壓訊號而不是錯誤**，不該印 —— 每次都印會把序列埠洗到無法閱讀，
+// 而回歸清單是靠人工讀序列埠逐項比對的。呼叫端看回傳值決定下一輪要不要重試。
+//
+// **它擋不住什麼**：安靜掉的是「這一包沒送出去」的即時訊息。真正的失敗仍看得見
+// —— 同一個區塊重送 8 輪仍失敗會印「[OTA] 區塊 %u 重試 %d 次仍失敗」並報 espnow_fail。
+// 但「持續在背壓邊緣、吞吐很慢」這種亞健康狀態，這裡一個字都不會說。
+bool espNowSendToEx(const uint8_t mac[6], HoPacketType type,
+                    const void* payload, size_t len, bool verbose) {
   uint8_t buf[250];
   size_t total = hoPackPacket(buf, sizeof(buf), type, txSeq++, payload, len);
   if (total == 0) {
-    Serial.println("[ESP-NOW] 打包失敗");
+    if (verbose) Serial.println("[ESP-NOW] 打包失敗");
     return false;
   }
   esp_err_t res = esp_now_send(mac, buf, total);
   if (res != ESP_OK) {
-    Serial.printf("[ESP-NOW] esp_now_send 失敗: %d\n", res);
+    if (verbose) Serial.printf("[ESP-NOW] esp_now_send 失敗: %d\n", res);
     return false;
   }
   return true;
+}
+
+// 既有呼叫端一行都不用改：預設仍然是會印訊息的那一版。
+bool espNowSendTo(const uint8_t mac[6], HoPacketType type,
+                  const void* payload, size_t len) {
+  return espNowSendToEx(mac, type, payload, len, true);
 }
 
 // ── 心跳廣播 ──
@@ -2984,6 +3122,87 @@ bool otaStageRead(uint32_t offset, uint8_t* out, size_t len) {
   return esp_partition_read(otaStagePart, offset, out, len) == ESP_OK;
 }
 
+// ── 轉送引擎的計算與送出（Phase 4 Task 4）──
+
+// 本區塊要幾包（最後一塊可能不足 16）。
+// 那個 `>=` 的守衛是防守性的：otaBlockBase 一旦超過 otaTotalChunks，
+// 下面的減法會下溢成 65535，otaFullMask() 會變 0xFFFF，master 會開始送
+// 「塊號 >= totalChunks」的越界包（otaSendChunk() 的 remain 也會一起下溢，
+// 讀到暫存分區以外的資料）。slave 端擋得住（它有 chunkIndex >= otaTotalChunks
+// 的守衛，直接丟棄），所以那是誤紅不是誤綠，但會白白重試到工作階段逾時。
+// **目前沒有已知路徑會走到它** —— 唯一可能推進 otaBlockBase 的兩條路徑
+//（收齊推進、跟上 slave）都各自有 >= otaTotalChunks 的檢查在前面。
+uint16_t otaBlockNeed() {
+  if (otaBlockBase >= otaTotalChunks) return 0;
+  uint16_t need = HO_OTA_WINDOW;
+  if ((uint32_t)otaBlockBase + HO_OTA_WINDOW > otaTotalChunks) {
+    need = (uint16_t)(otaTotalChunks - otaBlockBase);
+  }
+  return need;
+}
+
+uint16_t otaFullMask() {
+  uint16_t need = otaBlockNeed();
+  return (need >= 16) ? 0xFFFF : (uint16_t)((1u << need) - 1u);
+}
+
+// 從暫存分區讀出第 idx 包並送給目標 slave。
+// 回 false 有兩種原因：分區讀失敗，或 ESP-NOW 佇列滿（背壓）。呼叫端一律當背壓處理
+// ——**這是刻意的**：分區讀失敗在這裡只會表現成「這一輪少送一包」，
+// 真正的紅燈由區塊重試上限（8 輪）兜底，錯誤碼會是 espnow_fail 而不是 flash_fail。
+// 換句話說：**現場看到 espnow_fail 時，不能排除是暫存分區讀不出來。**
+bool otaSendChunk(uint16_t idx) {
+  uint32_t off = (uint32_t)idx * HO_OTA_CHUNK_SIZE;
+  if (off >= otaTotalSize) return false;   // 防守：越界的塊號一律不送（見 otaBlockNeed()）
+  uint32_t remain = otaTotalSize - off;
+  size_t dataLen = (remain < HO_OTA_CHUNK_SIZE) ? (size_t)remain : HO_OTA_CHUNK_SIZE;
+
+  uint8_t pkt[sizeof(HoOtaDataPayload) + HO_OTA_CHUNK_SIZE];
+  HoOtaDataPayload dh;
+  dh.sessionId  = otaSessionId;
+  dh.chunkIndex = idx;
+  memcpy(pkt, &dh, sizeof(dh));
+  if (!otaStageRead(off, pkt + sizeof(dh), dataLen)) return false;
+
+  return espNowSendToEx(otaTargetMac, HO_PKT_OTA_DATA, pkt, sizeof(dh) + dataLen, false);
+}
+
+// 送一封「這個區塊你收到哪幾包了？」。**到達 slave 的 OTA_ACK 一律是查詢**
+//（方向本身就是語義，協定沒有 request 欄位；見 ho_slave1.ino 的 OTA_ACK 分支）。
+void otaSendPoll() {
+  HoOtaAckPayload q;
+  q.sessionId = otaSessionId;
+  q.blockBase = otaBlockBase;
+  q.mask      = 0;
+  q.status    = 0;
+  espNowSendToEx(otaTargetMac, HO_PKT_OTA_ACK, &q, sizeof(q), false);
+}
+
+// 送 OTA_END。abort=1 是「你丟掉、不要切換分區」，abort=0 是「收齊了，去校驗」。
+// 收斂成一個函式的理由：計畫的範本在四個地方各自組一次 HoOtaEndPayload，
+// 而 totalSize 這個欄位是 slave 端「長度三重比對」的其中一項 ——
+// 四份複製貼上裡只要有一份漏填或填錯，slave 會回 HO_OTA_ERR_MD5 而現場會去查韌體檔。
+void otaSendEnd(uint8_t abort) {
+  HoOtaEndPayload en;
+  en.sessionId = otaSessionId;
+  en.abort     = abort;
+  en.totalSize = otaTotalSize;
+  espNowSendToEx(otaTargetMac, HO_PKT_OTA_END, &en, sizeof(en), true);
+}
+
+// 給 Task 5 的進度回報用（本 Task 只有序列埠的轉送進度會用到）。
+// 下載半段用位元組數、轉送半段用區塊數 —— 兩段的分母不同，這是刻意的：
+// 對 App 而言「%」只是一條進度條，而 phase 欄位才是真正在講「現在在做什麼」。
+uint8_t otaProgressPercent() {
+  if (otaPhase == OTA_DOWNLOADING || otaPhase == OTA_RESOLVING || otaPhase == OTA_ERASING) {
+    if (otaTotalSize == 0) return 0;
+    return (uint8_t)((uint64_t)otaDownloaded * 100 / otaTotalSize);
+  }
+  if (otaPhase == OTA_SUCCESS) return 100;
+  if (otaTotalChunks == 0) return 0;
+  return (uint8_t)((uint32_t)otaBlockBase * 100 / otaTotalChunks);
+}
+
 void otaReleaseHttp() {
   if (otaHttp) { otaHttp->end(); delete otaHttp; otaHttp = nullptr; }
   if (otaTls)  { delete otaTls; otaTls = nullptr; }
@@ -3059,8 +3278,11 @@ void otaSetTarget(const char* slaveId, const uint8_t* mac) {
   }
 }
 
+// stageOnly：見 otaStageOnly 宣告處。**刻意不給預設值** —— 給了預設值等於讓
+// 未來的呼叫端「不寫就是不轉送」或反過來，而這個參數的兩側各自對應一種現場後果，
+// 應該每個呼叫端都明確寫出來。
 bool otaStart(const char* slaveId, const char* url, const char* version,
-              const char* expectMd5, bool force) {
+              const char* expectMd5, bool force, bool stageOnly) {
   if (otaSessionBusy()) {
     // 這裡刻意**不**呼叫 otaFail()：那會把進行中工作階段的階段與錯誤碼蓋掉。
     // 對 App 回報 "busy" 是呼叫端（Task 5）的責任。
@@ -3159,6 +3381,9 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
 
   // sessionId 避開 0（0 保留給「無工作階段」）
   otaSessionId = (uint8_t)((millis() % 255) + 1);
+  otaStageOnly = stageOnly;
+  otaBeginAttempt = 0;
+  otaAckPending = false;
   otaAttempt = 0;
   otaRedirects = 0;
   otaDlStep = OTA_DL_CONNECT;
@@ -3173,6 +3398,88 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
   Serial.printf("[OTA] 開始工作階段 %u：目標 %s，版本 %u.%u.%u\n",
                 otaSessionId, otaTargetId, otaVerMajor, otaVerMinor, otaVerPatch);
   Serial.printf("[OTA] 網址 %s\n", otaUrl);
+  return true;
+}
+
+// 把**已經在暫存分區裡**的那份韌體轉送給第 n 台（序列埠 otarelay）。
+// 不下載、不碰網路，直接從 OTA_STAGED 起跑。
+//
+// 為什麼不提供 plan 原本描述的那條路（把 master 自己正在跑的韌體當假韌體送出去）：
+// 那份映像的 MD5 一定對得上、slave 一定會切換開機分區，於是那台 slave 重開機後
+// **跑的是 master 的程式** —— 它不再回應任何 slave 端協定、繼電器腳位定義也不同，
+// 而它掛在籠門上。要救只能拆下來接 USB 重燒。一條「打錯一個字就得跑一趟現場」的
+// 指令，驗證價值買不起它的誤用風險。所以採用 plan 的建議做法：
+// 先用 otadl 把**真正的 slave 韌體**下載進暫存區，再用本指令轉送。
+//
+// **它擋不住什麼**：它不檢查暫存區裡那份映像到底是不是 slave 的韌體 ——
+// 只驗過首位元組 0xE9（合法的 ESP32 映像）與 MD5（下載階段算的）。
+// 拿 otadl 去下載一份 master 韌體、再 otarelay 出去，一樣會把 slave 變成上面那樣。
+// 這道防線消滅的是「不必打錯字、預設就危險」，不是「不可能誤用」。
+bool otaRelayStaged(int n, const char* version, bool force) {
+  if (otaSessionBusy()) {
+    Serial.printf("[OTA] 已有工作階段進行中（目標 %s，階段 %s），忽略本次指令\n",
+                  otaTargetId, otaPhaseName());
+    return false;
+  }
+  if (fakeSlavesActive) {
+    Serial.println("[OTA] 目前掛著 fakeslaves 的假名冊，拒絕轉送（那些 MAC 沒有對應的實體 slave）");
+    return false;
+  }
+  if (n < 0 || n >= slaveCount) {
+    Serial.println("[OTA] slave 編號超出範圍");
+    return false;
+  }
+  // 暫存區的有效性：otaStagePart 只在本次開機跑過 otadl 之後才是非空。
+  // 重開機之後 flash 裡的資料還在，但 master 這邊已經不知道長度與 MD5 ——
+  // 一律拒絕（fail-closed），不去猜。
+  if (otaStagePart == nullptr || otaTotalSize < 65536 || otaTotalChunks == 0) {
+    Serial.println("[OTA] 暫存分區沒有可用的映像，請先跑一次 otadl <n> <url>"
+                   "（重開機後也要重跑，master 不會沿用上次開機留下的暫存內容）");
+    return false;
+  }
+
+  char id[20];
+  hoFormatDeviceId(slaves[n].mac, id);
+
+  // ⚠ 與 otaStart() 同一道安全保護：轉送成功會讓目標重開機，繼電器必然回到 LOW，
+  //   C3 板還會在開機瞬間短暫通電。對一台正把籠門保持在關閉狀態的 slave 做這件事，
+  //   等於在遠端把那扇門打開。所以預設拒絕。
+  //   **它擋不住什麼**：force 一律放行；它只在起手那一瞬間看一次；
+  //   slaves[n].relay 是那台上一次回報的值，不是即時真相。
+  if (slaves[n].relay != 0 && !force) {
+    Serial.println("[OTA] 目標的繼電器正開著。轉送會讓它重開機並把繼電器歸零，"
+                   "確定要做請在指令尾端加上 force");
+    return false;
+  }
+
+  otaSetTarget(id, slaves[n].mac);
+  otaTargetIdx = n;
+  otaErrCode[0] = '\0';
+
+  otaVerMajor = otaVerMinor = otaVerPatch = 0;
+  sscanf(version, "%hhu.%hhu.%hhu", &otaVerMajor, &otaVerMinor, &otaVerPatch);
+  otaHasVersion = (otaVerMajor != 0 || otaVerMinor != 0 || otaVerPatch != 0);
+  if (!otaHasVersion) {
+    Serial.println("⚠ [OTA] 沒指定版本（或解析失敗）：版本回檢的第 (a) 條前提不成立，"
+                   "**即使 slave 真的更新成功，本次也必定走到 90 秒 no_return**。"
+                   "要讓版本回檢有機會成立，請下 otarelay <n> <暫存映像的實際版本>");
+  }
+
+  otaSessionId = (uint8_t)((millis() % 255) + 1);
+  otaStageOnly = false;
+  otaBeginAttempt = 0;
+  otaAckPending = false;
+  otaAttempt = 0;
+  otaRetryAt = 0;
+  otaSessionStart = millis();
+  otaPhase = OTA_STAGED;
+  otaPhaseStart = millis();
+
+  Serial.printf("[OTA] 開始轉送工作階段 %u：目標 %s，暫存 %u bytes／%u 包，宣告版本 %u.%u.%u\n",
+                otaSessionId, otaTargetId, (unsigned)otaTotalSize, otaTotalChunks,
+                otaVerMajor, otaVerMinor, otaVerPatch);
+  Serial.println("⚠ [OTA] 轉送成功會讓目標 slave 重新開機：它的繼電器會斷一次，"
+                 "而 C3 板開機瞬間還會短暫通電（硬體限制，韌體無法根治）");
   return true;
 }
 
@@ -3579,17 +3886,324 @@ void updateOtaSession(unsigned long now) {
       }
     }
 
-    case OTA_STAGED:
-      // Task 4 會在這裡接上轉送。本 Task 先原地收尾並印一行，
-      // 讓 otadl 指令可以單獨驗證「下載 + 暫存 + MD5」這一整段。
-      // ⚠ 因此本 Task 的 "success" **不代表任何 slave 被更新過**，
+    case OTA_STAGED: {
+      // stageOnly（序列埠 otadl）：原地收尾並印一行，讓「下載 + 暫存 + MD5」
+      // 這一整段可以單獨驗證。
+      // ⚠ 這條路徑的 "success" **不代表任何 slave 被更新過**，
       //   只代表 master 把檔案抓下來、寫進暫存分區、MD5 算完了。
-      Serial.printf("[OTA] 已暫存完成：%u bytes 已寫入 master 的閒置分區、MD5 已核對；"
-                    "「未轉送、未接觸任何 slave」，目標 %s 的韌體版本沒有任何改變"
-                    "（轉送是 Task 4）\n",
-                    (unsigned)otaDownloaded, otaTargetId);
-      otaFinish();
+      if (otaStageOnly) {
+        Serial.printf("[OTA] 已暫存完成：%u bytes 已寫入 master 的閒置分區、MD5 已核對；"
+                      "「未轉送、未接觸任何 slave」，目標 %s 的韌體版本沒有任何改變"
+                      "（要轉送請下 otarelay）\n",
+                      (unsigned)otaDownloaded, otaTargetId);
+        otaFinish();
+        return;
+      }
+
+      HoOtaBeginPayload bg;
+      bg.totalSize   = otaTotalSize;
+      bg.totalChunks = otaTotalChunks;
+      memcpy(bg.md5, otaImageMd5, 16);
+      bg.verMajor  = otaVerMajor;
+      bg.verMinor  = otaVerMinor;
+      bg.verPatch  = otaVerPatch;
+      bg.sessionId = otaSessionId;
+
+      espNowSendToEx(otaTargetMac, HO_PKT_OTA_BEGIN, &bg, sizeof(bg), true);
+      otaBeginAttempt++;
+      // 每次（含重送）都把區塊狀態歸零。**master 一律從第 0 塊開始送**，
+      // 不採用「重複 BEGIN 的回覆帶著 slave 既有進度就跟上去」那套：
+      // 本檔唯一會重送 BEGIN 的路徑是 OTA_BEGIN_SENT 的 3 秒逾時，
+      // 而那時**一包 OTA_DATA 都還沒送出去**，slave 的進度必然是 0 ——
+      // 跟上去省不到任何東西，卻多一條「拿對方回報的數字當起點」的路徑。
+      otaBlockBase  = 0;
+      otaSendMask   = 0;
+      otaAckMask    = 0;
+      otaBlockRetry = 0;
+      otaPollCount  = 0;
+      otaAckPending = false;
+      otaPhase = OTA_BEGIN_SENT;
+      otaPhaseStart = millis();
+      Serial.printf("[OTA] 已送出 OTA_BEGIN 給 %s（第 %d／%d 次），等待回應\n",
+                    otaTargetId, otaBeginAttempt, OTA_BEGIN_MAX_TRY);
       return;
+    }
+
+    case OTA_BEGIN_SENT: {
+      if (otaAckPending) {
+        otaAckPending = false;
+        if (otaAckStatus == HO_OTA_READY) {
+          Serial.println("[OTA] slave 已就緒，開始轉送");
+          otaSendMask   = otaFullMask();
+          otaAckMask    = 0;
+          otaBlockRetry = 0;
+          otaPollCount  = 0;
+          otaPhase = OTA_RELAYING;
+          otaPhaseStart = millis();
+        } else {
+          // 到得了這裡的狀態碼只有 slave 端 BEGIN 分支產生的三種：
+          // 2=HO_OTA_ERR_BEGIN（Update.begin() 失敗）、5=HO_OTA_ERR_SIZE（長度不合理）、
+          // 7=HO_OTA_ERR_BUSY（它已經在跑別的工作階段）。
+          Serial.printf("[OTA] slave 拒絕，狀態碼 %u（2=Update.begin 失敗 "
+                        "5=長度不合理 7=它已有工作階段）\n", otaAckStatus);
+          otaFail("slave_reject");
+        }
+        return;
+      }
+      // 3 秒沒回應就重送 BEGIN。次數用 otaBeginAttempt（**不是** otaBlockRetry，
+      // 理由見 otaBeginAttempt 宣告處：回 OTA_STAGED 會把 otaBlockRetry 歸零）。
+      if (now - otaPhaseStart >= 3000) {
+        if (otaBeginAttempt >= OTA_BEGIN_MAX_TRY) {
+          Serial.printf("[OTA] 送了 %d 次 OTA_BEGIN 都沒有回應\n", otaBeginAttempt);
+          otaFail("slave_timeout");
+          return;
+        }
+        otaPhase = OTA_STAGED;   // 回上一階段重送（計數器在那裡遞增）
+      }
+      return;
+    }
+
+    case OTA_RELAYING: {
+      // 每輪最多送 OTA_SEND_PER_LOOP 包；佇列滿（ESP_ERR_ESPNOW_NO_MEM）就這輪不送，
+      // 下一輪 loop() 再試 —— 背壓即流控，沒有任何跨 task 的共享計數器。
+      int sent = 0;
+      for (uint16_t i = 0; i < HO_OTA_WINDOW && sent < OTA_SEND_PER_LOOP; i++) {
+        if ((otaSendMask & (1u << i)) == 0) continue;
+        if (!otaSendChunk(otaBlockBase + i)) break;   // NO_MEM：背壓，下一輪再送
+        otaSendMask &= (uint16_t)~(1u << i);
+        sent++;
+      }
+      if (otaSendMask == 0) {
+        // 本區塊該送的都進了佇列，送一封查詢問它收到哪幾包。
+        // 查詢排在資料之後進同一條 ESP-NOW 佇列，所以不會超車。
+        otaSendPoll();
+        otaPollCount = 1;
+        otaWaitStart = millis();
+        otaPhase = OTA_WAIT_BLOCK_ACK;
+      }
+      return;
+    }
+
+    case OTA_WAIT_BLOCK_ACK: {
+      if (otaAckPending) {
+        otaAckPending = false;
+        uint16_t full = otaFullMask();
+
+        // 落後的 ACK ＝ 上一個區塊的回音（slave 收齊時會主動回一封，master 的查詢
+        // 也會再引來一封）。**忽略它、繼續等**。
+        // 計畫的範本沒有這一條，會讓它落進下面的「缺包」分支：
+        // otaSendMask 變成 full & ~0xFFFF = 0 → 下一輪 OTA_RELAYING 一包都不送、
+        // 立刻又送一次查詢，白跑一次來回，**而且 otaBlockRetry 被加了 1**
+        // （8 次就中止整場）。
+        // **它擋不住什麼**：若 slave 真的落在 master 後面（本檔沒有已知路徑會造成，
+        // 因為兩邊的 blockBase 只在同一封 ACK 上一起前進），這條會讓 master 一直等到
+        // 查詢逾時 → 整塊重送 → 8 輪後 espnow_fail。那是誠實的紅燈，不是靜默卡死。
+        if (otaAckBase < otaBlockBase) return;
+
+        // slave 已經推進到更後面的區塊 → 代表這塊它早就寫完，直接跟上。
+        if (otaAckBase > otaBlockBase) {
+          otaBlockBase  = otaAckBase;
+          otaBlockRetry = 0;
+          otaPollCount  = 0;
+          // 防守：跟上去之後若已經沒有區塊可送，直接進 END（否則 otaBlockNeed()
+          // 會回 0、otaFullMask() 也是 0，下一輪 OTA_RELAYING 會空轉送查詢）。
+          // **目前沒有已知路徑會走到這裡**：slave 只有在「整份校驗通過」那一封
+          // 才會送出 blockBase == totalChunks，而那封的前提是 master 已經送過 END、
+          // 早就不在本階段了。
+          if (otaBlockBase >= otaTotalChunks) {
+            otaSendEnd(0);
+            otaPhase = OTA_END_SENT;
+            otaPhaseStart = millis();
+            Serial.println("[OTA] 全部區塊已送達，已送出 OTA_END，等待校驗結果");
+            return;
+          }
+          otaSendMask = otaFullMask();
+          otaPhase = OTA_RELAYING;
+          return;
+        }
+
+        if ((otaAckBits & full) == full) {
+          otaAckMask = otaAckBits;
+          otaBlockBase += otaBlockNeed();
+          otaBlockRetry = 0;
+          otaPollCount  = 0;
+          if (otaBlockBase >= otaTotalChunks) {
+            otaSendEnd(0);
+            otaPhase = OTA_END_SENT;
+            otaPhaseStart = millis();
+            Serial.println("[OTA] 全部區塊已送達，已送出 OTA_END，等待校驗結果");
+            return;
+          }
+          otaSendMask = otaFullMask();
+          otaPhase = OTA_RELAYING;
+          // 每 40 個區塊印一行，避免 274 個區塊洗掉序列埠上的其他訊息
+          if ((otaBlockBase / HO_OTA_WINDOW) % 40 == 0) {
+            Serial.printf("[OTA] 轉送進度 %u%%（%u/%u 包）\n",
+                          otaProgressPercent(), otaBlockBase, otaTotalChunks);
+          }
+          return;
+        }
+
+        // 缺包 → 只補送缺的那幾包（bitmap 選擇性重傳，成本遠低於整塊重送）
+        otaAckMask = otaAckBits;
+        otaSendMask = (uint16_t)(full & ~otaAckBits);
+        otaBlockRetry++;
+        if (otaBlockRetry > OTA_BLOCK_MAX_RETRY) {
+          Serial.printf("[OTA] 區塊 %u 重試 %d 次仍失敗\n", otaBlockBase, otaBlockRetry);
+          // 明確叫 slave 丟掉：Update.abort() 只丟狀態、不碰 otadata，
+          // 它的開機分區在整場過程中一個位元都沒被動過。
+          otaSendEnd(1);
+          otaFail("espnow_fail");
+          return;
+        }
+        otaPollCount = 0;
+        otaPhase = OTA_RELAYING;
+        return;
+      }
+
+      if (now - otaWaitStart < OTA_ACK_TIMEOUT_MS) return;
+
+      // 逾時：先重發查詢（成本 1 包），確認不是 ACK 回程丟了；
+      // 查詢也試完才整塊重送（成本 16 包）。弱訊號下這一層能省下大量重複資料。
+      if (otaPollCount < OTA_POLL_MAX) {
+        otaPollCount++;
+        otaSendPoll();
+        otaWaitStart = millis();
+        return;
+      }
+      otaBlockRetry++;
+      if (otaBlockRetry > OTA_BLOCK_MAX_RETRY) {
+        Serial.printf("[OTA] 區塊 %u 查詢 %d 次無回應、整塊重送 %d 輪仍失敗\n",
+                      otaBlockBase, otaPollCount, otaBlockRetry);
+        otaSendEnd(1);
+        otaFail("espnow_fail");
+        return;
+      }
+      otaSendMask  = otaFullMask();
+      otaPollCount = 0;
+      otaPhase = OTA_RELAYING;
+      return;
+    }
+
+    case OTA_END_SENT: {
+      if (otaAckPending) {
+        otaAckPending = false;
+        // ⚠ Task 2 定案的 ACK status 分工（見 ho_slave1.ino 的 otaSendAck() 上方）：
+        //   HO_OTA_READY ＝「工作階段進行中，這封帶的是我的進度」
+        //                   （BEGIN 接受／重複 BEGIN／區塊收齊／查詢回覆，四處都用它）
+        //   HO_OTA_OK    ＝「整份校驗通過」，slave **全檔唯一一處**產生，
+        //                   且固定帶 (blockBase = totalChunks, mask = 0xFFFF) 當正向識別
+        //
+        // 這裡一定要做兩件事，否則各製造一個假燈號：
+        //   1. **收到 READY 要忽略並繼續等，絕對不能判成失敗。**
+        //      一封晚到的查詢回覆落進這個階段時，slave 其實已經校驗通過、正在重開機 ——
+        //      判成失敗就是**假紅燈**（現場會去重燒一台其實已經更新好的 slave）。
+        //   2. 判定成功時**連 blockBase 與 mask 一起檢查**，不要只看 status。
+        //      產生端已經保證唯一性，這裡再加一道是零成本的第二層。
+        //      （原始設計是 (0,0,OK)，與查詢回覆逐位元組相同 ＝ **假綠燈**，已在產生端消滅。）
+        if (otaAckStatus == HO_OTA_READY) {
+          return;   // 進度回報，不是結果 —— 繼續等下面的 10 秒逾時
+        }
+        if (otaAckStatus == HO_OTA_OK &&
+            otaAckBase == otaTotalChunks && otaAckBits == 0xFFFF) {
+          Serial.println("[OTA] slave 校驗通過，正在重新啟動，等它回線確認版本");
+          otaPhase = OTA_VERIFYING;
+          // **這裡用 millis() 而不是 now**（Task 3 的其他階段也一律如此）。
+          // now 是 loop() 開頭取的時間戳，而 updateOtaSession() 排在 loop() 尾端 ——
+          // 同一輪裡前面可能已經走過 connectToWiFi()（≤15 秒）、smartConnect()（≈18 秒）、
+          // mqttClient.loop() 的 PINGREQ 與 publishStatus()（各約 10 秒）、
+          // processGroupCmd()（≤6 秒），now 因此可能已經舊了數十秒。
+          // 拿一個偏早的時刻當 OTA_VERIFYING 的起點，會讓下面第 (c) 條前提
+          // 被**重開機之前**就送達的那份狀態回報滿足 —— 那是往假綠燈的方向。
+          otaPhaseStart = millis();
+        } else {
+          Serial.printf("[OTA] slave 校驗失敗，狀態碼 %u（它的開機分區未變動）\n",
+                        otaAckStatus);
+          otaFail("md5_mismatch");
+        }
+        return;
+      }
+      // slave 在這段時間裡要做完 Update.end(true)：讀完整份暫存映像算 MD5、
+      // 補寫回開頭 16 bytes、再切換開機分區。1 MB 級的映像是百毫秒級，10 秒有餘裕。
+      //
+      // ⚠ 逾時**不直接判失敗**，改成落到版本回檢（互通模擬抓到的，見下）。
+      //   計畫的範本是 `otaFail("slave_timeout")`，那會在兩種**單封丟包**下
+      //   把一次真正成功的更新記成失敗：
+      //     (甲) OTA_END 本身掉了 —— slave 沒收到，不會回任何東西
+      //     (乙) OTA_END 到了、slave 校驗通過並切換了分區，但那封 OTA_OK 回程掉了，
+      //          或被一封晚到的查詢回覆覆寫掉（otaAckPending 是單槽旗標，
+      //          後到的一封會蓋掉前一封，見它的宣告處）
+      //   兩者都只需要**一封**封包掉在 4400 包的尾巴上就會發生，而 (乙) 的 slave
+      //   其實已經在跑新韌體了 —— 那是**假紅燈**（現場會去重燒一台已經更新好的機器）。
+      //
+      //   **為什麼不改成重送 OTA_END**：重送治得了 (甲)，卻會把 (乙) 變得更糟。
+      //   slave 校驗通過之後 `otaActive` 已經是 false（見 ho_slave1.ino 的 END 分支），
+      //   第二封 OTA_END 會落進 `!otaActive` 那條，回一封 HO_OTA_ERR_MD5 ——
+      //   master 當場報 md5_mismatch，把假紅燈從「逾時」升級成「明確宣告校驗失敗」。
+      //
+      //   落到 OTA_VERIFYING 沒有新開任何綠燈路徑：那裡的三條硬性前提一條都沒少，
+      //   slave 若真的沒更新，它回報的版本就是舊版，90 秒後照樣 no_return。
+      //   代價只有「(甲) 這種真失敗要多花 90 秒才收手」。
+      if (now - otaPhaseStart >= 10000) {
+        Serial.println("[OTA] 10 秒沒收到校驗結果（OTA_END 或它的回覆掉了一封），"
+                       "改用版本回檢判定：等它重開機回報版本");
+        otaPhase = OTA_VERIFYING;
+        otaPhaseStart = millis();
+      }
+      return;
+    }
+
+    case OTA_VERIFYING: {
+      // slave 重開機後會恢復配對、鎖回 channel，master 的 pollNextSlave() 會問到它
+      //（**VERIFYING 期間不跳過目標**，見 pollNextSlave() 的 C6 註釋），
+      // 版本欄位由 onEspNowRecv() 的 HO_PKT_STATE 分支更新進 slaves[]。
+      //
+      // 本階段**完全不看 otaAckPending** —— 走到這裡代表結果已經定案（收到 OTA_OK）
+      // 或已經放棄等 ACK（上面的逾時落下來）。晚到的 ACK 只會讓旗標留在那裡，
+      // 由下一次工作階段的 OTA_STAGED 清掉。
+      //
+      // 三個硬性前提（缺一不可，不得簡化；plan 的 Task 4 Interfaces 逐字列著）：
+      //   (a) otaHasVersion 為真 —— 目標版本不是 0.0.0。
+      //       否則會對上「從沒回報過狀態的 slave」的預設 fw*=0（addSlave() 的初值），
+      //       **第一輪就成立**而 slave 還在重開機、甚至根本沒被碰過。
+      //   (b) 用 findSlave(otaTargetMac) **重查索引**，不得沿用 otaTargetIdx ——
+      //       它的宣告處逐字寫著「會過期」（名冊變動時 slaves[] 會往前搬），
+      //       用它等於拿**別台**的版本宣告成功（本專案已因索引式慣例出過「開錯門」缺陷）。
+      //   (c) 那台的 lastSeen 必須**晚於進入 OTA_VERIFYING 的時刻** ——
+      //       證明這份版本是「重開機之後才回報的」，不是工作階段開始前的舊值。
+      int vIdx = findSlave(otaTargetMac);
+      if (otaHasVersion && vIdx >= 0 &&
+          slaves[vIdx].online &&
+          (long)(slaves[vIdx].lastSeen - otaPhaseStart) > 0 &&
+          slaves[vIdx].fwMajor == otaVerMajor &&
+          slaves[vIdx].fwMinor == otaVerMinor &&
+          slaves[vIdx].fwPatch == otaVerPatch) {
+        // ⚠ 這裡是全檔**唯一**有資格印「已更新到 x.y.z」的地方（tools/check_doc_claims.py
+        //   的方向 14 會數它在非註釋行的出現次數，必須剛好一次）。
+        //   回歸清單第 12 項的判準字串就是下面這一行。
+        //
+        //   **它仍然擋不住**（兩項）：
+        //   1. **重送同一版** —— slave 本來就已經是目標版本時，(a)(b)(c) 全成立
+        //      而韌體其實沒換過。要分辨得比對重開機事件本身（slave 的 uptime／
+        //      開機計數），HoStatePayload 目前沒有那個欄位。
+        //   2. 「版本三段相符」只證明**那台自己回報的三個位元組**與指令要求的相同，
+        //      不證明映像內容正確 —— 內容那一層是 slave 的 Update.end(true) 比 MD5，
+        //      在更早的 OTA_END_SENT 就已經定案。
+        Serial.printf("[OTA] 完成：%s 已更新到 %u.%u.%u\n",
+                      otaTargetId, otaVerMajor, otaVerMinor, otaVerPatch);
+        otaFinish();
+        return;
+      }
+      if (now - otaPhaseStart >= 90000) {
+        // 90 秒足夠 pollNextSlave() 問到它 6 輪（一輪 15 秒）。走到這裡代表
+        // 「它沒回線」或「回線了但版本不是目標版本」，兩者都可能是它真的沒更新，
+        // **也可能是它更新成功了但指令給的版本字串與韌體實際版本對不上**。
+        // 誤紅可接受、誤綠不可接受，所以一律報 no_return。
+        Serial.printf("[OTA] 等待 %s 回線 90 秒逾時，它可能沒有開起來\n", otaTargetId);
+        otaFail("no_return");
+      }
+      return;
+    }
 
     case OTA_SUCCESS:
     case OTA_FAILED:
@@ -3602,8 +4216,10 @@ void updateOtaSession(unsigned long now) {
       return;
 
     default:
-      // OTA_ERASING 與 Task 4 的五個轉送階段都落在這裡：本 Task 沒有任何
-      // 路徑會把 otaPhase 設成它們，真的走到這裡也只會靠 OTA_SESSION_MAX_MS 兜底。
+      // Task 4 之後這裡只剩 OTA_ERASING（五個轉送階段都已經有自己的 case）。
+      // 抹除是在 OTA_DOWNLOADING 的 OTA_DL_ERASE 子步驟同步做完的，
+      // **本檔沒有任何一行把 otaPhase 設成 OTA_ERASING**（可用 grep 驗證），
+      // 真的走到這裡也只會靠 OTA_SESSION_MAX_MS 兜底。
       return;
   }
 }
