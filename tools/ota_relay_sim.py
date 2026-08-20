@@ -109,9 +109,9 @@ TRANSCRIBED_FROM_INO = [
     ('STAGED：BEGIN 走統一送出點（CR1）',
      'otaTxToTarget(HO_PKT_OTA_BEGIN, &bg, sizeof(bg), true);'),
     ('STAGED：每次進來都把區塊狀態歸零、從第 0 塊開始',
-     'otaBlockBase  = 0;'),
+     '      otaBlockBase  = 0;\n      otaSendMask   = 0;'),
     ('BEGIN_SENT：只有 READY 才開始轉送',
-     'if (otaAckStatus == HO_OTA_READY) {'),
+     'if (otaAckStatus == HO_OTA_READY) {\n          Serial.println("[OTA] slave 已就緒，開始轉送");'),
     ('BEGIN_SENT：重送次數用 otaBeginAttempt，不與 otaBlockRetry 共用',
      'if (otaBeginAttempt >= OTA_BEGIN_MAX_TRY) {'),
     ('BEGIN_SENT：3 秒逾時重送',
@@ -132,10 +132,12 @@ TRANSCRIBED_FROM_INO = [
      'otaSendMask = (uint16_t)(full & ~otaAckBits);'),
     ('WAIT_ACK：先重發查詢，查詢用完才整塊重送',
      'if (otaPollCount < OTA_POLL_MAX) {'),
-    ('WAIT_ACK：整塊重送也用完就中止並叫 slave 丟掉',
-     'if (otaBlockRetry > OTA_BLOCK_MAX_RETRY) {'),
+    ('WAIT_ACK：缺包重送用完就中止並叫 slave 丟掉',
+     '        if (otaBlockRetry > OTA_BLOCK_MAX_RETRY) {\n          Serial.printf("[OTA] 區塊 %u 重試 %d 次仍失敗'),
+    ('WAIT_ACK：查詢也用完之後的整塊重送上限',
+     '      if (otaBlockRetry > OTA_BLOCK_MAX_RETRY) {\n        Serial.printf("[OTA] 區塊 %u 查詢 %d 次無回應'),
     ('END_SENT：收到 READY 要繼續等，不得判成失敗（假紅燈）',
-     'if (otaAckStatus == HO_OTA_READY) {'),
+     'if (otaAckStatus == HO_OTA_READY) {\n          return;   // 進度回報，不是結果'),
     ('END_SENT：成功判定連 blockBase 與 mask 一起檢查（假綠燈）',
      'otaAckBase == otaTotalChunks && otaAckBits == 0xFFFF'),
     ('END_SENT：10 秒沒結果不判失敗，改落到版本回檢',
@@ -143,7 +145,7 @@ TRANSCRIBED_FROM_INO = [
     ('VERIFYING：(b) 用 MAC 重查索引，不得沿用會過期的 otaTargetIdx',
      'int vIdx = findSlave(otaTargetMac);'),
     ('VERIFYING：(a) 目標版本不是 0.0.0',
-     'if (otaHasVersion && vIdx >= 0 &&'),
+     'if (otaHasVersion && vIdx >= 0 &&\n          slaves[vIdx].online &&'),
     ('VERIFYING：(c) lastSeen 晚於進入 VERIFYING 的時刻',
      '(long)(slaves[vIdx].lastSeen - otaPhaseStart) > 0 &&'),
     ('VERIFYING：版本三段相等（「版本回檢」四個字的全部內容）',
@@ -155,7 +157,24 @@ TRANSCRIBED_FROM_INO = [
     ('CR1：群組歸因守衛',
      'if (otaUnicastRecently(desAddr)) {'),
     ('群組指令期間轉送整個讓開（plan 決定 1(b)）',
-     'if (groupCmdActive()) {'),
+     'if (groupCmdActive()) {\n      if (otaGroupPauseSince == 0) {'),
+    # ── 這一輪複審修的四項，原本**兩支腳本都沒有任何錨點守著**（A 族第 20 次）──
+    # 複審實測：MJ3／MJ6 的計時器順延／MJ7／otaEndQueued 全部可以原樣改回去而不會被發現。
+    ('MJ6：讓開期間三個計時器都要順延（少一個就會被吃掉重試額度）',
+     '      otaPhaseStart += paused;\n      otaWaitStart += paused;\n      otaSessionStart += paused;'),
+    ('MJ7：OTA_VERIFYING 不受 5 分鐘總上限管',
+     'otaPhase != OTA_SUCCESS && otaPhase != OTA_FAILED && otaPhase != OTA_VERIFYING &&'),
+    ('MJ3：心跳只在成功進佇列時才推進計時器',
+     'if (sendHeartbeat()) lastBeat = now;'),
+    ('END_SENT：OTA_END 沒進佇列要每輪重試（只重試「沒離開 master」那一種）',
+     'if (!otaEndQueued) {\n        otaEndQueued = otaSendEnd(0);'),
+    # ── N1：程式碼自己指名的危險方向 ──
+    # 「拿偏早的時刻當 OTA_VERIFYING 的起點是往假綠燈的方向」這句話就寫在同一個位置，
+    # 而把 millis() 換成 otaSessionStart 之前**兩支腳本全綠、前提 (c) 整條失效**。
+    ('N1：VERIFYING 的起點必須是 millis()（成功路徑）',
+     '          otaPhase = OTA_VERIFYING;\n          // **這裡用 millis() 而不是 now**'),
+    ('N1：VERIFYING 的起點必須是 millis()（逾時落下來那條）',
+     '        otaPhase = OTA_VERIFYING;\n        otaPhaseStart = millis();\n      }\n      return;'),
 ]
 
 # ─────────────── 方向 A2：順序錨點（W1 證明位置就是最大破口）───────────────
@@ -930,9 +949,20 @@ def main():
              BEGIN_MAX_TRY, SEND_PER_LOOP))
 
     # ── 方向 A ──
+    # **錨點必須唯一**（A 族第 20 次）：只驗「有沒有出現」的話，一條同時命中
+    # 程式碼與旁邊那段說明註釋的錨點會**永遠命中**——把它守著的那一行整個刪掉、
+    # 或改成別的寫法，腳本一個字都不會說。複審實測：本表原本 26 條裡有 6 條非唯一，
+    # 而這一輪修的四項（MJ3／MJ6 計時器順延／MJ7／otaEndQueued）**全部可以原樣改回去**。
+    # 這道檢查與同一份 report §2.1 剛學到的教訓是同一條，卻沒有套到自己身上。
     for label, needle in TRANSCRIBED_FROM_INO:
-        if needle not in flat:
+        n = flat.count(needle)
+        if n == 0:
             FAILURES.append('[轉寫錨點] %s：ho_master1.ino 裡找不到 %r' % (label, needle))
+        elif n > 1:
+            FAILURES.append('[轉寫錨點] %s：錨點在 ho_master1.ino 出現 %d 次，**不唯一** —— '
+                            '它可能命中的是旁邊的說明註釋而不是程式碼本身，'
+                            '等於這條錨點什麼都沒守著。請補上下一行讓它唯一（%r）'
+                            % (label, n, needle[:60]))
 
     # ── 方向 A2 ──
     for entry in ORDER_IN_INO:
@@ -951,6 +981,13 @@ def main():
             FAILURES.append('[順序錨點] %s：錨點不見了（%r / %r）' % (label, first, second))
         elif i > j:
             FAILURES.append('[順序錨點] %s：%r 排在 %r **之後**' % (label, first, second))
+        else:
+            # 同一個理由：不唯一的錨點比的可能是註釋裡的引用，不是程式碼的先後。
+            for who in (first, second):
+                if hay.count(who) > 1:
+                    FAILURES.append('[順序錨點] %s：錨點 %r 在比對範圍內出現 %d 次，'
+                                    '**不唯一** —— 順序檢查會比到不相干的位置'
+                                    % (label, who[:50], hay.count(who)))
 
     # ── 基準：全部情境必須通過 ──
     base_failed = run_all()

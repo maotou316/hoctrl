@@ -3689,10 +3689,17 @@ void updateOtaSession(unsigned long now) {
   //   1. 它只讓開 master 這端的送出。**目標 slave 收不收得到那封 CMD，這裡管不著** ——
   //      plan 決定 1(b) 的更正框寫得很清楚：抹除窗口內的靜默漏包，補送以 MAC 層 ACK
   //      為判準，**接不住那一種**。本段沒有改變那件事。
-  //   2. 群組 job 有 6 秒 wall-clock 上限（GROUP_JOB_MAX_MS），所以暫停最長 6 秒；
-  //      但**連續多道群組指令**會讓轉送被反覆讓開，總時長沒有上界 ——
-  //      兜底是 OTA_SESSION_MAX_MS（而暫停期間 otaSessionStart 也被往後移，
-  //      所以那個兜底在暫停期間同樣不會開火）。
+  //   2. 群組 job 有 6 秒 wall-clock 上限（GROUP_JOB_MAX_MS），所以**單次**暫停最長 6 秒；
+  //      連續多道群組指令會讓轉送被反覆讓開，**累計時長本身沒有上界**
+  //      （暫停期間 otaSessionStart 也被往後移，所以 OTA_SESSION_MAX_MS 不會開火）。
+  //      **但那不代表會無聲卡住**：真正封頂它的是 slave 端的 OTA_SLAVE_IDLE_MS ——
+  //      連續 30 秒沒收到任何 OTA 封包，那台會自己 Update.abort() 並清掉工作階段
+  //      （見 ho_slave1.ino 的 loop()）。之後 master 送的資料包會因為 otaActive 為 false
+  //      而被靜默丟棄，走完 8 輪區塊重試後報 espnow_fail。
+  //      也就是說**這條路徑的結局是有界的誠實紅燈**（最壞約 30 秒 + 重試時間），
+  //      不是無限期停擺；而且要撞到它得有 5 道以上背靠背、中間毫無空隙的群組指令。
+  //      （前一版這裡寫的是「總時長沒有上界」就停住，那句話字面為真但**比實情悲觀**，
+  //       會讓讀的人以為存在一個無界的停擺窗口。）
   //   3. 它不涵蓋 OTA_VERIFYING：那個階段一封封包都不送，沒有要讓的東西。
   static unsigned long otaGroupPauseSince = 0;
   if (otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_END_SENT) {

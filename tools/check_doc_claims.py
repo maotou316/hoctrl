@@ -30,7 +30,7 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
                 `esp_ota_set_boot_partition` / `#include <Update.h>` / `Update.begin(`
                 / `setRedirectLimit` / `HTTPC_STRICT_FOLLOW_REDIRECTS`
                 / `HTTPC_FORCE_FOLLOW_REDIRECTS`
-  9. LR 掛鉤 —— `otaSessionBusy()` 的呼叫點數量必須仍是 2
+  9. LR 掛鉤 —— `otaSessionBusy()` 的呼叫點數量必須仍是 **3**（定義 1 ＋ 重入檢查 2）
                 （readme 宣稱「LR 互斥守衛現在並不存在」，這條讓那句話會過期時吵）
  10. 文件必含 —— 「宣告某道保護不存在」的句子本身不得被刪（方向 9 的另一半）
  11. 假綠燈  —— `otaFinish()` 的函式本體不得出現「已更新到」
@@ -156,6 +156,13 @@ HIT_IN_SOURCE = [
     ('CR1：群組指令期間轉送讓開', '[OTA] 群組指令進行中，轉送讓開（安全指令優先於 OTA；計時器一併暫停）'),
     ('MJ3：心跳佇列滿要重試',   '⚠ [心跳] 送出佇列滿，這一則沒進佇列；不推進計時器，下一輪 loop() 立刻重試'),
     ('MJ4：送出失敗彙總',       '[OTA] 轉送期間單播送出失敗 %u 次（累計，每 5 秒彙總一行）'),
+    # ── 下面三條 ota_relay_sim.py **沒有模型**（它不模擬心跳、不模擬群組指令、
+    #    也沒有 5 分鐘總上限），所以只能由這裡的逐字錨點守。
+    #    A 族第 20 次：這三項原本兩支腳本都沒守著，可以原樣改回去而不被發現。
+    ('MJ3：心跳只在成功進佇列時才推進計時器', 'if (sendHeartbeat()) lastBeat = now;'),
+    ('MJ6：讓開期間三個計時器都要順延', 'otaSessionStart += paused;'),
+    ('MJ7：OTA_VERIFYING 不受 5 分鐘總上限管',
+     'if (otaPhase != OTA_SUCCESS && otaPhase != OTA_FAILED && otaPhase != OTA_VERIFYING &&'),
     ('轉送：收包 log 排除 ACK', 'if (header.type != HO_PKT_OTA_ACK) {'),
 ]
 
@@ -474,11 +481,14 @@ def main():
                                 % (lineno, pat, line.strip()[:80]))
 
     # ── 方向 9：otaSessionBusy() 的呼叫點數量（Phase 5 技術債的防腐）──
-    # ho_master1/readme.md 白紙黑字寫著「除了 otaStart() 自己的重入檢查以外
-    # **沒有任何呼叫端**，所以『OTA 進行中拒絕切 LR』這道守衛現在並不存在」。
-    # 那句話會在 Phase 5 有人補上守衛的當天變成假的 —— 而假的方向剛好是
-    # 「文件低估了保護」→ 下一個人以為還沒做、又做一次；或反過來被當成已經做了。
-    # 所以把「呼叫點數量」釘住：定義 1 處 + otaStart() 內 1 處 = 2。
+    # ho_master1/readme.md 白紙黑字寫著「目前的呼叫端只有兩處，而且兩處都是
+    # 『同時只能有一個工作階段』的重入檢查，所以『OTA 進行中拒絕切 LR』這道守衛
+    # 現在並不存在」。那句話會在 Phase 5 有人補上守衛的當天變成假的 —— 而假的方向
+    # 剛好是「文件低估了保護」→ 下一個人以為還沒做、又做一次；或反過來被當成已經做了。
+    # 所以把「呼叫點數量」釘住：**定義 1 處 + otaStart() 1 處 + otaRelayStaged() 1 處 = 3**。
+    # （B 族第 15 次：Task 4 把呼叫點加到 3 之後，這一叢敘述有三處還寫著「= 2」，
+    #  就長在 `if (n_busy != 3):` 的正上方 —— 而上一輪的 MJ5 修的正是這一叢。
+    #  判準改了就要回頭掃自己的散文，數字型的敘述尤其容易漏。）
     #
     # **它擋不住什麼**：它只數字面出現次數。有人加了呼叫端**同時**改掉這個
     #   期望值卻不改 readme，它就會靜靜通過；它也不檢查那個呼叫端是不是
@@ -722,19 +732,89 @@ def main():
                 failures.append('[轉送燈號] OTA_VERIFYING 區塊用了會過期的 otaTargetIdx：'
                                 'ho_master1.ino:%d %s' % (lineno, line.strip()[:80]))
 
-        # (丙) 禁止析取：版本回檢按設計是純合取，任何 `||` 都是多開的綠燈路徑。
+        # (丙) 禁止析取與三元：版本回檢按設計是**純合取**，
+        # 任何 `||` 或 `?:` 都是多開的綠燈路徑。
         # **這一條才是擋住 W2' 的主力** —— 逐字錨點只是剛好因為尾巴含 `) {` 而
         # 附帶抓到（那是意外覆蓋，不是設計；M10 當初成立也是同一個意外，照實記）。
-        for ln in verifying.split(chr(10)):
-            if ln.lstrip().startswith('//'):
-                continue
-            if '||' in ln:
-                failures.append('[轉送燈號] OTA_VERIFYING 區塊出現 `||`：%s'
-                                '／版本回檢按設計是純合取，析取等於多開一條綠燈路徑'
-                                '（例如把版本相等換成「或已經等了 60 秒」）。'
-                                '若真的需要析取，那是**中斷器**：請先確認新寫法沒有'
-                                '放寬任何一條硬性前提，再更新這條規則'
-                                % ln.strip()[:80])
+        #
+        # **範圍限定在「守衛的條件式」之內**，不是整個 case 區塊（複審實測）：
+        # 整段禁的話，加一行純診斷 `if (vIdx < 0 || !online) Serial.println(...)`
+        # 就會變紅 —— 而這支腳本自己在方向 9 才剛寫過「正當重構誤觸會養成
+        # 把期望值 +1 的反射，那等於這道檢查失效」。誤觸不是零成本。
+        #
+        # **一起禁 `?:` 的理由**：三元版的 W2'
+        #（`waited ? true : 三段相符`）**穿得過逐字錨點與 `||` 的禁令**，
+        # 上一輪是靠 ota_relay_sim.py 的括號差異才被擋下來的 —— 那是運氣，不是規則。
+        #
+        # **它擋不住什麼**：只看條件式那幾行的字面。把析取搬到條件式**外面**
+        #（先算一個 bool 再拿進來，例如 `bool ok = a || b;`）它抓不到 ——
+        # 那一種要靠順序不變量與 ota_relay_sim.py 的情境。
+        gi = verifying.find('if (otaHasVersion && vIdx >= 0 &&')
+        gj = verifying.find('slaves[vIdx].fwPatch == otaVerPatch')
+        if gi >= 0 and gj > gi:
+            guard_expr = verifying[gi:gj]
+            for bad, why in (('||', '析取等於多開一條綠燈路徑（例如「或已經等了 60 秒」）'),
+                             ('?', '三元運算子同樣是多開一條路徑，而且穿得過 `||` 的禁令')):
+                if bad in guard_expr:
+                    failures.append('[轉送燈號] OTA_VERIFYING 的守衛條件式裡出現 `%s`：%s。'
+                                    '版本回檢按設計是純合取。若真的需要，那是**中斷器**：'
+                                    '請先確認新寫法沒有放寬任何一條硬性前提，再更新這條規則'
+                                    % (bad, why))
+
+    # ── N1：**程式碼自己指名的危險方向，原本沒有任何錨點守著** ──
+    #
+    # `case OTA_END_SENT:` 裡逐字寫著「拿一個偏早的時刻當 OTA_VERIFYING 的起點，
+    # 會讓第 (c) 條前提被**重開機之前**就送達的那份狀態回報滿足 —— 那是往假綠燈的
+    # 方向」。複審實測：把那兩行的 `millis()` 換成 `otaSessionStart`，
+    # **兩支腳本全綠、前提 (c) 整條失效** —— 目標本來就是目標版本時，
+    # 連重開機都不必就會印「已更新到」。
+    #
+    # 規則做成機械的：**全檔對 `otaPhaseStart` 的指派只能是 `millis()`**
+    #（唯一的例外是讓開段的 `+= paused`，那是順延不是重設）。
+    #
+    # **它擋不住什麼**：只認直接指派的字面。先把一個偏早的時刻存進別的變數
+    # 再 `otaPhaseStart = thatVar;` 會被抓到（RHS 不是 millis()），
+    # 但 `otaPhaseStart = millis() - 60000;` 會被抓到、
+    # 而 `unsigned long t = millis(); … otaPhaseStart = t;` 也會被抓到（RHS 不是字面的
+    # millis()）—— 代價是這條規則**不允許任何合法的重構**，它是中斷器。
+    for lineno, line in code_lines:
+        if 'otaPhaseStart' not in line:
+            continue
+        m = re.search(r'otaPhaseStart\s*(\+?=)\s*([^;]+);', line)
+        if not m:
+            continue
+        op, rhs = m.group(1), m.group(2).strip()
+        if op == '+=':
+            if rhs != 'paused':
+                failures.append('[VERIFYING 起點] ho_master1.ino:%d otaPhaseStart += %s'
+                                '（只允許讓開段的 `+= paused`）' % (lineno, rhs))
+            continue
+        if rhs not in ('millis()', '0'):
+            failures.append('[VERIFYING 起點] ho_master1.ino:%d otaPhaseStart = %s —— '
+                            '**只能指派 millis()**。拿一個偏早的時刻當起點，'
+                            '會讓版本回檢的第 (c) 條前提被「重開機之前」送達的舊回報滿足，'
+                            '那是假綠燈（程式碼在 OTA_END_SENT 裡就寫著這句話，'
+                            '而在補上這條規則之前沒有任何錨點守著它）' % (lineno, rhs))
+
+    # ── N2：名冊上的版本欄位只能由「slave 自己回報」與「addSlave() 的初值」寫 ──
+    # 複審的 N2：在 VERIFYING 裡等 60 秒就把 slaves[vIdx].fw* 改寫成目標版本
+    # → 版本比對必然相等 → 全綠。那不是「回檢」，是 master 自己填答案。
+    #
+    # **它擋不住什麼**：只數 `.fwMajor =` 這個字面的出現次數，是**中斷器不是守衛**——
+    # 它只保證「有人動了寫入點就會停下來看一眼」，不保證新增的那個寫入點是錯的。
+    # 用別的寫法（memcpy 整個 struct、透過指標）它一個都抓不到。
+    # `=(?!=)` 是必要的：少了那個否定環視，版本**比對**那一行
+    # （`slaves[vIdx].fwMajor == otaVerMajor &&`）也會被算成寫入點。
+    fw_writes = [(n, l) for n, l in code_lines
+                 if re.search(r'\.fwMajor\s*=(?!=)', l)]
+    if len(fw_writes) != 4:
+        failures.append('[版本來源] `.fwMajor =` 的非註釋寫入點有 %d 處（期望 4：'
+                        'loadSlaves() 的初值、addSlave() 的初值、'
+                        'onEspNowRecv() 的 HO_PKT_STATE 分支、'
+                        'fakeSlavesForCapacityTest() 的假值）。'
+                        '版本回檢比對的就是這個欄位 —— 多一個寫入點就要先問'
+                        '「那份版本是不是 slave 自己回報的」：%s'
+                        % (len(fw_writes), [n for n, _ in fw_writes]))
 
     end_sent = block_of('case OTA_END_SENT: {', 'case OTA_VERIFYING: {', 'OTA_END_SENT')
     if end_sent is not None:
