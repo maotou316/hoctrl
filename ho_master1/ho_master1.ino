@@ -382,10 +382,17 @@ const size_t STATUS_GROUP_MAX_BYTES = 120;
 //       31 這個數字整個掛在這一條上。把陣列放大就會靜靜推翻整個上界，
 //       而 static_assert 用的是常數、抓不到。
 //
-// **這四條前提現在都有機械檢查**（`tools/check_doc_claims.py` 方向 19，
+// **這四條前提各有一道機械檢查**（`tools/check_doc_claims.py` 方向 19，
 // Task 5 複審第 2 輪 N2）：白名單字元集整段釘住、otaTargetId 的寫入點必須全部
 // 落在 otaSetTarget()／fakeOtaForCapacityTest() 之內、兩個字元陣列的宣告逐字釘住、
 // otaPhaseName() 與 otaFail() 的字串字面長度逐一量過。
+//
+// ⚠ **「各有一道檢查」不等於「都被封住了」**（I-3，複審第 3 輪把這句話的分寸改回來）：
+//   前提 (3) 的那道檢查是**一張函式名白名單**。第一版漏了 `strlcpy`，複審在
+//   update_slave 的 bad_json 分支加一行 `strlcpy(otaTargetId, id, …)` 就整條繞過去
+//   ——三支工具全綠、編得過，而 `id` 完全來自遠端。名單已補齊，但
+//   **「先把 otaTargetId 指派給指標再寫」這一類寫法它原理上驗不到**。
+//   方向 19 的註釋裡逐條列了驗不到的寫法。這裡照實寫，不要再讀成「已經封死」。
 //
 // **它擋不住什麼**：
 //   - 這個常數本身只是「預算上界」，不是對 otaPhaseName()／otaErrCode 的檢查；
@@ -2542,8 +2549,15 @@ void printHelp() {
   Serial.println("                 不寫 NVS、不動名冊內容，重開機或重新配對即恢復");
   Serial.println("  fakeslaves <n> 測試用：把名冊灌成 n 台假 slave，實測容量（不寫 NVS；");
   Serial.println("                 灌入後到重開機前，pair／unpair 會被擋下，避免假 MAC 寫進 NVS）");
+  // ⚠ I-1（複審第 3 輪）：這裡原本寫「清除方式同 fakeota」，**那是假的**。
+  //   fakeota 的第一種清法是「重開機讓 master 重發真實狀態壓過去」，
+  //   而這 n 台的 MAC 是捏造的、不寫 NVS —— 重開機後名冊裡沒有它們，
+  //   publishSlaveStatus() 再也不會碰那些 topic，retained 訊息會**永久**留著。
+  //   照那句話做的人會以為清乾淨了，實際上 App 會一直看到 20 台不存在的設備顯示在線。
+  //   正確說法見 ho_master1/readme.md 與 docs/phase2b-regression-checklist.md 第 3 項結尾。
   Serial.println("                 ⚠ 已連上 broker 時，這 n 台會以 retain 壓上各自的 status topic，");
-  Serial.println("                 清除方式同 fakeota");
+  Serial.println("                 而重開機後名冊沒有它們、master 再也不會發那些 topic ——");
+  Serial.println("                 只能手動對每一條 topic 發空 payload 的 retain 訊息才清得掉");
   Serial.println("  fakeota       測試用：把 ota 欄位灌成最壞值（不啟動工作階段、不寫 NVS），");
   Serial.println("                 配合 fakeslaves 20 → fakeota → jsonsize 實測容量；");
   Serial.println("                 量到的 phase 是 idle（4 字元），記錄時要加回 8 bytes");

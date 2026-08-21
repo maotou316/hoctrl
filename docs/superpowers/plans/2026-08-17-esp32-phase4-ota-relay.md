@@ -514,8 +514,10 @@ OTA 進度改掛在 master 狀態的**單一頂層物件**上 —— 反正一�
 > | `MQTT_BUFFER_SIZE` | 3328 | **3840** |
 > | `static_assert` | `2420/96 = 25 ≥ 20` | **`2844/112 = 25 ≥ 20`**（餘裕同樣是 5 台） |
 >
-> 本節其餘內容（`ota` 物件的欄位與 118→128 的實算、`phase`／`error` 必須走查表
-> 函式、`fakeota` ＋ `jsonsize` 實測）**全部仍然有效**，Task 5 照做即可。
+> 本節其餘內容（`ota` 物件的**欄位組成**、`phase`／`error` 必須走查表函式、
+> `fakeota` ＋ `jsonsize` 實測）仍然有效，Task 5 照做即可。
+> **但「118→128 的實算」那一句已被 Task 5 複審第 2 輪推翻**：正確的合計是 **119**
+>（`"target"` 那一項是 31 不是 30，見下方 §4.2 表格的更正框）。128 這個結論不變。
 >
 > **另外：Task 2 與 Task 3 各自加上「WROOM flash ≤ 95%（≤ 1,930,035 / 2,031,616）」
 > 的硬門檻**，理由與算法見 `docs/phase4-flag-day-upgrade.md` 第 3.6 節。
@@ -527,7 +529,7 @@ OTA 進度改掛在 master 狀態的**單一頂層物件**上 —— 反正一�
 | 片段 | bytes |
 |---|---|
 | `"ota":{` | 7 |
-| `"target":"hoban-aabbccddeeff",` | 30 |
+| `"target":"hoban-aabbccddeeff",` | 30 ⚠ **應為 31**（見表下更正框） |
 | `"phase":"<最長 12 字元>",` | 23 |
 | `"progress":100,` | 15 |
 | `"size":2031616,` | 15 |
@@ -2312,6 +2314,16 @@ commit 訊息要點名：
 
 - [ ] **Step 1: 重算容量常數（本 Task 最重要的一步）**
 
+> **⚠ Task 5 複審第 2／3 輪的更正（N4／M-5）：下面這段範本的數字已修正過，
+> 而且它與 §4.2 那張表**不再一致**（那張表在本檔往上約 1,800 行，它自己也有一個更正框）。**
+> - `"target"` 那一項是 **31** 不是 30：30 是拿範例 `hoban-aabbccddeeff`（18 字元）算的，
+>   真正的上界是 `otaTargetId[20]` 容得下的 **19** 字元。合計是 **119** 不是 118。
+> - 前提是**四**條不是兩條 —— 原本的範本只寫了 (1)(2)，
+>   而 (3)「不含需要 JSON 逃逸的字元」與 (4)「陣列容量 20 bytes」是隱含的。
+> - `STATUS_BASE_WITHOUT_OTA_MAX_BYTES = 512` / `= 640` 那兩行**早就過時**
+>   （Task 1 已拆成 `WITHOUT_GROUP_OTA` 480 ＋ `GROUP` 120 ＋ `OTA` 128 ＝ **728**）。
+> **以 `ho_master1/ho_master1.ino` 的常數註釋為準，不要照抄這段範本的數字。**
+
 把 Phase 2b 的 `STATUS_BASE_MAX_BYTES` 改成**分項相加**：
 
 ```cpp
@@ -2328,15 +2340,19 @@ const size_t STATUS_BASE_WITHOUT_OTA_MAX_BYTES = 512;
 
 // Phase 4 新增的 ota 物件上界。逐項實算（最壞值）：
 //   "ota":{                                    =   7
-//   "target":"hoban-aabbccddeeff",             =  30
+//   "target":"<最長 19 字元>",                  =  31
 //   "phase":"<最長 12 字元>",                   =  23
 //   "progress":100,                            =  15
 //   "size":2031616,                            =  15
 //   "error":"<最長 16 字元>"                    =  26
 //   } 與外層逗號                                =   2
-//                                          合計 = 118 → 取 128
-// ⚠ 上界成立的前提是 otaPhaseName() 的字串 ≤ 12 字元、錯誤碼 ≤ 16 字元。
-//    改動那兩張表時必須回頭重算這個常數。
+//                                          合計 = 119 → 取 128
+// ⚠ 上界成立的前提有**四**條：(1) otaPhaseName() 的字串 ≤ 12 字元；
+//    (2) 錯誤碼 ≤ 16 字元；(3) otaTargetId 不含任何需要 JSON 逃逸的字元
+//    （Task 5 起它的內容可能來自遠端的 update_slave）；
+//    (4) otaTargetId 的容量是 20 bytes（＝最長 19 字元，31 這個數字掛在這一條上）。
+//    改動那兩張表、那個陣列容量、或 otaSetTarget() 的字元過濾時，
+//    都必須回頭重算這個常數。
 const size_t STATUS_OTA_MAX_BYTES = 128;
 
 const size_t STATUS_BASE_MAX_BYTES =

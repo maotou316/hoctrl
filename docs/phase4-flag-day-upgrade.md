@@ -268,7 +268,7 @@ Task 5 一放進去就撞牆。
 | `SLAVE_ENTRY_MAX_BYTES` | 104 | **112** | 單筆最壞實算 97 → **105**（`,"exe":0` ＝ 8 bytes） |
 | `STATUS_BASE_WITHOUT_GROUP_OTA_MAX_BYTES` | （併在 640 裡） | **480** | 317＋75＋19＋42＋27，剛好整數 |
 | `STATUS_GROUP_MAX_BYTES` | （併在 640 裡，註釋寫 96） | **120** | 逐欄位實算 **112**（移除 `cid` 後） |
-| `STATUS_OTA_MAX_BYTES` | 不存在 | **128** | plan 決定 4.2 的實算 118。**預留額度，Task 5 才會真的發出** |
+| `STATUS_OTA_MAX_BYTES` | 不存在 | **128** | 逐項實算 **119**（plan 決定 4.2 寫 118，`"target"` 那一項用範例的 18 字元算成 30，而上界是 `otaTargetId[20]` 的 19 字元＝31；Task 5 複審第 2 輪 N4 更正）。**預留額度，Task 5 才會真的發出** |
 | `STATUS_BASE_MAX_BYTES` | 640（魔術數字） | **728**（三項相加） | 480＋120＋128 |
 | `STATUS_BUF_SIZE` | 3072 | **3584** | 見下 |
 | `MQTT_BUFFER_SIZE` | 3328 | **3840** | 3584＋5＋2＋31 ＝ 3622，取 3840 |
