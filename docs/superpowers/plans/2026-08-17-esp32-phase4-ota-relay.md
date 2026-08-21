@@ -2369,7 +2369,7 @@ const size_t STATUS_BASE_MAX_BYTES =
 > |---|---|
 > | `"staged_only"` | 只下載到 master 暫存區、MD5 已核對，**零 slave 接觸**（`OTA_STAGED_OK`，走 `otaFinishStagedOnly()`） |
 > | `"verifying"` | 已整份轉送完，**slave 親口回報校驗通過**，等它重開機回線 |
-> | `"unconfirmed"` | 已送出 `OTA_END` 但一封回應都沒收到，改用版本回檢兜底：**沒有任何 slave 正面證據**（Task 4 放寬入口的那一條） |
+> | `"unconfirmed"` | 已送出 `OTA_END`，但 10 秒內**沒收到整份校驗結果**（`OTA_OK` 或 `ERR_*`），改用版本回檢兜底：**沒有「校驗通過」這份證據**。⚠ 不是「一封回應都沒收到」—— BEGIN 的 READY 與約 18 封窗口 ACK 本來就收過了（Task 4 放寬入口的那一條） |
 > | `"success"` | 版本回檢的三條硬性前提全部成立 |
 >
 > 兩者的長度都是 11 字元，仍在 `STATUS_OTA_MAX_BYTES` 假設的 12 字元之內。
@@ -2647,7 +2647,7 @@ commit 訊息必須說明：
 | 8 | 完整轉送：MQTT 對 master 送 `update_slave:{...}`，slave 更新成功並重啟 | 主要驗收條件 |
 | 9 | 轉送全程（30~90 秒）**其他 slave 一台都不失聯、繼電器不被強制關閉** | **失敗判定，本階段最重要的一條** |
 | 10 | 轉送期間 App／MQTT Explorer 看得到 `ota.phase` 由 `downloading` → `relaying` → `verifying` → `success`，`progress` 遞增 | |
-| 11 | 轉送期間目標 slave 的代發 status 是 `"updating"` 且帶 `ota_progress` | |
+| 11 | 轉送期間目標 slave 的代發 status 是 `"updating"` 且帶 `ota_progress`。**⚠ 判準必須拆成兩段（Task 5 複審 MJ5）**：**(a) MQTT 層** 用訂閱工具看 `hoban/<目標 ID>/status` 的 `status` 是不是 `"updating"`、有沒有帶 `ota_progress` —— **這一段現在就該 PASS**；**(b) App 畫面**會顯示「離線」，那是**已知的 App 端缺口**，記成「已知不符」、**不是韌體回歸失敗**。原因：App 的解析是 `data['status'] == 'online' ? online : offline`（`devices_page.dart` 與 `device_detail_page.dart` 兩個生產路徑都是），`"updating"` 會落到 **offline**；`DeviceStatus.updating` 確實存在，但它的**唯一產生點是舊的 `updating:` 純字串格式**。**不要在韌體側硬湊**（改回 `"online"` 會讓一台正在重開機、繼電器已歸零的設備顯示成正常在線 —— 那是誤綠）。另：App 的 `lib/` 對 `ota` 物件**零讀取點**，所以 `staged_only`／`unconfirmed` 不會讓 App 出錯 | |
 | 12 | slave 重啟後回線，master 印出 `[OTA] 完成：… 已更新到 x.y.z`，`ota.phase` 變 `success` | 驗證版本回檢。**這一行只由 Task 4 的 `OTA_VERIFYING` 比對 `slaves[].fwMajor/Minor/Patch` 之後印出**，是「slave 自己回報了新版本」的證據；Task 3 的 `otadl`（第 3 項）不會、也不得印出它 |
 | 13 | **轉送中途把目標 slave 拔電**：master 重試後 `[OTA] 失敗：espnow_fail` 或 `slave_timeout`；**slave 復電後仍是舊韌體、可正常配對與控制** | **不變磚的正面驗證，失敗判定** |
 | 14 | **轉送中途把 master 拔電**：slave 印出 `[OTA] 已中止：超過 30 秒沒收到 OTA 封包`，**開機分區未變動** | **失敗判定** |
@@ -2655,7 +2655,7 @@ commit 訊息必須說明：
 | 16 | 轉送進行中再送一次 `update_slave`：master 印出「已有工作階段進行中」，`ota.error` 為 `busy`，**原工作階段不受影響** | 決定 5 |
 | 17 | 對繼電器正開著的 slave 送 `update_slave`（不帶 force）：`ota.error` 為 `relay_on` 且**沒有開始下載** | 決定 1 的附帶保護 |
 | 18 | 同上但帶 `"force":true`：正常開始 | |
-| 19 | **容量驗證**：`fakeslaves 20` → `fakeota` → `jsonsize`，記錄實際 bytes（**加回 phase 字串的 8 bytes**），必須 < 3072 且**沒有** `slaves_truncated` | |
+| 19 | **容量驗證**：`fakeslaves 20` → `fakeota` → `jsonsize`，記錄實際 bytes（**加回 phase 字串的 8 bytes**），必須 < 3584（`STATUS_BUF_SIZE`，Task 1 已由 3072 放大；本項原本寫 3072 是過期值）且**沒有** `slaves_truncated` | |
 | 20 | 同上狀態實際發布一次 `status`，MQTT Explorer 收到的 JSON **語法完整、20 筆條目齊全、`ota` 物件完整** | 「靜默截斷」的正面驗證 |
 | 21a | 轉送期間送 `ALL:ON`（**App 的關門路徑**）與 `ALL:OFF`：**目標以外的每一台**都立刻動作 | 安全指令優先權，**失敗判定** |
 | 21b | 同一次操作，**目標那一台**有沒有出現在 `⚠ [群組]   無執行證明：…`：記錄有沒有、幾次 | **觀察項，不是失敗判定** —— 目標在 60~190 ms 的 flash 抹除窗口內可能靜默漏包，而補送以 MAC 層 ACK 為判準、接不住（決定 1(b) 的更正框）。**判成 FAIL 會讓實測者去修一個本階段沒有解的東西** |

@@ -362,6 +362,12 @@ const size_t STATUS_GROUP_MAX_BYTES = 120;
 //   ＋ `"progress":100,` 15 ＋ `"size":2031616,` 15 ＋ `"error":"<最長 16 字元>"` 26
 //   ＋ `},` 2 = 118，取 128。
 //
+// **上界成立的前提有三條，缺一不可**：
+//   (1) otaPhaseName() 的字串 ≤ 12 字元；(2) 錯誤碼 ≤ 16 字元；
+//   (3) **otaTargetId 不含任何需要 JSON 逃逸的字元** —— Task 5 起它的內容
+//       可能來自遠端的 update_slave，19 個 `"` 會逃逸成 38 bytes、把 118 撐到約 139。
+//       這一條由 otaSetTarget() 的字元過濾保證（見該函式，MJ7）。
+//
 // **它擋不住什麼**：這只是「預算上界」，不是對 otaPhaseName()／otaErrCode 的檢查。
 // 若哪天 phase／error 字串超過 12／16 字元，這個常數不會自己變大，
 // static_assert 也抓不到 —— plan 決定 4.2 因此要求那兩個字串必須走查表函式、
@@ -565,7 +571,10 @@ bool     otaEndQueued = false;
 // 「END 送出後 10 秒沒回應也進來」（那是為了消滅兩種單封丟包造成的假紅燈）。
 // 於是「verifying」這個階段名底下混著兩種完全不同的事實：
 //   (甲) slave 親口回報整份校驗通過，正在重開機   → 有正面證據
-//   (乙) 一封回應都沒收到，只是改用版本回檢兜底   → **零 slave 正面證據**
+//   (乙) 10 秒內沒收到**整份校驗結果**，改用版本回檢兜底 → **沒有「校驗通過」這份證據**
+//        ⚠ 不是「一封回應都沒收到」—— 要抵達 OTA_END_SENT 本來就必須先收過
+//        BEGIN 的 READY 與約 18 封窗口 ACK；連那 10 秒窗口內都可能再收到一封
+//        READY（同一個 case 往上 15 行就是 `if (otaAckStatus == HO_OTA_READY) return;`）。
 // 對 App 而言把 (乙) 也叫「verifying」等於宣稱一件沒發生的事，所以 otaPhaseName()
 // 用這個旗標把 (乙) 報成 "unconfirmed"。
 //
@@ -576,7 +585,12 @@ bool     otaSlaveVerified = false;
 // ── Task 5：階段轉換後要不要在這一輪 loop() 立刻補發一次 master 狀態 ──
 // 進度變化**不**設它（274 個區塊每塊發一次，最壞每次 publish 吃 10 秒級的
 // socket 阻塞，直接撞破 slave 的 30 秒失聯門檻）；只有階段轉換與指令被拒絕才設。
-bool     otaStatusDirty = false;
+// volatile：otaFail() 的註釋自己寫著它可能由 onEspNowRecv()（**WiFi task**）
+// 的路徑間接觸發，而 otaFail() 會寫這個旗標。沿用本檔既有的無鎖慣例
+//（callback 只搬旗標、判斷都在 loop()），與 otaAckPending 那組同一個理由。
+// **它擋不住什麼**：volatile 不是原子操作，也不保證順序。這裡可接受的原因是
+// 最壞後果只有「多發或少發一次狀態」——少發的那一次會被 5／10 秒的週期補上。
+volatile bool otaStatusDirty = false;
 // ── 以下四個由 ESP-NOW callback（**WiFi task**）寫、由 loop() 讀 ──
 // 沿用本檔 slaves[] 既有的無鎖慣例：callback 只搬旗標，一切判斷與後續送出都在 loop()。
 // otaAckPending **最後**才設為 true，讓 loop() 讀到旗標時另外三個值已經寫好。
@@ -3188,8 +3202,10 @@ void otaBurst(const char* stage) {
 //   "staged_only" ＝ 檔案下載到 master 的閒置分區、MD5 已核對，**零 slave 接觸**
 //                    （序列埠 otadl 的終點。目標 slave 的韌體一個位元都沒變）
 //   "verifying"   ＝ 已整份轉送完，**slave 親口回報校驗通過**，等它重開機回線
-//   "unconfirmed" ＝ 已送出 OTA_END 但一封回應都沒收到，改用版本回檢兜底：
-//                    **沒有任何 slave 的正面證據**（見 otaSlaveVerified）
+//   "unconfirmed" ＝ 已送出 OTA_END，但 10 秒內**沒收到整份校驗結果**
+//                    （OTA_OK 或 ERR_*），改用版本回檢兜底：**沒有「校驗通過」這份證據**。
+//                    ⚠ 這不代表「一封回應都沒收到」：先前的 READY 與窗口 ACK 本來就收過了
+//                    （見 otaSlaveVerified）
 //   "success"     ＝ 版本回檢的三條硬性前提全部成立（見 case OTA_VERIFYING）
 // 把它們合併成一個 "success" 就是 Task 3 的 MJ2 逐字警告過的假綠燈。
 const char* otaPhaseName() {
@@ -3417,6 +3433,10 @@ uint8_t otaProgressPercent() {
     if (otaTotalSize == 0) return 0;
     return (uint8_t)((uint64_t)otaDownloaded * 100 / otaTotalSize);
   }
+  // OTA_IDLE：上一場的 otaBlockBase／otaTotalChunks 都還留著，不歸零的話 App 會在
+  // 沒有任何工作階段的時候讀到一個非零進度（複審的 Minor）。target 與 error 刻意
+  // 留著當診斷殘值（otastat 靠它看上一次的失敗原因），但**進度歸零**。
+  if (otaPhase == OTA_IDLE) return 0;
   if (otaPhase == OTA_SUCCESS) return 100;
   // OTA_STAGED_OK：100% 指的是**暫存**做完了，不是 slave 更新完了。
   // 「100% 到底是什麼的 100%」由 phase 欄位回答（"staged_only"），不由這個數字回答。
@@ -3518,8 +3538,31 @@ bool otaParseUrlHost(const char* url) {
 // 那是「開錯門」的 MAC 版：兩個欄位各自指向不同的 slave。
 // 現在一律經由這裡：id 與 mac **一起**更新，解析不出 MAC 就把 mac 清成全 0，
 // 索引清成 -1（全 0 的 MAC 不是任何一台 slave，送不出去、也對不上任何名冊條目）。
+// ⚠ MJ7（Task 5 複審）：**otaTargetId 的內容從 Task 5 起可能來自遠端** ——
+//   update_slave 的 cmd["id"] 完全沒有格式限制就會走到這裡（解析不出 MAC 時
+//   一樣先 otaSetTarget() 再 otaFail("no_target")，那是刻意的：錯誤回報要帶著
+//   使用者打的那個 id）。而 STATUS_OTA_MAX_BYTES = 128 的實算假設
+//   `"target":"hoban-aabbccddeeff",` 只佔 30 bytes —— 那個假設只在「字串不需要
+//   JSON 逃逸」時才成立。19 個 `"` 或 `\` 會被 ArduinoJson 逃逸成 38 bytes，
+//   整個 ota 物件的最壞值會從 118 漲到約 139，**超過 128**。
+//
+//   所以在這裡把字元集收斂成 [0-9A-Za-z_.:-]，其餘一律換成 '?'（'?' 在 JSON
+//   裡不需要逃逸）。這樣「30 bytes」與 128 這個上界重新變成真的，而不是靠
+//   總預算的餘裕去吸收。
+//
+//   **它擋不住什麼**：它不驗這個 id 是不是一台真的 slave（那是 findSlave() 的事），
+//   也不縮短長度（otaTargetId[20] 的截斷本來就封頂在 19 字元）。
+//   被換成 '?' 的字元會讓序列埠與 App 顯示的 id 與使用者打的不完全一致 ——
+//   那是刻意的取捨：那條路徑必定以 no_target 收場，可讀性讓位給上界成立。
 void otaSetTarget(const char* slaveId, const uint8_t* mac) {
   snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
+  for (size_t i = 0; otaTargetId[i] != '\0'; i++) {
+    char c = otaTargetId[i];
+    bool safe = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                (c >= 'A' && c <= 'Z') || c == '-' || c == '_' ||
+                c == '.' || c == ':';
+    if (!safe) otaTargetId[i] = '?';
+  }
   if (mac != nullptr) {
     memcpy(otaTargetMac, mac, 6);
   } else {
@@ -3634,7 +3677,7 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
   otaStageOnly = stageOnly;
   otaBeginAttempt = 0;
   otaEndQueued = false;
-  otaSlaveVerified = false;   // 新工作階段：還沒有任何 slave 的正面證據
+  otaSlaveVerified = false;   // 新工作階段：還沒收到「整份校驗通過」這份證據
   otaStatusDirty = true;      // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
   otaAckPending = false;
   otaTxFailCount = 0;
@@ -3725,7 +3768,7 @@ bool otaRelayStaged(int n, const char* version, bool force) {
   otaStageOnly = false;
   otaBeginAttempt = 0;
   otaEndQueued = false;
-  otaSlaveVerified = false;   // 新工作階段：還沒有任何 slave 的正面證據
+  otaSlaveVerified = false;   // 新工作階段：還沒收到「整份校驗通過」這份證據
   otaStatusDirty = true;      // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
   otaAckPending = false;
   otaTxFailCount = 0;
@@ -4510,8 +4553,10 @@ void updateOtaSession(unsigned long now) {
       if (now - otaPhaseStart >= 10000) {
         Serial.println("[OTA] 10 秒沒收到校驗結果（OTA_END 或它的回覆掉了一封），"
                        "改用版本回檢判定：等它重開機回報版本");
-        // otaSlaveVerified 刻意**維持 false**：這條路徑一封 slave 的回應都沒收到，
-        // App 應該看到 "unconfirmed" 而不是 "verifying"（見 otaSlaveVerified 宣告處）。
+        // otaSlaveVerified 刻意**維持 false**：這條路徑 10 秒內沒收到**整份校驗結果**
+        //（OTA_OK 或 ERR_*），App 應該看到 "unconfirmed" 而不是 "verifying"。
+        // ⚠ 不是「一封回應都沒收到」：BEGIN 的 READY 與窗口 ACK 本來就收過了，
+        //   連這 10 秒內都可能再收到一封 READY（往上 15 行那條 return）。
         otaStatusDirty = true;   // 階段轉換：讓 loop() 這一輪就補發一次 master 狀態
         otaPhase = OTA_VERIFYING;
         otaPhaseStart = millis();
@@ -5197,9 +5242,14 @@ void buildStatusDoc(JsonDocument& doc) {
   //
   // **phase 是 App 唯一該拿來判斷「發生了什麼」的欄位**，progress 只是進度條：
   //   staged_only ＝ 只下載到 master 暫存區，**零 slave 接觸**（progress 100 是暫存的 100%）
-  //   unconfirmed ＝ 轉送完但沒有任何 slave 的正面證據，正在用版本回檢兜底
+  //   unconfirmed ＝ 轉送完但 10 秒內沒收到**整份校驗結果**，正在用版本回檢兜底
+  //                 （不代表「一封回應都沒收到」，見 otaPhaseName() 上方那張表）
   //   success     ＝ 版本回檢三條硬性前提全部成立
   //   （完整語義見 otaPhaseName() 上方那張表）
+  // ⚠ phase 是 "idle" 時，target 與 error 是**上一次工作階段的殘值**（刻意保留，
+  //   與 otastat 同一個理由：現場還看得到上一次失敗的目標與原因）。
+  //   progress 則已歸零（見 otaProgressPercent()）。App 在 phase == "idle" 時
+  //   **不應該**拿 target／error 當「現在正在做的事」。
   JsonObject ota = doc["ota"].to<JsonObject>();
   ota["target"]   = otaTargetId;
   ota["phase"]    = otaPhaseName();
@@ -5542,6 +5592,11 @@ void fakeOtaForCapacityTest() {
   otaBlockBase = otaTotalChunks;      // 讓 otaProgressPercent() 回 100（3 位數，最壞）
   Serial.println("[測試] ota 欄位已灌成最壞值（未啟動工作階段），請接著執行 jsonsize");
   Serial.println("       正確的驗證順序：fakeslaves 20 → fakeota → jsonsize");
+  Serial.println("⚠ [測試] 若當下已連上 broker，這些**捏造的 ota 欄位**會隨下一次狀態發布"
+                 "以 retain=true 壓上 hoban/<本機 ID>/status，而 retain 是永久保留、"
+                 "重開機也不會被自動清（與 fakeslaves 同一個坑）");
+  Serial.println("       清除方式：重開機後讓 master 重新發一次真實狀態壓過去，"
+                 "或用 MQTT 客戶端對該 topic 發一則空 payload 的 retain 訊息");
   Serial.println("⚠ [測試] jsonsize 量到的 phase 是 \"idle\"（4 字元）而非最壞的 12 字元，"
                  "記錄結果時要把 8 bytes 加回去再與 statusBuf 比較");
 }

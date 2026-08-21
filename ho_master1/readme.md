@@ -72,17 +72,33 @@ Phase 2a 起接上 WiFi + MQTT + BLE 配網，成為 App 與所有 slave 之間�
 | `ch <n>` | 測試用：切換 channel，驗證 slave 重掃 |
 | `droppeer <n>` | **測試用**：刪掉第 n 台的 ESP-NOW peer 但**保留名冊條目**，製造「在名冊上卻送不出單播」。回歸清單 8e 專用。不寫 NVS、不動名冊內容，重開機或重新配對即恢復。**傷害面**：App 對那台的個別開／關會**靜默失敗**到重開機為止；群組關門仍有效（主指令走廣播×3），但它會被誠實記成未送達 |
 | `fakeslaves <n>` | **測試用**：把名冊灌成 n 台假 slave，量狀態 JSON 容量用。MAC 是 `AA:BB:CC:DD:EE:<i>`，**`<i>` 是迴圈索引 0…n−1（不是 n）**，所以 `fakeslaves 20` 產生的 ID 是 `hoban-aabbccddee00` … `hoban-aabbccddee13`（**十六進位**）。**不寫 NVS**、**不註冊 ESP-NOW peer**。灌入後 `fakeSlavesActive` 會鎖住 `saveSlaves()` 直到重開機，避免假 MAC 經由後續的 pair／unpair 流程寫進 NVS 汙染真實名冊。**⚠ 若當下已連上 broker，master 會在約 0.75 秒後開始把這 n 台以 `retain=true` 發上去，而那些 topic 重開機後不會被覆蓋、永久留在 broker 上** —— 清除步驟見 `docs/phase2b-regression-checklist.md` 第 3 項結尾 |
-| `fakeota` | **測試用**（Phase 4 Task 5）：把 `ota` 物件灌成最壞值（最長 target／最長錯誤碼／`progress` 100／`size` 2031616），**不啟動任何工作階段、不寫 NVS**。驗證順序是 `fakeslaves 20` → `fakeota` → `jsonsize`。**⚠ 量到的 `phase` 是 `"idle"`（4 字元）而不是上界假設的 12 字元，記錄結果時必須把 8 bytes 加回去再與 `statusBuf` 比較** |
+| `fakeota` | **測試用**（Phase 4 Task 5）：把 `ota` 物件灌成最壞值（最長 target／最長錯誤碼／`progress` 100／`size` 2031616），**不啟動任何工作階段、不寫 NVS**。驗證順序是 `fakeslaves 20` → `fakeota` → `jsonsize`。**⚠ 量到的 `phase` 是 `"idle"`（4 字元）而不是上界假設的 12 字元，記錄結果時必須把 8 bytes 加回去再與 `statusBuf` 比較**。**⚠ 與 `fakeslaves` 同一個坑**：若當下已連上 broker，這些**捏造的 `ota` 欄位**會隨下一次狀態發布以 `retain=true` 壓上 `hoban/<本機 ID>/status`，而預設伺服器清單含公用 broker、retain 是永久保留、韌體無法自動清。清除方式：重開機後讓 master 重新發一次真實狀態壓過去，或用 MQTT 客戶端對該 topic 發一則空 payload 的 retain 訊息 |
 | `jsonsize` | **測試用**：用 `buildStatusDoc()` + `measureJson()` 印出「實際會發布的那份 JSON」的大小，與 `statusBuf`／mqtt buffer 對照。不需連上 MQTT |
-
-> **`update_slave` 與 `ota` 狀態欄位的完整格式、每個 `phase`／`error` 值的語義，以及 App 該怎麼呈現，由 Task 6 補進本文件。** 在那之前，唯一權威來源是 `ho_master1.ino` 裡 `otaPhaseName()` 上方那張表與 `buildStatusDoc()` 的 `ota` 區塊。
-> **一句話版本**：`"staged_only"` ＝只下載到 master 暫存區、**零 slave 接觸**；`"verifying"` ＝ slave 親口回報整份校驗通過；`"unconfirmed"` ＝轉送完但**沒有任何 slave 正面證據**，正在用版本回檢兜底；`"success"` ＝版本回檢三條硬性前提全部成立。
 | `help` | 顯示說明 |
-| `otadl <n> <url>` | **測試用（Phase 4 Task 3）**：只跑「HTTPS 下載 → 寫進 master 自己的**閒置 OTA 分區**暫存 → 算 MD5」，**不轉送給 slave**（轉送要另外下 `otarelay`）。收尾印的是 `[OTA] 已暫存完成：… 「未轉送、未接觸任何 slave」…` 與 `[OTA] 工作階段 N 結束（目標 …，階段轉為 success）`，**兩行都不會出現「已更新到 x.y.z」** —— 那句話只由 Task 4 的版本回檢路徑印。（初版這裡是 `[OTA] 完成：%s 已更新到 x.y.z`，每跑一次 `otadl` 就宣稱一次 slave 已更新，是**假綠燈方向**的判準矛盾，已修掉。）會抹除閒置 OTA 分區（不動開機分區，master 不會變磚：全檔沒有任何一行呼叫 `esp_ota_set_boot_partition()`）。**固定帶 `force=true`**，因此**略過**「目標繼電器正開著就拒絕」那道保護。只接受 `https://` 開頭的網址 |
+| `otadl <n> <url>` | **測試用（Phase 4 Task 3）**：只跑「HTTPS 下載 → 寫進 master 自己的**閒置 OTA 分區**暫存 → 算 MD5」，**不轉送給 slave**（轉送要另外下 `otarelay`）。收尾印的是 `[OTA] 已暫存完成：… 「未轉送、未接觸任何 slave」…` 與 `[OTA] 工作階段 N 結束（目標 …，階段轉為 staged_only：只到 master 暫存區，未接觸任何 slave）`，**兩行都不會出現「已更新到 x.y.z」**（⚠ Phase 4 Task 5 起收尾那行的階段字串由 `success` 改成 `staged_only`：`otadl` 走的是 `otaFinishStagedOnly()` → `OTA_STAGED_OK`，與版本回檢成功的 `success` 是**兩個不同的終局階段**。拿舊字串當判準會把正確行為判成 FAIL） —— 那句話只由 Task 4 的版本回檢路徑印。（初版這裡是 `[OTA] 完成：%s 已更新到 x.y.z`，每跑一次 `otadl` 就宣稱一次 slave 已更新，是**假綠燈方向**的判準矛盾，已修掉。）會抹除閒置 OTA 分區（不動開機分區，master 不會變磚：全檔沒有任何一行呼叫 `esp_ota_set_boot_partition()`）。**固定帶 `force=true`**，因此**略過**「目標繼電器正開著就拒絕」那道保護。只接受 `https://` 開頭的網址 |
 | `otarelay <n> [版本] [force]` | **測試用（Phase 4 Task 4）**：把**已經在暫存分區裡**的那份韌體轉送給第 n 台（不下載、不碰網路），所以**要先跑過一次 `otadl`**；重開機後暫存資訊就沒了，會被拒絕（fail-closed，不去猜 flash 裡殘留的是什麼）。**轉送成功那台會重新開機**：繼電器會斷一次，而 C3 板開機瞬間還會短暫通電 —— 所以目標的 `relay != 0` 時**預設拒絕**，要做得在指令尾端加 `force`。**版本參數省略等同 `0.0.0`**，那會讓版本回檢的第 (a) 條前提不成立，**即使 slave 真的更新成功也必定走到 90 秒 `no_return`**（指令會先印警告）。⚠ 它不檢查暫存區裡那份映像到底是不是 slave 的韌體：拿 `otadl` 下載一份 **master** 的韌體再轉送出去，MD5 會過、分區會切換，那台 slave 重開機後會跑 master 的程式，只能拆下來接 USB 重燒 |
 | 轉送期間的**群組指令行為**（Task 4，務必照這個寫清單） | 兩件事都是刻意的：**(1) 轉送在群組安全指令期間整個讓開** —— `updateOtaSession()` 看到 `groupCmdActive()` 就直接 return，並把 `otaPhaseStart`／`otaWaitStart`／`otaSessionStart` 一起往後移（不移的話一次 6 秒的群組 job 會吃掉 8 輪區塊重試額度，把一場好好的轉送判成 `espnow_fail`）。序列埠會印 `[OTA] 群組指令進行中，轉送讓開…` 與 `[OTA] 群組指令收工，轉送恢復…`。**(2) 轉送期間，目標那一台在群組指令裡一律被記成「未送達」** —— `onEspNowSent()` 分不出這則 MAC 層 ACK 是哪一封封包的，而轉送每輪都在送單播，所以 `groupNoteUnicastAck()` 對那台一律拒絕歸因（`otaUnicastRecently()`）。**那是誤紅，不是「指令沒送到」**；補送迴圈會因此持續重送給它，對「一次要全部關」是正向的。**不修這一條的話是假綠燈＋補送整台跳過**，而那台依建構必然 `relay == 0`（門開著、正是 `ALL:ON` 要去關的那一台） |
 | 轉送 OTA 的**對外範圍** | Task 3 立下的硬性前提是：**⚠ Task 5 開 MQTT 入口之前，轉送 OTA 這條路徑不該對外。** 理由是當時 `otadl` 走的 `stageOnly` 路徑在 `OTA_STAGED` 直接把 `otaPhase` 設成 `OTA_SUCCESS`，而那時一台 slave 都沒被接觸 —— 只要有人把 `ota.phase` 發到 MQTT，App 就會顯示「更新完成」。**Task 5 開入口的同時把那個成因拆掉了**：`stageOnly` 改走 `otaFinishStagedOnly()`，終局階段是 `OTA_STAGED_OK`（對 App 是 `"staged_only"`），與版本回檢成功的 `"success"` 分開。序列埠的 `otadl` 在 MQTT 入口開了之後**照樣可以被下**，所以「MQTT 入口只送 `stageOnly=false`」本身不構成保護 —— 真正的保護是那兩條路徑有兩個不同的對外字串（`tools/check_doc_claims.py` 方向 16）。 |
 | `otastat` | 印出目前 OTA 工作階段的階段（`otaPhaseName()`）、目標、已下載／總位元組數與錯誤碼。工作階段結束回到 `idle` 之後**錯誤碼刻意不清空**，所以還看得到上一次的失敗原因 |
+
+> **`update_slave` 與 `ota` 狀態欄位的完整格式、每個 `phase`／`error` 值的語義，以及 App 該怎麼呈現，由 Task 6 補進本文件。** 在那之前，唯一權威來源是 `ho_master1.ino` 裡 `otaPhaseName()` 上方那張表與 `buildStatusDoc()` 的 `ota` 區塊。
+>
+> **一句話版本**：`"staged_only"` ＝只下載到 master 暫存區、**零 slave 接觸**；`"verifying"` ＝ slave 親口回報整份校驗通過；`"unconfirmed"` ＝轉送完但 **10 秒內沒收到整份校驗結果**（`OTA_OK`/`ERR_*`），正在用版本回檢兜底（**不是「一封回應都沒收到」**）；`"success"` ＝版本回檢三條硬性前提全部成立。
+>
+> **`ota.phase == "idle"` 時，`ota.target` 與 `ota.error` 是上一次工作階段的殘值**（刻意保留，與 `otastat` 同一個理由）；`ota.progress` 已歸零。App 在 `idle` 時不應該拿 `target`／`error` 當「現在正在做的事」。
+
+### ⚠ 已知不相容：App 目前會把代發的 `status:"updating"` 顯示成「離線」
+
+轉送期間 master 會把目標 slave 的代發狀態填成 `"updating"` 並多帶 `"ota_progress"`（語義沿用 `ho_relay2` 對一般設備的既有用法）。**但現行 App 端接不住這個值**：
+
+- App 的解析是 `data['status'] == 'online' ? online : offline`，所以 `"updating"` 會落到 **offline** —— **轉送全程，目標 slave 在 App 上顯示「離線」**。
+- `DeviceStatus.updating` 這個狀態在 App 端**確實存在**，但它的唯一產生點是**舊的 `updating:` 純字串格式**，不是 JSON 狀態裡的 `status` 欄位。
+- App 的 `lib/` 對 master 狀態的 `ota` 物件**目前零讀取點**，所以新增的 `staged_only`／`unconfirmed` 不會讓 App 出錯，只是還沒有人用。
+
+**這是 App 端的待辦，不要在韌體側硬湊**（把 `"updating"` 改回 `"online"` 會讓一台正在重開機、繼電器已歸零的設備在 App 上顯示成正常在線 —— 那是誤綠，方向不可接受）。
+
+**Phase 4 回歸清單第 11 項（轉送期間目標顯示 `updating`）照現行 App 驗會 FAIL。**
+判準要拆成兩段記：**(a) MQTT 層**用訂閱工具看 `hoban/<目標 ID>/status` 的 `status` 欄位是不是 `"updating"`、有沒有帶 `ota_progress` —— 這一段**現在就該 PASS**；**(b) App 畫面**顯示「離線」是**已知的 App 端缺口**，在 App 補上對應之前記成**已知不符**，不是韌體回歸失敗。
 
 **沒有 `lr on｜off` 這條序列埠指令。** Long Range 的原 Task 6 已整個移到 Phase 5，
 兩端都還沒有任何 LR 開關（`longRangeEnabled` 全檔只有讀取點、沒有寫入 `true` 的路徑）。

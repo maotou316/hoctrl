@@ -983,7 +983,8 @@ def main():
     #
     # Task 4 把 OTA_VERIFYING 的入口從「必須收到 HO_OTA_OK」放寬成「END 送出後
     # 10 秒沒回應也進來」。於是同一個階段底下混著兩種事實：有 slave 正面證據的，
-    # 與**一封回應都沒收到**的。otaSlaveVerified 是兩者對外唯一的分野
+    # 與**10 秒內沒收到整份校驗結果**的（不是「一封回應都沒收到」：
+    # BEGIN 的 READY 與窗口 ACK 本來就收過了）。otaSlaveVerified 是兩者對外唯一的分野
     #（"verifying" vs "unconfirmed"）。
     #
     # 這一條驗：設成 true 的地方**剛好一處**，而且必須排在
@@ -1003,9 +1004,27 @@ def main():
         failures.append('[slave 正面證據] `otaSlaveVerified = true;` 的非註釋指派有 %d 處'
                         '（必須剛好 1 處，就在 OTA_END_SENT 收到 HO_OTA_OK 那個分支裡）。'
                         '多一處＝有第二條路徑在宣稱「slave 說它校驗通過了」' % n_verified)
+    # ── C1（複審）：位置維度**必須是雙邊的**（A 族第 18／20 次的同型第三次）──
+    #
+    # 這一條的第一版只驗 `e_set > e_ok`，也就是「不准往上搬」。複審實測出一個
+    # 一字不改的突變：**把 `otaSlaveVerified = true;` 往下搬進同一個 case 底部的
+    # 10 秒逾時分支** → 三支工具全綠，而效果是把 "verifying" 與 "unconfirmed"
+    # **完全對調** —— 沒有「校驗通過」證據的那條路徑會顯示成「slave 親口回報校驗通過」。
+    #
+    # 所以改成夾在**兩個**錨點之間：必須排在證據判斷之後，**而且**必須排在
+    # 「校驗失敗」那條 else 分支之前（那是 OK 分支的結尾，逾時分支還在更後面）。
+    #
+    # **它擋不住什麼**：這仍然是「文字先後」而不是括號結構 —— 把整段連同 else
+    # 一起重排，或把賦值包進一個更早出現、但執行時走不到的分支，它照樣過。
+    # 那時它是**中斷器**：請人回來確認新寫法仍然只在有證據時為真，再更新這張表。
     if end_sent is not None:
-        e_ok = end_sent.find('otaAckBase == otaTotalChunks && otaAckBits == 0xFFFF')
-        e_set = end_sent.find('otaSlaveVerified = true;')
+        # 位置比對一律在**去掉註釋行**的版本上做（與方向 14 同一個理由：
+        # 解釋「為什麼一定要在這裡」的註釋本身就得寫出這幾個字）。
+        end_code = chr(10).join(ln for ln in end_sent.split(chr(10))
+                                if not ln.lstrip().startswith('//'))
+        e_ok = end_code.find('otaAckBase == otaTotalChunks && otaAckBits == 0xFFFF')
+        e_set = end_code.find('otaSlaveVerified = true;')
+        e_end = end_code.find('[OTA] slave 校驗失敗，狀態碼 %u')
         if e_set < 0:
             failures.append('[slave 正面證據] OTA_END_SENT 區塊裡找不到 '
                             '`otaSlaveVerified = true;`：那是 "verifying" 與 "unconfirmed" '
@@ -1014,6 +1033,43 @@ def main():
             failures.append('[slave 正面證據] `otaSlaveVerified = true;` 排在'
                             '「HO_OTA_OK ＋ base ＋ mask 三項齊備」的判斷**之前**：'
                             '那等於在還沒確認證據之前就先宣告有證據')
+        elif e_end < 0:
+            failures.append('[slave 正面證據] OTA_END_SENT 區塊裡找不到「校驗失敗」'
+                            'else 分支的錨點，位置檢查的**下界**無法成立')
+        elif e_set > e_end:
+            failures.append('[slave 正面證據] `otaSlaveVerified = true;` 排在'
+                            '「校驗失敗」的 else 分支**之後** —— 它已經不在收到 '
+                            'HO_OTA_OK 的那個分支裡了。最可能的落點是同一個 case 底部的'
+                            '**10 秒逾時分支**，而那條路徑正是「沒收到整份校驗結果」的那一條：'
+                            '這樣會把 "verifying" 與 "unconfirmed" 完全對調，'
+                            '**零證據的情況會顯示成「slave 親口回報校驗通過」**')
+
+    # ── MJ3（複審）：session reset 無人守 ──
+    # 複審突變：刪掉 otaRelayStaged() 的 `otaSlaveVerified = false;` → 三支工具全綠。
+    # 後果是**上一場的 true 漏到下一場**：新工作階段一封 OK 都沒收到，逾時落到版本
+    # 回檢時卻報 "verifying"。方向 17 的第一版只驗「設成 true 的地方」，從不驗 reset ——
+    # 而一個「只會被設成 true、永遠不歸零」的旗標等於沒有旗標。
+    #
+    # **它擋不住什麼**：只數字面與所在函式。有人把 reset 搬到函式尾端（在 otaPhase
+    # 已經被設定之後）它抓不到；也不驗兩個起手函式之外有沒有第三條起手路徑。
+    # `^\s*otaSlaveVerified` 是必要的：宣告那一行（`bool     otaSlaveVerified = false;`）
+    # 也含同樣的字面，算進來會讓期望值變成一個「有兩個來源」的數字。
+    n_reset = len([1 for _, line in code_lines
+                   if re.match(r'^\s*otaSlaveVerified\s*=\s*false;', line)])
+    if n_reset != 2:
+        failures.append('[slave 正面證據] `otaSlaveVerified = false;` 的非註釋指派有 %d 處'
+                        '（必須剛好 2 處：otaStart() 與 otaRelayStaged() 兩個起手點各一）。'
+                        '少一處＝**上一場的 true 會漏到下一場**，'
+                        '新工作階段在零證據的情況下報 "verifying"' % n_reset)
+    for fname, start_a, end_a in (
+            ('otaStart()', 'bool otaStart(const char* slaveId', 'bool otaRelayStaged('),
+            ('otaRelayStaged()', 'bool otaRelayStaged(', 'void updateOtaSession(')):
+        i, j = master_src.find(start_a), master_src.find(end_a)
+        if i < 0 or j < 0 or j < i:
+            failures.append('[slave 正面證據] 找不到 %s 的函式範圍，reset 檢查無法定位' % fname)
+        elif 'otaSlaveVerified = false;' not in master_src[i:j]:
+            failures.append('[slave 正面證據] %s 裡沒有 `otaSlaveVerified = false;`：'
+                            '那條起手路徑會沿用上一場的證據旗標' % fname)
     if 'otaSlaveVerified ? "verifying" : "unconfirmed"' not in master_src:
         failures.append('[slave 正面證據] otaPhaseName() 不再用 otaSlaveVerified 區分'
                         '"verifying"／"unconfirmed"：沒有 slave 正面證據的那條路徑'
@@ -1029,10 +1085,25 @@ def main():
     #
     # **它擋不住什麼**：只認這一行的字面。它不驗 otaTargetMac 本身是不是對的，
     # 也不驗這段判斷在 publishSlaveStatus() 的哪個位置。
-    if 'bool isOtaTarget = (memcmp(slaves[idx].mac, otaTargetMac, 6) == 0) &&' not in master_src:
-        failures.append('[代發 updating] publishSlaveStatus() 的 isOtaTarget 不再用 '
-                        'otaTargetMac 比對：改用 otaTargetIdx 會在名冊變動後把**別台**'
-                        '的狀態蓋成 "updating"（開錯門的 MAC 版，本專案已因索引式慣例出過）')
+    # **兩行一起釘**（MJ4，複審實測）：第一版只釘了前半行，於是把階段上界從
+    # OTA_VERIFYING 改成 OTA_STAGED_OK → 三支工具全綠，而效果是
+    # **`staged_only`（零 slave 接觸）期間目標 slave 的代發狀態變成
+    # `"updating"` + `ota_progress:100`** —— 一台一個位元都沒被碰過的設備，
+    # 在 App 上顯示成「更新中、已完成 100%」。那是誤綠。
+    #
+    # **它擋不住什麼**：只認這兩行的字面。它不驗 otaTargetMac 本身是不是對的，
+    # 也不驗這段判斷在 publishSlaveStatus() 的哪個位置；把上界換成一個
+    # 數值相同的別名它也抓不到。
+    ISOTATARGET = ('bool isOtaTarget = (memcmp(slaves[idx].mac, otaTargetMac, 6) == 0) &&'
+                   + chr(10) +
+                   '                     (otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_VERIFYING);')
+    if ISOTATARGET not in master_src:
+        failures.append('[代發 updating] publishSlaveStatus() 的 isOtaTarget 不再逐字是'
+                        '「用 otaTargetMac 比對 ＋ 階段落在 OTA_BEGIN_SENT~OTA_VERIFYING」：'
+                        '(a) 改用 otaTargetIdx 會在名冊變動後把**別台**的狀態蓋成 "updating"'
+                        '（開錯門的 MAC 版，本專案已因索引式慣例出過）；'
+                        '(b) 階段上界放寬到終局階段會讓 staged_only（**零 slave 接觸**）'
+                        '期間的目標顯示成 "updating" + ota_progress:100')
 
     print('禁用 API 靜態檢查：ho_master1.ino 非註釋行 %d 行；'
           'otaSessionBusy() 呼叫點 %d 處；文件必含 %d 條；'
