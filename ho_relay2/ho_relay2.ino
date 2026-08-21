@@ -140,6 +140,15 @@ int currentServerIndex = 0;  // 當前連接的預設伺服器索引
 
 bool useCustomServer = false;       // 是否使用自訂伺服器
 
+// 目前**實際**連上的 MQTT 伺服器位址，由連線成功的那一刻寫入。
+//
+// 【不可以用「useCustomServer 為真就填 mqttServer」來推斷】
+// smartConnectStep() 會在自訂伺服器連不上時 fallback 到預設伺服器，那時
+// useCustomServer 仍然是 true。舊寫法會讓每 3 秒的保活狀態用 retained 訊息
+// 把正確的 server_changed 事件蓋掉，App 上永久顯示一台它其實沒連的 broker。
+// 指向的都是持久儲存（DEFAULT_SERVERS 的字串常數或全域 mqttServer 陣列），不會懸空。
+const char* activeMqttServer = nullptr;
+
 WiFiClient espClient; // MQTT 客戶端
 PubSubClient mqttClient(espClient);
 
@@ -728,9 +737,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       // 單次 loop() 迭代阻塞 111 秒以上——跟這整輪重寫要消滅的舊行為一模一樣。
       // 改成只斷線並把探測狀態歸零，剩下的交給 loop() 的 smartConnectStep()
       // 依 MQTT_RETRY_INTERVAL_MS 的節奏一次試一台。
-      Serial.println("收到重新測試伺服器命令，交由 loop 逐台重試");
+      //
+      // 【必須順手推進 currentServerIndex】只做 resetMqttProbe() 是不夠的：
+      // 它把 mqttProbeOffset 歸零，而下一次 smartConnectStep() 試的就是
+      // (currentServerIndex + 0)，也就是剛剛那一台。本輪又拿掉了「<1 秒才接受」
+      // 的門檻，於是那次重連必定成功 —— 指令就再也換不掉伺服器，變成原地重連。
+      Serial.println("收到重新測試伺服器命令，換下一台並交由 loop 逐台重試");
       mqttClient.disconnect();
       resetMqttProbe();
+      currentServerIndex = (currentServerIndex + 1) % DEFAULT_SERVER_COUNT;
+      Serial.printf("下一輪從 [%d] %s 開始\n",
+                    currentServerIndex, DEFAULT_SERVERS[currentServerIndex].server);
     } else if (message.startsWith("update:")) {
       // 解析更新命令
       StaticJsonDocument<200> doc;
@@ -1126,8 +1143,9 @@ void loop()
 
       // 每 3 秒發送一次保持連線的狀態更新（帶伺服器資訊）
       if (nowMqtt - lastKeepAlive > 3000) {
-        const char* server = useCustomServer && strlen(mqttServer) > 0 ?
-                             mqttServer : DEFAULT_SERVERS[currentServerIndex].server;
+        // 用連線當下記下的實際位址，不要從 useCustomServer 反推（見其宣告處的說明）
+        const char* server = activeMqttServer ? activeMqttServer
+                                              : DEFAULT_SERVERS[currentServerIndex].server;
         publishStatusWithServer(server);
         // publish() 內部走 NetworkClient::write，retry 上限 10 次、每輪 select 1 秒。
         // 注意 10 秒是「連續無進度」的上界，不是「單次呼叫」的上界——
@@ -1619,6 +1637,7 @@ bool quickConnectToIndex(int index) {
                   legacySubscribeSuccess ? "成功" : "失敗");
 
     // 發布上線狀態（包含伺服器資訊）
+    activeMqttServer = cfg.server;
     publishStatusWithServer(cfg.server);
     currentServerIndex = index;
 
@@ -1691,6 +1710,7 @@ bool quickConnectCustom() {
                   legacySubscribeSuccess ? "成功" : "失敗");
 
     // 發布上線狀態（包含伺服器資訊）
+    activeMqttServer = mqttServer;
     publishStatusWithServer(mqttServer);
 
     return true;
@@ -1716,7 +1736,21 @@ void smartConnect() {
   }
 
   // 2. 從上次成功的伺服器開始，輪流嘗試所有預設伺服器
+  //
+  // 本函式只在 setup() 被呼叫（運行期一律走 smartConnectStep()，一次只試一台）。
+  // 五台全掛時最壞阻塞約 90 秒，期間 loop() 完全不跑，長按重置也就沒人理——
+  // 而「WiFi 通、broker 全掛」正是長按重置作為唯一復原手段的情境之一。
+  // 所以每試完一台就給按鈕一次機會。
+  //
+  // 【它擋不住什麼】quickConnectToIndex() 內部單台最壞約 18 秒
+  //（不受管的 DNS + 3 秒 TCP + 15 秒等 CONNACK 的 busy-wait，且那個迴圈沒有 yield()），
+  // 這道輪詢插不進去。使用者最久仍需按住約 18 秒才會被看見，只是不再是 90 秒。
   for (int i = 0; i < DEFAULT_SERVER_COUNT; i++) {
+    if (anyResetButtonPressed()) {
+      Serial.println("偵測到按鈕按下（MQTT 連線等待中）...");
+      waitForResetConfirm();  // 確認成功會直接重啟，返回代表已取消
+    }
+
     int index = (currentServerIndex + i) % DEFAULT_SERVER_COUNT;
     if (quickConnectToIndex(index)) {
       Serial.printf("✓ 已連接到預設伺服器 [%d]: %s\n", index, DEFAULT_SERVERS[index].server);
