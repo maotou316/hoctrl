@@ -358,20 +358,43 @@ const size_t STATUS_GROUP_MAX_BYTES = 120;
 //（buildStatusDoc() 無條件加它，OTA_IDLE 時也在，只是內容是空的）。
 // Task 1 先把額度預留下來、而不是等到 Task 5 再算，是因為「等到那時」正是 (a) 的
 // 640 被吃光卻沒人發現的成因。逐項實算取自 plan 決定 4.2：
-//   `"ota":{` 7 ＋ `"target":"hoban-aabbccddeeff",` 30 ＋ `"phase":"<最長 12 字元>",` 23
-//   ＋ `"progress":100,` 15 ＋ `"size":2031616,` 15 ＋ `"error":"<最長 16 字元>"` 26
-//   ＋ `},` 2 = 118，取 128。
+//   `"ota":{` 7
+//   ＋ `"target":"<最長 19 字元>",` **31**（`"target":` 9 ＋ 引號含內容 21 ＋ 逗號 1）
+//   ＋ `"phase":"<最長 12 字元>",` 23（`"phase":` 8 ＋ 引號含內容 14 ＋ 逗號 1）
+//   ＋ `"progress":100,` 15 ＋ `"size":2031616,` 15
+//   ＋ `"error":"<最長 16 字元>"` 26（**最後一個成員，不帶逗號**）
+//   ＋ `},` 2
+//   = **119**，取 128。
 //
-// **上界成立的前提有三條，缺一不可**：
+// ⚠ **119，不是舊註釋寫的 118**（Task 5 複審第 2 輪 N4，我自己重算過一次）：
+//   舊版把 target 那一項算成 30，是拿範例 `hoban-aabbccddeeff`（**18** 字元）去算的，
+//   而真正的上界是 otaTargetId[20] 容得下的 **19** 字元 —— 差的那 1 byte，
+//   正好就是下面第 (4) 條前提原本被漏寫的地方。128 在兩種算法下都成立
+//   （方向保守、上界仍然是上界），但數字本身是錯的，照實改掉。
+//
+// **上界成立的前提有四條，缺一不可**（原本只寫了三條，第 (4) 條是隱含的）：
 //   (1) otaPhaseName() 的字串 ≤ 12 字元；(2) 錯誤碼 ≤ 16 字元；
 //   (3) **otaTargetId 不含任何需要 JSON 逃逸的字元** —— Task 5 起它的內容
-//       可能來自遠端的 update_slave，19 個 `"` 會逃逸成 38 bytes、把 118 撐到約 139。
+//       可能來自遠端的 update_slave，19 個 `"` 會逃逸成 38 bytes，
+//       target 那一項從 31 漲到 50、整個 ota 物件從 119 漲到 **138**，**超過 128**。
 //       這一條由 otaSetTarget() 的字元過濾保證（見該函式，MJ7）。
+//   (4) **otaTargetId 的容量是 20 bytes（＝最長 19 字元）** ——
+//       31 這個數字整個掛在這一條上。把陣列放大就會靜靜推翻整個上界，
+//       而 static_assert 用的是常數、抓不到。
 //
-// **它擋不住什麼**：這只是「預算上界」，不是對 otaPhaseName()／otaErrCode 的檢查。
-// 若哪天 phase／error 字串超過 12／16 字元，這個常數不會自己變大，
-// static_assert 也抓不到 —— plan 決定 4.2 因此要求那兩個字串必須走查表函式、
-// 不得是自由格式 String，並用 `fakeota` + `jsonsize` 實測。
+// **這四條前提現在都有機械檢查**（`tools/check_doc_claims.py` 方向 19，
+// Task 5 複審第 2 輪 N2）：白名單字元集整段釘住、otaTargetId 的寫入點必須全部
+// 落在 otaSetTarget()／fakeOtaForCapacityTest() 之內、兩個字元陣列的宣告逐字釘住、
+// otaPhaseName() 與 otaFail() 的字串字面長度逐一量過。
+//
+// **它擋不住什麼**：
+//   - 這個常數本身只是「預算上界」，不是對 otaPhaseName()／otaErrCode 的檢查；
+//     它不會因為字串變長就自己變大，static_assert 也抓不到 —— 那是方向 19 的工作。
+//   - 方向 19 量的是**原始碼裡的字面**。`ota["size"]` 的位數不在它的檢查範圍內：
+//     otaTotalSize 是 uint32_t，十進位最多 10 位，現行值受下載階段那道
+//     「不得大於暫存分區」的 `too_big` 檢查壓在 7 位以內，但**那是執行期判斷**，
+//     不是靜態腳本驗得到的東西。最壞多出 3 bytes（119 → 122），落在 128−119＝9
+//     的餘裕裡，所以上界仍然成立 —— 但 128 **不是**被完整證明過的，照實寫在這裡。
 // Task 5 現行最長的 phase 字串是 11 字元（"downloading"／"unconfirmed"／
 // "staged_only"），最長的 error 是 13 字元（"slave_timeout"），兩者都在上界之內。
 const size_t STATUS_OTA_MAX_BYTES = 128;
@@ -2519,9 +2542,19 @@ void printHelp() {
   Serial.println("                 不寫 NVS、不動名冊內容，重開機或重新配對即恢復");
   Serial.println("  fakeslaves <n> 測試用：把名冊灌成 n 台假 slave，實測容量（不寫 NVS；");
   Serial.println("                 灌入後到重開機前，pair／unpair 會被擋下，避免假 MAC 寫進 NVS）");
+  Serial.println("                 ⚠ 已連上 broker 時，這 n 台會以 retain 壓上各自的 status topic，");
+  Serial.println("                 清除方式同 fakeota");
   Serial.println("  fakeota       測試用：把 ota 欄位灌成最壞值（不啟動工作階段、不寫 NVS），");
   Serial.println("                 配合 fakeslaves 20 → fakeota → jsonsize 實測容量；");
   Serial.println("                 量到的 phase 是 idle（4 字元），記錄時要加回 8 bytes");
+  // ⚠ MJ6／N3：這裡**不能只寫「不寫 NVS」**。「不寫 NVS」為真，但它會讓人以為
+  //   「重開機就乾淨了」，而真正的坑是 retain —— 捏造的欄位會被壓上 broker 且永久保留。
+  //   序列埠輸出（fakeOtaForCapacityTest()）與 readme 都寫了這一段，這裡原本漏掉，
+  //   而「三處都補了」曾被寫進 report —— 那是 A 族（宣稱與事實不符）。
+  Serial.println("                 ⚠ 已連上 broker 時，捏造的 ota 欄位會以 retain=true 壓上");
+  Serial.println("                 hoban/<本機 ID>/status，retain 永久保留、重開機不會自動清；");
+  Serial.println("                 清除：重開機讓 master 重發真實狀態壓過去，或對該 topic");
+  Serial.println("                 發一則空 payload 的 retain 訊息");
   Serial.println("  jsonsize      測試用：印出目前狀態 JSON 的實際大小");
   Serial.println("  otadl <n> <url>  測試用：只下載並暫存韌體，不轉送（會抹除 master 的閒置 OTA 分區，");
   Serial.println("                 不動開機分區；固定略過『繼電器正開著就拒絕』的保護）");
@@ -3542,18 +3575,37 @@ bool otaParseUrlHost(const char* url) {
 //   update_slave 的 cmd["id"] 完全沒有格式限制就會走到這裡（解析不出 MAC 時
 //   一樣先 otaSetTarget() 再 otaFail("no_target")，那是刻意的：錯誤回報要帶著
 //   使用者打的那個 id）。而 STATUS_OTA_MAX_BYTES = 128 的實算假設
-//   `"target":"hoban-aabbccddeeff",` 只佔 30 bytes —— 那個假設只在「字串不需要
+//   `"target":"<最長 19 字元>",` 只佔 31 bytes —— 那個假設只在「字串不需要
 //   JSON 逃逸」時才成立。19 個 `"` 或 `\` 會被 ArduinoJson 逃逸成 38 bytes，
-//   整個 ota 物件的最壞值會從 118 漲到約 139，**超過 128**。
+//   target 那一項變成 50，整個 ota 物件的最壞值會從 119 漲到 138，**超過 128**。
 //
 //   所以在這裡把字元集收斂成 [0-9A-Za-z_.:-]，其餘一律換成 '?'（'?' 在 JSON
-//   裡不需要逃逸）。這樣「30 bytes」與 128 這個上界重新變成真的，而不是靠
+//   裡不需要逃逸）。這樣「31 bytes」與 128 這個上界重新變成真的，而不是靠
 //   總預算的餘裕去吸收。
 //
-//   **它擋不住什麼**：它不驗這個 id 是不是一台真的 slave（那是 findSlave() 的事），
-//   也不縮短長度（otaTargetId[20] 的截斷本來就封頂在 19 字元）。
-//   被換成 '?' 的字元會讓序列埠與 App 顯示的 id 與使用者打的不完全一致 ——
-//   那是刻意的取捨：那條路徑必定以 no_target 收場，可讀性讓位給上界成立。
+// ⚠ N2（Task 5 複審第 2 輪）：**上面那句「由字元過濾保證」曾經是一句沒有守衛的宣稱。**
+//   複審實測兩個突變，兩個都三支工具全綠：
+//     (i)  白名單尾端加 `|| c == '"'`；(ii) 整段刪掉這個過濾迴圈。
+//   兩者都讓 ota 物件的最壞值回到 138 > 128，而 STATUS_OTA_MAX_BYTES 會靜靜地
+//   停止是上界 —— 那正是 Step 1 整個「拆成具名分項」的設計要防的那件事。
+//   現在由 `tools/check_doc_claims.py` **方向 19** 守著：這個過濾區塊
+//   （snprintf 那一行到迴圈右大括號）必須**整段逐字如此**，而且 otaTargetId 的
+//   寫入點必須全部落在本函式或 fakeOtaForCapacityTest() 之內。
+//   **改這段程式碼就一定要同步改腳本裡的錨點** —— 那是刻意的摩擦，
+//   目的是逼下一個人回來重算 31 這個數字。
+//
+//   **它擋不住什麼**：
+//   - 它不驗這個 id 是不是一台真的 slave（那是 findSlave() 的事），
+//     也不縮短長度（otaTargetId[20] 的截斷本來就封頂在 19 字元）。
+//   - 白名單是**位元組**層級的：UTF-8 的每一個位元組都會各自被換成 '?'，
+//     所以一個中文字會變成三個 '?'。長度不會變大（1 byte → 1 byte），上界不受影響，
+//     但顯示出來的東西會比使用者輸入的更難認。
+//   - 方向 19 是**字面比對**：把過濾改寫成一個等價的具名函式（例如
+//     `sanitizeTargetId()`）它會當場變紅，即使新寫法完全正確。那時它是
+//     **中斷器**而不是守衛：請人回來確認新寫法的字元集仍不含任何需要逃逸的字元，
+//     再更新錨點。
+//   - 被換成 '?' 的字元會讓序列埠與 App 顯示的 id 與使用者打的不完全一致 ——
+//     那是刻意的取捨：那條路徑必定以 no_target 收場，可讀性讓位給上界成立。
 void otaSetTarget(const char* slaveId, const uint8_t* mac) {
   snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);
   for (size_t i = 0; otaTargetId[i] != '\0'; i++) {

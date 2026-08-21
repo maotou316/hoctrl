@@ -17,7 +17,7 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
     python tools/check_doc_claims.py
 全部通過印 ALL CHECKS PASSED，任何一項失敗以 exit code 1 結束。
 
-**十八個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
+**十九個**驗證方向（第 7 個 PLAN 方向見下方 BANNED_IN_PLAN）。
 這個數字自己就是一個判準 —— 初版寫「八個」而實際是九個，
 **一支專門檢查「文件寫死的 N 項」的腳本自己數錯**，所以改動方向時請一起數：
   1. HIT     —— 文件引用的判準字串必須逐字出現在原始碼裡
@@ -53,8 +53,16 @@ Phase 4 Task 1 的 review M4 抓到 `ho_master1/readme.md` 的
  17 slave 正面證據 —— `otaSlaveVerified = true;` 剛好一處，且必須排在
                 「HO_OTA_OK ＋ base ＋ mask 三項齊備」之後（"verifying" 與
                 "unconfirmed" 唯一的分野，**一字不改只搬位置**就能造假）
- 18 代發 updating —— `publishSlaveStatus()` 的 `isOtaTarget` 必須用 `otaTargetMac`
-                比對，不得用宣告處寫著「會過期」的 `otaTargetIdx`
+ 18 代發 updating —— `publishSlaveStatus()` 的 `isOtaTarget` **連同 if/else 整段**
+                逐字釘住（中間一行都不准插）；`isOtaTarget` 全檔只准賦值一次；
+                函式內 `doc["status"]` 剛好 2 處、`"updating"` 剛好 1 處；
+                列舉 `OTA_BEGIN_SENT..OTA_VERIFYING` 剛好是那五個轉送中階段
+                （**「加一行覆蓋它」與「一個字都不改、只重排列舉」各繞過去一次**）
+ 19 ota 上界前提 —— `STATUS_OTA_MAX_BYTES = 128` 那四條前提要真的有人守：
+                `otaSetTarget()` 整個函式體逐字（字元白名單就是前提 3 的唯一保證）、
+                `otaTargetId` 的寫入點必須全部在該函式或 `fakeOtaForCapacityTest()` 內、
+                `otaTargetId[20]`／`otaErrCode[20]` 兩個宣告逐字、
+                `otaPhaseName()` 的字串 ≤ 12、錯誤碼字面 ≤ 16
 
 **這支腳本擋不住什麼**（必須連著讀）：
   - 它只做**字串／算式比對**。字串對不代表語義對
@@ -82,6 +90,11 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 換行字元。本檔多處要用**多行字面**當錨點（方向 14／17／18／19），
+# 而在 Python 原始碼裡直接寫跳脫序列會讓那些錨點自己變得難以逐字核對，
+# 所以一律用這個名字接起來（既有程式碼裡的 chr(10) 是同一件事）。
+NL = chr(10)
 
 SRC_FILES = [
     'ho_master1/ho_master1.ino',
@@ -1075,7 +1088,7 @@ def main():
                         '"verifying"／"unconfirmed"：沒有 slave 正面證據的那條路徑'
                         '會對 App 宣稱 slave 已經回報校驗通過')
 
-    # ── 方向 18：代發狀態的 "updating" 判定不得用會過期的索引 ──
+    # ── 方向 18：代發狀態的 "updating" 只能在「真的正在被轉送」時出現 ──
     #
     # plan Task 5 Step 3 的範本寫的是 `idx == otaTargetIdx`，而 otaTargetIdx 的宣告處
     # 逐字寫著「會過期」（unpairSlave() 會把 slaves[] 往前搬）。用過期索引會把**另一台**
@@ -1083,27 +1096,298 @@ def main():
     # 「離線」，等於用一個進行中的假象蓋掉一個真實的壞消息。
     # 本檔的慣例是「真相一律以 otaTargetMac 為準」，這裡把它釘住。
     #
-    # **它擋不住什麼**：只認這一行的字面。它不驗 otaTargetMac 本身是不是對的，
-    # 也不驗這段判斷在 publishSlaveStatus() 的哪個位置。
-    # **兩行一起釘**（MJ4，複審實測）：第一版只釘了前半行，於是把階段上界從
-    # OTA_VERIFYING 改成 OTA_STAGED_OK → 三支工具全綠，而效果是
-    # **`staged_only`（零 slave 接觸）期間目標 slave 的代發狀態變成
-    # `"updating"` + `ota_progress:100`** —— 一台一個位元都沒被碰過的設備，
-    # 在 App 上顯示成「更新中、已完成 100%」。那是誤綠。
+    # ── 這一條被繞過的沿革（每一次都是「只擋了一半」）──
+    # MJ4（第一輪複審）：第一版只釘前半行 → 把階段上界從 OTA_VERIFYING 改成
+    #   OTA_STAGED_OK 就全綠。改成兩行一起釘。
+    # N1（第二輪複審）：那兩行**一字不動**，在後面另加一行
+    #   `isOtaTarget = isOtaTarget || otaPhaseIsFinal();`
+    #   → 三支工具全綠，效果與 MJ4 **完全相同**。
+    #   本檔方向 12 的註釋早就寫著「HIT 擋不住『再加一行覆蓋它』」，
+    #   而方向 18 的「它擋不住什麼」段落**沒有寫這一格** —— A 族的定義。
+    # 本輪自己補跑的三個加寬突變（三個在補完前都活著）：
+    #   (i)   在 if/else **之後**再加一段 `if (otaPhaseIsFinal() && memcmp(...) == 0)
+    #         doc["status"] = "updating";` —— 上面那幾行字面完全不動。
+    #   (ii)  把 else 分支改成 `slaves[idx].online ? "online"
+    #         : (otaPhaseIsFinal() ? "updating" : "offline")` —— 直接拿「更新中」
+    #         蓋掉「離線」，那是誤綠最壞的一格。
+    #   (iii) **一個字都不改**，把 `OTA_STAGED_OK` 從列舉最後搬到 `OTA_BEGIN_SENT`
+    #         後面 —— `otaPhase <= OTA_VERIFYING` 這行字面不變，涵蓋範圍卻靜靜
+    #         多吃一個終局階段。（列舉宣告處自己就寫著「刻意排在列舉最後」。）
     #
-    # **它擋不住什麼**：只認這兩行的字面。它不驗 otaTargetMac 本身是不是對的，
-    # 也不驗這段判斷在 publishSlaveStatus() 的哪個位置；把上界換成一個
-    # 數值相同的別名它也抓不到。
-    ISOTATARGET = ('bool isOtaTarget = (memcmp(slaves[idx].mac, otaTargetMac, 6) == 0) &&'
-                   + chr(10) +
-                   '                     (otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_VERIFYING);')
-    if ISOTATARGET not in master_src:
-        failures.append('[代發 updating] publishSlaveStatus() 的 isOtaTarget 不再逐字是'
-                        '「用 otaTargetMac 比對 ＋ 階段落在 OTA_BEGIN_SENT~OTA_VERIFYING」：'
-                        '(a) 改用 otaTargetIdx 會在名冊變動後把**別台**的狀態蓋成 "updating"'
-                        '（開錯門的 MAC 版，本專案已因索引式慣例出過）；'
-                        '(b) 階段上界放寬到終局階段會讓 staged_only（**零 slave 接觸**）'
-                        '期間的目標顯示成 "updating" + ota_progress:100')
+    # 所以現在驗四件事：
+    #   (a) 從 `bool isOtaTarget` 到 else 分支的右大括號**整段連續逐字如此**
+    #       —— 擋 N1 的「中間加一行」與「把 if 條件改成 isOtaTarget || …」
+    #   (b) `isOtaTarget` 的非註釋賦值全檔剛好 1 處 —— 擋「賦值搬到別的地方去做」
+    #   (c) publishSlaveStatus() 的非註釋行裡 `doc["status"]` 剛好 2 處、
+    #       `"updating"` 剛好 1 處 —— 擋上面的 (i) 與 (ii)
+    #   (d) 列舉 OtaPhase 裡 OTA_BEGIN_SENT..OTA_VERIFYING 這段**剛好是**那五個
+    #       轉送中階段 —— 擋上面的 (iii)
+    #
+    # **它擋不住什麼**（照實寫）：
+    #   - 它不驗 otaTargetMac 本身是不是對的（那是方向 15 與 otaSetTarget() 的事）。
+    #   - (a) 是字面比對：把這段重構成一個具名述詞（例如 `slaveIsOtaTarget(idx)`）
+    #     會當場變紅，即使新寫法完全正確。那時它是**中斷器**不是守衛。
+    #   - (c) 只數 `doc["status"]` 這個字面。改用 `doc[F("status")]`、或先算進一個
+    #     `const char* st` 再一次寫進去，它就數不到 —— 那時 (a) 仍然會擋下這種改法，
+    #     但**同時繞過 (a) 與 (c) 的寫法是存在的**，不要以為這裡是封閉的。
+    #   - (d) 只驗列舉的**文字順序**。它不驗 `>=`／`<=` 兩個運算子沒被對調，
+    #     那一側由 (a) 的整段字面顧。
+    ISOTATARGET_BLOCK = NL.join([
+        '  bool isOtaTarget = (memcmp(slaves[idx].mac, otaTargetMac, 6) == 0) &&',
+        '                     (otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_VERIFYING);',
+        '  if (isOtaTarget) {',
+        '    doc["status"] = "updating";',
+        '    doc["ota_progress"] = otaProgressPercent();',
+        '  } else {',
+        '    doc["status"] = slaves[idx].online ? "online" : "offline";',
+        '  }',
+    ])
+    if ISOTATARGET_BLOCK not in master_src:
+        failures.append('[代發 updating] publishSlaveStatus() 的 isOtaTarget 判斷**連同 '
+                        'if/else 整段**不再逐字如此。這一段必須是連續的八行，中間'
+                        '**一行都不准插**：(a) 改用 otaTargetIdx 會在名冊變動後把**別台**的'
+                        '狀態蓋成 "updating"（開錯門的 MAC 版）；(b) 階段上界放寬到終局階段，'
+                        '或事後補一行 `isOtaTarget = isOtaTarget || …` 覆蓋它，都會讓 '
+                        'staged_only（**零 slave 接觸**）與 failed 期間的目標顯示成 '
+                        '"updating" + ota_progress:100 —— failed 那一格是拿「更新中」'
+                        '蓋掉一台真的離線的設備，那是誤綠')
+    n_isota_assign = sum(len(re.findall(r'\bisOtaTarget\s*[|&^+\-]?=(?!=)', line))
+                         for _, line in code_lines)
+    if n_isota_assign != 1:
+        failures.append('[代發 updating] `isOtaTarget` 的非註釋賦值有 %d 處（必須剛好 1 處，'
+                        '就是宣告時那一次）。多一處＝有人在別的地方重新決定「這台算不算 '
+                        'OTA 目標」，而整段字面比對看不到那一行' % n_isota_assign)
+    i_pss = master_src.find('void publishSlaveStatus(int idx) {')
+    j_pss = master_src.find('void publishSlaveOffline(int idx) {')
+    if i_pss < 0 or j_pss < 0 or j_pss < i_pss:
+        failures.append('[代發 updating] 找不到 publishSlaveStatus() 的函式範圍，'
+                        '「status 只被寫兩次」的檢查無法定位')
+    else:
+        pss_code = NL.join(ln for ln in master_src[i_pss:j_pss].split(NL)
+                           if not ln.lstrip().startswith('//'))
+        n_set_status = pss_code.count('doc["status"]')
+        n_updating = pss_code.count('"updating"')
+        if n_set_status != 2:
+            failures.append('[代發 updating] publishSlaveStatus() 的非註釋行裡 `doc["status"]` '
+                            '出現 %d 次（必須剛好 2 次：if 分支與 else 分支各一）。'
+                            '第三次＝在 if/else 之後又蓋了一層，而那一層可以在'
+                            '**零 slave 接觸**的終局階段把離線的設備寫成 "updating"'
+                            % n_set_status)
+        if n_updating != 1:
+            failures.append('[代發 updating] publishSlaveStatus() 的非註釋行裡 `"updating"` '
+                            '出現 %d 次（必須剛好 1 次）。把它塞進 else 分支的三元式'
+                            '（`online ? "online" : (… ? "updating" : "offline")`）'
+                            '就是拿「更新中」蓋掉「離線」的那一格' % n_updating)
+    # (d) 列舉順序：`otaPhase >= OTA_BEGIN_SENT && otaPhase <= OTA_VERIFYING` 這個
+    #     範圍的**意義**完全來自列舉的排列。OTA_STAGED_OK 的宣告處自己就寫著
+    #     「刻意排在列舉最後」，但那句話原本沒有任何機械檢查。
+    m_enum = re.search(r'enum OtaPhase : uint8_t \{(.*?)' + NL + r'\};', master_src, re.S)
+    if m_enum is None:
+        failures.append('[代發 updating] 解析不出 `enum OtaPhase : uint8_t { … };`，'
+                        '階段範圍的順序檢查無法進行')
+    else:
+        enum_code = NL.join(ln for ln in m_enum.group(1).split(NL)
+                            if not ln.lstrip().startswith('//'))
+        order = re.findall(r'^\s*(OTA_[A-Z_]+)', enum_code, re.M)
+        RELAY_RANGE = ['OTA_BEGIN_SENT', 'OTA_RELAYING', 'OTA_WAIT_BLOCK_ACK',
+                       'OTA_END_SENT', 'OTA_VERIFYING']
+        if 'OTA_BEGIN_SENT' not in order or 'OTA_VERIFYING' not in order:
+            failures.append('[代發 updating] 列舉 OtaPhase 裡找不到 OTA_BEGIN_SENT／'
+                            'OTA_VERIFYING，範圍檢查無法定位（解析到 %s）' % order)
+        else:
+            got = order[order.index('OTA_BEGIN_SENT'):order.index('OTA_VERIFYING') + 1]
+            if got != RELAY_RANGE:
+                failures.append('[代發 updating] 列舉 OtaPhase 裡 OTA_BEGIN_SENT..OTA_VERIFYING '
+                                '這段是 %s，必須剛好是 %s。`otaPhase <= OTA_VERIFYING` 這行'
+                                '**字面一個字都不用改**，只要把終局階段（例如 OTA_STAGED_OK）'
+                                '插進這個區間，零 slave 接觸的階段就會被判成「更新中」——'
+                                '列舉宣告處自己寫著「刻意排在列舉最後」，這裡把那句話釘住'
+                                % (got, RELAY_RANGE))
+
+    # ── 方向 19：STATUS_OTA_MAX_BYTES = 128 那四條前提，必須真的有人守 ──
+    #
+    # N2（複審第 2 輪）：ho_master1.ino 的常數註釋逐字寫著
+    # 「這一條由 otaSetTarget() 的字元過濾保證」，而那個過濾迴圈**沒有任何守衛**。
+    # 複審實測兩個突變，兩個都三支工具全綠：
+    #   (i)  白名單尾端加一個雙引號；(ii) **整段刪掉過濾迴圈**。
+    # 後果是 ota 物件最壞值回到 138 > 128，STATUS_OTA_MAX_BYTES 靜靜停止是上界 ——
+    # 而那正是 Task 5 Step 1「拆成具名分項」整個設計要防的那件事。
+    # **宣稱有保證、實際沒有守衛 ＝ A 族的定義。**
+    #
+    # 本輪自己補跑、補完前都活著的兩個加寬突變：
+    #   (iii) 過濾迴圈**一字不動**，在它後面再抄一次未過濾的原字串
+    #   (iv)  `char otaTargetId[20]` 放大成 `[64]` —— 過濾迴圈完全不動，
+    #         但 31 bytes 那一項變成 75，ota 物件上界變成 163。
+    #
+    # 所以這一條驗四件事，對應那四條前提：
+    #   (a) otaSetTarget() 的**整個函式體**逐字如此（含過濾迴圈與白名單字元集）——
+    #       前提 (3)。擋 (i)(ii)(iii)。
+    #   (b) otaTargetId 的寫入點必須全部落在 otaSetTarget()／fakeOtaForCapacityTest()
+    #       之內，且全檔剛好 3 處 —— 擋「在別處塞一份未過濾的複本」。
+    #   (c) 兩個字元陣列的宣告逐字釘住 —— 前提 (4)（otaTargetId[20] ＝ 最長 19 字元）
+    #       與前提 (2) 的緩衝上限（otaErrCode[20]）。擋 (iv)。
+    #   (d) otaPhaseName() 回傳的字串字面 ≤ 12、otaFail()／otaErrCode 的錯誤碼
+    #       字面 ≤ 16 —— 前提 (1) 與 (2)。
+    #
+    # **它擋不住什麼**（照實寫）：
+    #   - (a) 是整段字面比對。把過濾抽成 `sanitizeTargetId()` 之類的具名函式會當場
+    #     變紅，即使新寫法完全正確 —— 那時它是**中斷器**：請人回來確認新字元集
+    #     仍不含任何需要 JSON 逃逸的字元，並重算 31 這個數字，再更新錨點。
+    #   - (d) 只認 `otaFail("字面")` 與 `snprintf(otaErrCode, …, "字面")` 兩種寫法。
+    #     **用變數呼叫 `otaFail(code)` 它一個字都驗不到**（現行程式沒有這種呼叫點，
+    #     但那是真的缺口，不是「原理上驗不出」）。
+    #   - `ota["size"]` 的位數完全不在檢查範圍內：otaTotalSize 是 uint32_t，
+    #     十進位最多 10 位，靠的是下載階段那道**執行期**的 too_big 檢查壓在 7 位以內。
+    #     最壞多 3 bytes，落在 128−119＝9 的餘裕裡，但那不是這支腳本證明的。
+    #   - 它完全不驗 ArduinoJson 真的照這個規則序列化 —— 那要 `fakeota` + `jsonsize`
+    #     實機量測，而那一步至今沒跑過（見 task-5-report.md 的疑慮清單）。
+    OTA_SET_TARGET_FN = NL.join([
+        'void otaSetTarget(const char* slaveId, const uint8_t* mac) {',
+        '  snprintf(otaTargetId, sizeof(otaTargetId), "%s", slaveId);',
+        "  for (size_t i = 0; otaTargetId[i] != '\\0'; i++) {",
+        '    char c = otaTargetId[i];',
+        "    bool safe = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||",
+        "                (c >= 'A' && c <= 'Z') || c == '-' || c == '_' ||",
+        "                c == '.' || c == ':';",
+        "    if (!safe) otaTargetId[i] = '?';",
+        '  }',
+        '  if (mac != nullptr) {',
+        '    memcpy(otaTargetMac, mac, 6);',
+        '  } else {',
+        '    memset(otaTargetMac, 0, sizeof(otaTargetMac));',
+        '    otaTargetIdx = -1;',
+        '  }',
+        '}',
+    ])
+    if OTA_SET_TARGET_FN not in master_src:
+        failures.append('[ota 上界前提] otaSetTarget() 的函式體不再逐字如此。'
+                        '這個函式是 STATUS_OTA_MAX_BYTES = 128 第 (3) 條前提'
+                        '（otaTargetId 不含任何需要 JSON 逃逸的字元）的**唯一**保證：'
+                        '白名單多一個需要逃逸的字元、整段刪掉、'
+                        '或在後面再抄一次未過濾的原字串，'
+                        'ota 物件的最壞值都會從 119 回到 138 以上、超過 128，'
+                        '而 static_assert 用的是常數、抓不到。'
+                        '**update_slave 的 id 欄位完全來自遠端，沒有其他格式限制。**')
+
+    def _fn_line_range(sig_a, sig_b):
+        a, b = master_src.find(sig_a), master_src.find(sig_b)
+        if a < 0 or b < 0 or b < a:
+            return None
+        return (master_src.count(NL, 0, a) + 1, master_src.count(NL, 0, b) + 1)
+
+    allowed_ranges = []
+    for name, sig_a, sig_b in (
+            ('otaSetTarget()', 'void otaSetTarget(const char* slaveId',
+             'bool otaStart(const char* slaveId'),
+            ('fakeOtaForCapacityTest()', 'void fakeOtaForCapacityTest() {',
+             'void printStatusJsonSize() {')):
+        rng = _fn_line_range(sig_a, sig_b)
+        if rng is None:
+            failures.append('[ota 上界前提] 找不到 %s 的函式範圍，'
+                            'otaTargetId 寫入點的定位檢查無法進行' % name)
+        else:
+            allowed_ranges.append(rng)
+    OTA_ID_WRITE = re.compile(
+        r'(?:snprintf|sprintf|strcpy|strncpy|memcpy|memset)\s*\(\s*otaTargetId\b'
+        r'|\botaTargetId\s*(?:\[[^\]]*\])?\s*[|&^+\-]?=(?!=)')
+    n_id_write = 0
+    for lineno, line in code_lines:
+        if re.match(r'\s*char\s+otaTargetId\[', line):
+            continue        # 宣告那一行由下面的陣列容量錨點顧
+        if OTA_ID_WRITE.search(line):
+            n_id_write += 1
+            if allowed_ranges and not any(a <= lineno <= b for a, b in allowed_ranges):
+                failures.append('[ota 上界前提] ho_master1.ino:%d 在 otaSetTarget()／'
+                                'fakeOtaForCapacityTest() **之外**寫入 otaTargetId → %s'
+                                '。那條路徑繞過了字元過濾，遠端字串會直接進 ota["target"]'
+                                % (lineno, line.strip()[:80]))
+    if n_id_write != 3:
+        failures.append('[ota 上界前提] otaTargetId 的非註釋寫入點有 %d 處'
+                        '（必須剛好 3 處：otaSetTarget() 的 snprintf 與逐字元覆寫兩處，'
+                        '加上 fakeOtaForCapacityTest() 的固定字面 1 處）。'
+                        '多一處＝有人在過濾之外又寫了一次' % n_id_write)
+    for decl, why in (
+            ('char     otaTargetId[20] = "";',
+             '前提 (4)：19 字元的上限完全掛在這個容量上。放大成 [64] 會讓 '
+             'target 那一項從 31 漲到 75、ota 物件上界變成 163，'
+             '而過濾迴圈一個字都沒動、方向 19 的其他檢查全部照過'),
+            ('char     otaErrCode[20] = "";',
+             '前提 (2)：錯誤碼 16 字元的假設靠這個緩衝封頂。放大它，'
+             'error 那一項就不再是 26 bytes')):
+        if decl not in master_src:
+            failures.append('[ota 上界前提] 找不到逐字的 `%s` —— %s' % (decl, why))
+    m_pn = re.search(r'const char\* otaPhaseName\(\) \{(.*?)' + NL + r'\}', master_src, re.S)
+    if m_pn is None:
+        failures.append('[ota 上界前提] 解析不出 otaPhaseName() 的函式體，'
+                        'phase 字串長度（前提 1）無法檢查')
+    else:
+        pn_code = NL.join(ln for ln in m_pn.group(1).split(NL)
+                          if not ln.lstrip().startswith('//'))
+        for lit in re.findall(r'"([^"]*)"', pn_code):
+            if len(lit) > 12:
+                failures.append('[ota 上界前提] otaPhaseName() 回傳的 "%s" 有 %d 字元 > 12：'
+                                'STATUS_OTA_MAX_BYTES 的 phase 那一項是照 12 字元'
+                                '算成 23 bytes 的，超過就要回頭重算那個常數' % (lit, len(lit)))
+    err_lits = re.findall(r'otaFail\("([^"]*)"\)', master_src)
+    err_lits += re.findall(r'snprintf\(otaErrCode, sizeof\(otaErrCode\), "([^"%]*)"\)', master_src)
+    for lit in err_lits:
+        if len(lit) > 16:
+            failures.append('[ota 上界前提] 錯誤碼 "%s" 有 %d 字元 > 16：'
+                            'STATUS_OTA_MAX_BYTES 的 error 那一項是照 16 字元'
+                            '算成 26 bytes 的' % (lit, len(lit)))
+    # (e) `ota` 物件本身的**欄位清單**。
+    #
+    # 本輪自己再補跑的兩個加寬突變，**兩個在補這一段之前都活著**：
+    #   (v)  `ota["error"] = otaErrCode;` 後面再加一行 `ota["url"] = otaHost;`
+    #        —— otaHost[64] 的內容來自遠端的 url，ota 物件直接爆掉 128。
+    #        而那五行**正上方的註釋逐字寫著**「加欄位必須回頭重算那個常數」——
+    #        那句話原本沒有任何守衛，正是 A 族的形狀，也正是 Task 5 Step 1
+    #        整個「拆成具名分項」的設計要防的那件事。
+    #   (vi) `ota["target"] = otaTargetId;` 改成 `= otaHost;`
+    #        —— otaSetTarget() 的過濾迴圈**一個字都沒動**，卻整條繞過去了：
+    #        前提 (3) 保護的是 otaTargetId 這個變數，不是 `ota["target"]` 這個欄位。
+    #        中間那條「誰被發出去」的連線原本沒人釘。
+    #
+    # 所以把那六行整段釘住，再數兩個字面：欄位數（`ota["`）必須剛好 5、
+    # `"ota"` 這個 key 在 buildStatusDoc() 內必須剛好出現 1 次
+    # （擋 `doc["ota"]["url"] = …` 這種不經 `ota` 這個區域變數的加欄位寫法）。
+    #
+    # **它擋不住什麼**：它不驗 `otaProgressPercent()`／`otaTotalSize` 的值域
+    #（size 的位數見上面那段），也不驗 slaves[] 或其他頂層區塊有沒有偷偷加欄位
+    # —— 那一側靠 SLAVE_ENTRY_MAX_BYTES 與方向 5 的算式複算，不在這一條裡。
+    OTA_JSON_BLOCK = NL.join([
+        '  JsonObject ota = doc["ota"].to<JsonObject>();',
+        '  ota["target"]   = otaTargetId;',
+        '  ota["phase"]    = otaPhaseName();',
+        '  ota["progress"] = otaProgressPercent();',
+        '  ota["size"]     = otaTotalSize;',
+        '  ota["error"]    = otaErrCode;',
+    ])
+    if OTA_JSON_BLOCK not in master_src:
+        failures.append('[ota 上界前提] buildStatusDoc() 組 `ota` 物件的那六行不再逐字如此。'
+                        '這六行**就是** STATUS_OTA_MAX_BYTES = 128 的實算內容：'
+                        '多一個欄位、或把某個欄位改讀別的變數（例如把 target 改成讀'
+                        '未經字元過濾的 otaHost），都會讓 128 靜靜停止是上界，'
+                        '而 static_assert 用的是常數、抓不到 —— 那正是 Task 5 Step 1 '
+                        '要防的「靜默截斷換一個面貌回來」')
+    i_bsd = master_src.find('void buildStatusDoc(JsonDocument& doc) {')
+    j_bsd = master_src.find('void publishStatus() {')
+    if i_bsd < 0 or j_bsd < 0 or j_bsd < i_bsd:
+        failures.append('[ota 上界前提] 找不到 buildStatusDoc() 的函式範圍，'
+                        'ota 欄位數的檢查無法定位')
+    else:
+        bsd_code = NL.join(ln for ln in master_src[i_bsd:j_bsd].split(NL)
+                           if not ln.lstrip().startswith('//'))
+        n_ota_field = bsd_code.count('ota["')
+        n_ota_key = bsd_code.count('"ota"')
+        if n_ota_field != 5:
+            failures.append('[ota 上界前提] buildStatusDoc() 裡 `ota["…"]` 有 %d 個欄位'
+                            '（必須剛好 5：target／phase／progress／size／error）。'
+                            '多一個字串欄位就足以讓 ota 物件超過 128 bytes' % n_ota_field)
+        if n_ota_key != 1:
+            failures.append('[ota 上界前提] buildStatusDoc() 裡 `"ota"` 這個 key 出現 %d 次'
+                            '（必須剛好 1 次）。第二次＝有人用 `doc["ota"]["…"] = …` '
+                            '繞過 ota 這個區域變數再加欄位' % n_ota_key)
 
     print('禁用 API 靜態檢查：ho_master1.ino 非註釋行 %d 行；'
           'otaSessionBusy() 呼叫點 %d 處；文件必含 %d 條；'
@@ -1113,6 +1397,15 @@ def main():
           '每個都回頭比對 otaPhaseName() 與「停留 30 秒再回 idle」的 case 群組；'
           'otaSlaveVerified = true 指派 %d 處（方向 17）'
           % (final_phases or '解析失敗', n_verified))
+    print('代發 updating（方向 18）：isOtaTarget 整段字面 ＋ 賦值 %d 處 ＋ '
+          'publishSlaveStatus() 內 doc["status"] %s／"updating" %s ＋ 列舉範圍 %s；'
+          'ota 上界前提（方向 19）：otaSetTarget() 整段字面 ＋ '
+          'otaTargetId 寫入點 %d 處（限 otaSetTarget()／fakeOtaForCapacityTest()） ＋ '
+          '兩個陣列宣告 ＋ phase≤12／error≤16 共 %d 個字面'
+          % (n_isota_assign,
+             locals().get('n_set_status', '未量'), locals().get('n_updating', '未量'),
+             locals().get('got', '解析失敗'), n_id_write,
+             len(re.findall(r'"([^"]*)"', locals().get('pn_code', ''))) + len(err_lits)))
 
     print('HIT 檢查 %d 項、BANNED 樣式 %d 條 × 檔案 %d 份（含原始碼註釋）；'
           'PLAN 樣式 %d 條 × %d 份'
