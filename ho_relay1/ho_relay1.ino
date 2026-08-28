@@ -54,6 +54,7 @@ const int CONFIRM_TIME = 3000;        // 確認等待 3 秒
 bool isBlinking = false;              // LED 閃爍狀態
 bool waitingConfirm = false;          // 等待確認狀態
 String deviceIdString;                // 儲存格式化後的設備 ID
+String legacyDeviceIdString;          // 舊版（MAC 反序）設備 ID，僅用於相容尚未更新的 App
 int failedAttempts = 0;               // MQTT 重試次數計數器
 
 char ssid[32] = "";
@@ -206,21 +207,45 @@ const char* getDeviceId() {
   if (deviceIdString.length() == 0) {  // 如果還沒有產生過
     uint64_t chipId = ESP.getEfuseMac();
     uint8_t* chipIdBytes = (uint8_t*)&chipId;
-    
-    // 按照網路順序（從左到右）組合 MAC 位址
+
+    // ESP.getEfuseMac() 以小端序把 mac[0]..mac[5] 寫進 uint64 的最低 6 個位元組，
+    // 因此 chipIdBytes[0] 就是 mac[0]。由 [0] 印到 [5] 才是網路順序（與 WiFi.macAddress() 一致）
     char tempId[23];
-    snprintf(tempId, 23, "hoban-%02x%02x%02x%02x%02x%02x", 
-      chipIdBytes[5],  // 最高位元組
+    snprintf(tempId, 23, "hoban-%02x%02x%02x%02x%02x%02x",
+      chipIdBytes[0],  // mac[0]（廠商 OUI 開頭）
+      chipIdBytes[1],
+      chipIdBytes[2],
+      chipIdBytes[3],
+      chipIdBytes[4],
+      chipIdBytes[5]   // mac[5]
+    );
+
+    deviceIdString = String(tempId);
+  }
+  return deviceIdString.c_str();
+}
+
+// 舊版設備 ID（MAC 反序輸出，1.0.5 以前的格式）
+// 只用來額外訂閱舊的 control 主題，讓尚未更新的 App 仍能控制設備，避免 OTA 後失聯。
+// 狀態一律只發布到新的正序主題，待所有 App 完成遷移後可移除本函式。
+const char* getLegacyDeviceId() {
+  if (legacyDeviceIdString.length() == 0) {
+    uint64_t chipId = ESP.getEfuseMac();
+    uint8_t* chipIdBytes = (uint8_t*)&chipId;
+
+    char tempId[23];
+    snprintf(tempId, 23, "hoban-%02x%02x%02x%02x%02x%02x",
+      chipIdBytes[5],
       chipIdBytes[4],
       chipIdBytes[3],
       chipIdBytes[2],
       chipIdBytes[1],
-      chipIdBytes[0]   // 最低位元組
+      chipIdBytes[0]
     );
-    
-    deviceIdString = String(tempId);
+
+    legacyDeviceIdString = String(tempId);
   }
-  return deviceIdString.c_str();
+  return legacyDeviceIdString.c_str();
 }
 
 void pulseRelay() {
@@ -244,7 +269,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print("] ");
   Serial.println(message);
 
-  if (String(topic) == String("hoban/" + deviceId + "/control")) {
+  // 舊版主題（MAC 反序）仍然受理，避免尚未更新的 App 無法控制
+  String legacyTopic = String("hoban/") + getLegacyDeviceId() + "/control";
+  String topicStr = String(topic);
+
+  if (topicStr == String("hoban/" + deviceId + "/control") || topicStr == legacyTopic) {
+    if (topicStr == legacyTopic) {
+      Serial.println("⚠ 收到舊版主題指令（App 尚未更新設備 ID）");
+    }
+
     if (message == "status") {
       publishStatus();  // 使用 JSON 格式發布狀態
     } else if (message == "ON") {
@@ -754,6 +787,13 @@ void connectToMQTT() {
 
     Serial.print("已訂閱主題: ");
     Serial.println(controlTopic);
+
+    // 同時訂閱舊版（MAC 反序）控制主題，讓尚未更新的 App 仍能控制設備
+    String legacyControlTopic = String("hoban/") + getLegacyDeviceId() + "/control";
+    mqttClient.subscribe(legacyControlTopic.c_str());
+
+    Serial.print("已訂閱舊版主題: ");
+    Serial.println(legacyControlTopic);
     failedAttempts = 0;
   } else {
     mqttStatus = "連接失敗 (錯誤碼: " + String(mqttClient.state()) + ")";
