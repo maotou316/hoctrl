@@ -3,3 +3,11 @@
 
 # SDD 執行工作區
 .superpowers/
+
+# VSCode 本機偏好（板子、埠號、IntelliSense 路徑，每台機器不同）
+.vscode/
+*/.vscode/
+
+# Python 位元碼快取（跑 tools/ 的模擬腳本時產生）
+__pycache__/
+*.pyc
