@@ -21,7 +21,7 @@
 // 改了程式碼卻沒動這三個數字就重燒，master 一樣會等到 90 秒逾時 —— 那是誤紅方向。
 #define HO_SLAVE_FW_MAJOR 1
 #define HO_SLAVE_FW_MINOR 0
-#define HO_SLAVE_FW_PATCH 0
+#define HO_SLAVE_FW_PATCH 1
 #define HO_STRINGIFY_(x) #x
 #define HO_STRINGIFY(x) HO_STRINGIFY_(x)
 
