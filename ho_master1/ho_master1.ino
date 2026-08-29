@@ -499,7 +499,27 @@ uint8_t  otaTargetMac[6] = { 0 };
 //   多問一次狀態，無安全性影響）。**真相一律以 otaTargetMac 為準**，
 //   Task 4 送封包時不得用這個索引。
 int      otaTargetIdx = -1;
-char     otaUrl[160] = "";
+// ⚠ **160 是不夠的，2026-08-29 實機量到。**
+//
+// 專案的發布通路是 GitHub Releases（publish.py 就是往那裡上傳），而
+// `github.com/.../releases/download/...` 會 302 轉到一個**帶 SAS token ＋ JWT
+// 的簽章網址**。實測長度：
+//
+//   https://github.com/maotou316/hoctrl-firmware/releases/download/... →  98 字元
+//   Location: https://release-assets.githubusercontent.com/...        → 917 字元
+//
+// 舊值 160 讓下面那道 `loc.length() >= sizeof(otaUrl)` 必然成立 ——
+// **從 GitHub Release 下載在這支韌體上原理上不可能成功**。
+// 對照組是 ho_relay2.ino：它用的是動態的 `String finalUrl`，沒有上限，
+// 所以既有的單機 OTA 一直好好的，沒有人撞到這個迴歸。
+//
+// 取 2048 而不是剛好蓋過 917：簽章網址的長度由 GitHub 決定、會隨時間變動，
+// 卡在剛好夠等於把整條通路押在一個別人隨時會改的數字上。
+// 代價是 2KB 靜態 RAM（C3 有 320KB，佔 0.6%），而且 otaUrl **不進狀態 JSON**
+// （ota 物件只發 target/phase/progress/size/error），不影響 STATUS_OTA_MAX_BYTES。
+char     otaUrl[2048] = "";
+// 只存主機名，不含路徑與查詢字串。轉址後的主機是
+// `release-assets.githubusercontent.com`（36 字元），80 夠用。
 char     otaHost[80] = "";
 // C3 修正：OTA_RESOLVING 解析出來的 IP 與埠號要留著，之後**直接用 IP 連線** ——
 // 這樣 NetworkClientSecure::connect() 就不會再自己做一次 hostByName()，
@@ -3707,8 +3727,10 @@ bool otaStart(const char* slaveId, const char* url, const char* version,
 
   otaSetTarget(slaveId, mac);
   otaTargetIdx = idx;
-  // ⚠ url 長度超過 otaUrl[160] 時 snprintf 會截斷，之後 GET 幾乎必然失敗（http_fail）。
+  // ⚠ url 長度超過 sizeof(otaUrl) 時 snprintf 會截斷，之後 GET 幾乎必然失敗（http_fail）。
   //   不另外報 bad_url，因為截斷的後果是誠實的紅燈，不是綠燈。
+  //   （寫 sizeof 而不是寫死數字：這個上限在 2026-08-29 從 160 改成 2048，
+  //    而當時**這行註釋本身**還停在舊數字上——見 otaUrl 宣告處的說明。）
   snprintf(otaUrl, sizeof(otaUrl), "%s", url);
   otaErrCode[0] = '\0';
 
@@ -3888,8 +3910,35 @@ void updateOtaSession(unsigned long now) {
   //   代價：一次工作階段的絕對上界由 300 秒變成 300 + 90 ＝ **390 秒**。
   //   **它擋不住什麼**：VERIFYING 仍然可能空等滿 90 秒（那是誠實的 no_return）；
   //   而 300 秒對下載＋轉送那一段的兜底一個字都沒放寬。
+  // ⚠⚠ **這個比較必須是 wrap-safe 的（帶號差值），2026-08-29 實機量到。**
+  //
+  // 舊寫法是無號數的 `now - otaSessionStart >= OTA_SESSION_MAX_MS`，
+  // 而 `otaSessionStart` 有可能**比 now 還晚**：
+  //
+  //   loop() 開頭    unsigned long now = millis();          ← now 在這裡取樣
+  //   loop() 中段    mqttClient.loop();                      ← update_slave 在這裡被處理
+  //                    → mqttCallback → handleMasterCommand → otaStart()
+  //                    → otaSessionStart = millis()          ← 比 now 晚（可達數秒）
+  //   loop() 後段    updateOtaSession(now);                  ← 拿舊的 now 減新的 start
+  //
+  // 無號數相減下溢成約 42.9 億 → 必然 `>= 300000` → 這道總逾時在工作階段的
+  // **第一拍**就開火，而且 `otaPhase < OTA_BEGIN_SENT` 成立 → 報 `http_fail`，
+  // 中間一行輸出都沒有。實機序列埠長這樣：
+  //
+  //   [OTA] 開始工作階段 239：目標 hoban-…，版本 1.0.1
+  //   [OTA] 網址 https://…
+  //   [OTA] 失敗：http_fail（目標 hoban-…）
+  //
+  // **從 MQTT 發起的 update_slave 因此 100% 必敗。**
+  // 序列埠的 otadl／otarelay 不受影響 —— handleSerialCommand() 排在
+  // updateOtaSession(now) **後面**，下一輪 loop() 的 now 重新取樣就正常了。
+  // 這就是為什麼靜態推演與序列埠測試都看不出來，而 Phase 4 的 MQTT 路徑
+  // 在 2026-08-29 之前從來沒有被實際執行過。
+  //
+  // 本檔別處早就用了 wrap-safe 的慣例（例如 `(long)(now - otaRetryAt) < 0`），
+  // 這一處是漏的。
   if (!otaPhaseIsFinal() && otaPhase != OTA_VERIFYING &&
-      now - otaSessionStart >= OTA_SESSION_MAX_MS) {
+      (long)(now - otaSessionStart) >= (long)OTA_SESSION_MAX_MS) {
     otaFail(otaPhase < OTA_BEGIN_SENT ? "http_fail" : "slave_timeout");
     return;
   }
