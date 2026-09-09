@@ -1,7 +1,7 @@
 ### hoRelay2
 - **開發板**: ESP32-C3 Dev Module
 - **特色**: 無聲繼電器
-- **韌體版本**: 1.8.0
+- **韌體版本**: 1.8.1
 - **GPIO 定義**:
   - BOOT 按鈕: GPIO 9
   - RESET 按鈕: GPIO 1（1.8.0 起**同時是電池電量的 ADC 輸入**，見下方 1.8.0 版本記錄與
@@ -171,6 +171,26 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 ---
 
 ## 版本記錄
+
+### 1.8.1
+
+**USB 接著電腦但沒人讀序列埠時，`Serial` 不再阻塞。**
+
+`CDCOnBoot=cdc` 下 `Serial` 是 HWCDC。電腦曾開過序列埠（監視視窗、esptool）之後，
+core 3.3.x 的 `HWCDC::write()` 就把鏈路視為 connected；之後關掉監視但 USB 線還插著，
+`isPlugged()` 仍為 true、旗標永遠翻不回去，每一次 `write()` 要等 20 × 100 ms = **2 秒**才放棄。
+`mqttCallback → publishStatus` 一路印十幾行，**一個指令就卡 35～60 秒**，MQTT loop 跑不到、
+keepalive 過期、broker 45 秒後用 LWT 踢掉。外觀是「收到指令就斷線、一分鐘後自己回來」，
+開機秒數卻連續；開機後 WiFi/MQTT 要連 114 秒也是同一個原因（開機 log 很多行）。
+
+`Serial.begin()` 後加 `Serial.setTxTimeoutMs(0)`：緩衝滿了就丟，不等。
+
+**現場設備本來就不受影響**（沒接電腦、從未列舉，走非阻塞 FIFO 路徑），這是讓桌面測試
+的行為跟現場一致。桌面測試的兩種假故障（本項，以及 DTR/RTS 把 C3 弄進下載模式造成
+繼電器常開）整理在 `.claude/rules/usb-cdc-bench-artifacts.md`。
+
+**實測狀態**：已在實機驗證。修正前序列埠不開時 4/4 收指令即斷線；修正後開機 15 秒上線、
+`status`／`OFF`／`ON` 全部即時回應、點動 2 秒、之後持續在線。
 
 ### 1.8.0
 

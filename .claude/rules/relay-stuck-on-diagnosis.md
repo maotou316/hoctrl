@@ -80,8 +80,12 @@ ADC 滿檔約 3100mV，讀到飽和只代表「至少到滿檔」，無法分辨
 [7,   200008,  333]   ← 繼電器腳，撞上限 —— 但這張板繼電器完全正常
 ```
 
-P25 版（繼電器在 GPIO 7）正常運作時 gate 本來就被拉在高電位（推測是 P 通道 MOS 或
-gate 有上拉，靠拉低導通）；Y176 版（GPIO 4）則相反。所以同一個讀數在兩版上意義相反。
+P25 版（繼電器在 GPIO 7）放掉驅動後 gate 會停在高電位、1.25 ms 內不會靠內部下拉洩掉；
+Y176 版（GPIO 4）則會掉下來。所以同一個讀數在兩版上意義相反。
+
+**不要把「放手後停在高電位」解讀成「靠拉低導通」**（2026-09-09 曾這樣寫，錯）：
+兩版韌體都是 HIGH＝開，正常的 P25 板照這樣跑得好好的，P25 一定也是 HIGH 才導通。
+那個讀數只說明 gate 前級的電容或偏壓讓它洩得慢，不說明導通極性。
 
 曾據此在韌體加過 `relay_fault` 自檢，一上線就在正常的 P25 板上持續誤報，**當天撤回**。
 要重做必須先能分辨板版，或改用不依賴絕對電位的判準。
@@ -109,6 +113,94 @@ gate 有上拉，靠拉低導通）；Y176 版（GPIO 4）則相反。所以同�
 「這張板故障」這件事，那是行為證據：接上外接電源後連下 12 次 ON/OFF，負載完全無反應、
 恆通電。至於故障機制的解釋，唯一旁證是它的上升只有 26 cycles，而正常接著 gate 的腳
 （那張 P25 板）是 333 cycles，差一個數量級，代表壞板那支腳缺少 gate 該有的電容性。
+
+## 2026-09-09 實測資料（hoRelay2，MAC 10:B4:1D:4A:FE:5C，P25 版）——板子沒壞
+
+**這一筆的最終結論是「板子正常」。** 當晚曾寫成「gate 側正常但恆開 → MOS D-S 貫通、換 MOSFET」，
+隔天推翻：恆開全部發生在**晶片根本沒在跑韌體**的時候，機制見 `usb-cdc-bench-artifacts.md`。
+
+9 輪 gate 讀數完全一致（這部分仍有效，是 P25 版第二筆「正常板」對照）：
+
+```
+[pin, 下降cycles, 上升cycles]
+[7,   200005,  260]   ← 繼電器 gate（P25），對照另一張正常 P25 板是 [7, 200008, 333]
+[4,   25,      26]    ← 空接腳（P25 版未接 MOS）
+[0,   709,     926]   ← 面板 LED 對照，有外接負載
+[3,   61,      62]    ← 板載 LED 對照，有外接負載
+[6,   25,      26]    ← 浮空基準
+[10,  25,      26]    ← 浮空基準
+```
+
+**判準（P25 版看上升，不看下降）**：下降撞上限是 P25 的正常表現，沒有鑑別力。
+上升 260 與另一張正常 P25 板的 333 同數量級，而空接腳只有 26。
+
+### 當晚誤判的過程，下次別再走一遍
+
+1. 燒完韌體「繼電器常開」→ 其實 esptool 關埠時 DTR/RTS 把 C3 弄進 ROM 下載模式，韌體沒跑
+2. 用 MQTT 下 ON/OFF，序列埠開著、韌體有回應，使用者卻回報「負載完全不動、恆通電」
+   → 據此判定硬體壞。**事後看這個觀察對不上其他所有證據**，但當時沒有追問就下了定論
+3. 燒回韌體後使用者說「正常了」；關掉監視視窗又常開 → 又是下載模式（序列埠只剩 ROM banner）
+4. 用 esptool 硬重置、**完全不開序列埠**、純 MQTT 查狀態：韌體 `relay:0`，負載斷 → 板子沒壞
+
+**教訓**：
+- 「韌體說關、負載卻通」要先確認**韌體真的在跑**（開機秒數、能不能回 MQTT），不是先懷疑 MOS
+- 使用者一句與其他證據矛盾的觀察，要當場重測，不能直接當結論的基石
+- 本規則第一步「用 MQTT 下指令」在 USB 接著電腦時有第二個陷阱（HWCDC 阻塞，同上檔案），
+  指令可能根本沒被處理；1.8.1 起 `Serial.setTxTimeoutMs(0)` 已修，舊韌體要開著監視測
+
+### 診斷 sketch 的可用寫法（實測跑得動）
+
+用 `soc/gpio_reg.h` 的暫存器宏，比直接碰 `GPIO.` struct 穩（ESP-IDF 各版欄位名不同）：
+
+```c
+#include "driver/gpio.h"
+#include "soc/gpio_reg.h"
+#include "esp_cpu.h"
+
+// toHigh=false：充高後放手，量掉到 LOW 幾 cycle（配內部下拉）
+// toHigh=true ：拉低後放手，量升到 HIGH 幾 cycle（配內部上拉）
+uint32_t measure(int pin, bool toHigh) {
+  const uint32_t mask = 1UL << pin;
+  gpio_set_pull_mode((gpio_num_t)pin, toHigh ? GPIO_PULLUP_ONLY : GPIO_PULLDOWN_ONLY);
+  REG_WRITE(GPIO_ENABLE_W1TS_REG, mask);
+  REG_WRITE(toHigh ? GPIO_OUT_W1TC_REG : GPIO_OUT_W1TS_REG, mask);
+  delayMicroseconds(500);                      // 等 gate 電容充飽
+  uint32_t n = 0;
+  portDISABLE_INTERRUPTS();
+  REG_WRITE(GPIO_ENABLE_W1TC_REG, mask);       // 只用一個 store 放掉驅動
+  uint32_t t0 = esp_cpu_get_cycle_count();
+  while (true) {
+    uint32_t level = (REG_READ(GPIO_IN_REG) >> pin) & 1;
+    if (toHigh ? level : !level) break;
+    n = esp_cpu_get_cycle_count() - t0;
+    if (n > 200000) break;                     // CEILING
+  }
+  portENABLE_INTERRUPTS();
+  REG_WRITE(GPIO_ENABLE_W1TS_REG, mask);       // 收尾一律回到輸出 LOW
+  REG_WRITE(GPIO_OUT_W1TC_REG, mask);
+  return n;
+}
+```
+
+- 兩個方向都要量。P25 版只看下降會得到「撞上限」，跟正常板無從分辨
+- `setup()` 第一行仍要 `initRelayPins()`，每輪測完再拉低一次（測試會把 gate 充高 500μs）
+- sketch 燒進去用 `EraseFlash=none`，測完 `.\flash.ps1 -Model 2 -Upload -KeepConfig` 燒回，
+  EEPROM 的 WiFi 設定不會掉，省一次 BLE 配網
+- 每 3 秒重印一輪：ESP32-C3 開 `CDCOnBoot=cdc` 時 USB CDC 會重新列舉，
+  只在 `setup()` 印一次的話，序列埠還沒接上就印完了
+
+### 判斷「韌體到底有沒有在跑」的取證方式
+
+`CDCOnBoot=cdc` 下開序列埠常常只讀到 `ESP-ROM:esp32c3-...` 就沒了，那是 USB CDC 重新列舉
+把 handle 弄失效，**不代表韌體沒跑**。要看開機訊息就用 esptool 硬重置後立刻重連：
+
+```powershell
+& $esptool --chip esp32c3 -p COM14 --after hard-reset flash-id
+# 接著迴圈重試 Open COM14（DtrEnable/RtsEnable 都設 $false）
+```
+
+**.NET SerialPort 的 `RtsEnable = $true` 會 assert RTS，把 EN 拉低讓晶片一直卡在 reset**，
+全程讀不到東西。要讓晶片正常跑，DTR 與 RTS 都設 `$false`。
 
 ## 順帶確認的事
 

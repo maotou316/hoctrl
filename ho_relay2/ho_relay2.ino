@@ -12,7 +12,7 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.8.0"; // 當前韌體版本
+const char* firmwareVersion = "1.8.1"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -1061,6 +1061,16 @@ void setup()
   initRelayPins();
 
   Serial.begin(115200);
+  // 【沒人讀 USB CDC 時絕不能讓 Serial 卡住】CDCOnBoot=cdc 下 Serial 是 HWCDC。
+  // 電腦曾開過序列埠（監視視窗、esptool）之後，core 3.3.x 的 HWCDC::write() 就把
+  // 鏈路視為 connected；之後關掉監視但 USB 線還插著，isPlugged() 仍為 true，旗標
+  // 永遠翻不回去，每一次 write() 都要等 20 × tx_timeout_ms(100ms) = 2 秒才放棄。
+  // mqttCallback → publishStatus 一路印十幾行，一個指令就卡 35～60 秒，MQTT loop
+  // 跑不到、keepalive 過期、broker 45 秒後用 LWT 踢掉——外觀是「收到指令就斷線、
+  // 一分鐘後自己回來」，開機秒數卻連續（2026-09-10 實測，開著監視就完全正常）。
+  // 現場設備沒接電腦、從未列舉，走的是非阻塞 FIFO 路徑，本來就不受影響；這行是
+  // 讓桌面測試時的行為跟現場一致。逾時設 0：緩衝滿了就丟，不等。
+  Serial.setTxTimeoutMs(0);
   delay(1000); // 等待序列埠穩定
 
   Serial.println("齁控－動物管制遠端控制系統 v" + String(firmwareVersion));
