@@ -12,7 +12,7 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.8.2"; // 當前韌體版本
+const char* firmwareVersion = "1.8.3"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -404,32 +404,69 @@ void clearWiFiConfig() {
 
 // 開機時偵測分壓模組是否存在，決定 GPIO 1 走 ADC 模式還是原本的 INPUT_PULLUP 按鈕模式。
 //
-// 原理：把腳設成 INPUT_PULLDOWN 讀一次。
-//   有模組 → 分壓源阻抗僅 6kΩ，對抗內部 45kΩ 下拉後仍有約 1.48V → 讀 HIGH
-//   沒模組 → 腳被內部下拉直接扯到 GND → 讀 LOW
+// 原理：開內部下拉，用 ADC 讀電壓。
+//   有模組 → 分壓源阻抗僅 6kΩ，對抗內部 45kΩ 下拉後仍有約 1.0~1.5V
+//   沒模組 → 腳被內部下拉直接扯到 GND → 接近 0mV
+// 【1.8.3 起改用 ADC 判斷，不能用 digitalRead】1.8.0 的寫法是 INPUT_PULLDOWN 後
+// digitalRead 看 HIGH/LOW，但有模組時腳上那 1.48V 對 ESP32-C3 的數位輸入是灰色地帶
+// （判 HIGH 要 ≥2.5V、判 LOW 要 ≤0.8V），實機讀成 LOW → 判成沒模組 → 退回
+// INPUT_PULLUP 按鈕模式 → 分壓輸出約 1.7V 又落在灰色地帶被讀成 LOW → 一開機就
+// 「偵測到按鈕按下，開始計時」（2026-09-10 第一次接模組實測）。ADC 讀 mV 兩邊差十倍以上，
+// 沒有灰色地帶。
+//
+// analogRead 附掛腳位時會把腳改成 ANALOG 模式、拿掉上下拉，所以下拉要在附掛之後
+// 用 gpio_pulldown_en() 補回來；偵測完成後再拿掉，否則 45kΩ 下拉會並聯到分壓下臂，
+// 讀值會偏低約 14%。
+//
 // 沒有這道偵測的話，未改裝的板子刷上這版韌體會很慘：GPIO 1 沒了 INPUT_PULLUP
 // 又只接一顆對地按鈕，等於浮空，ADC 讀隨機值隨時可能掉進按鈕門檻而誤觸重置。
 //
 // 誤判情境：開機瞬間按住 RESET 按鈕會把腳短路到地，被判成「沒有模組」。
 // 可接受 —— 按住按鈕開機本來就不是合法流程（見 checkStuckButtons() 的註釋），
 // 放開後重新上電即恢復。
+const int BATTERY_DETECT_MV = 600;    // 開下拉後 ADC 高於此值 → 判定有分壓模組
+
 void detectBatterySense() {
-  pinMode(batterySensePin, INPUT_PULLDOWN);
+  analogReadResolution(12);
+  analogReadMilliVolts(batterySensePin);               // 先附掛成 ANALOG，之後才能設衰減、補下拉
+  analogSetPinAttenuation(batterySensePin, ADC_11db);  // 量程約 0~2.5V 線性，涵蓋 1.20~1.68V
+                                                       // （放在附掛前會印 "Pin is not configured as analog channel"）
+  gpio_pulldown_en((gpio_num_t)batterySensePin);
   delay(20);  // 等內部下拉把腳位拉穩
-  int highCount = 0;
-  for (int i = 0; i < 5; i++) {
-    if (digitalRead(batterySensePin) == HIGH) highCount++;
-    delay(5);
-  }
-  batterySenseAvailable = (highCount >= 4);
+  int detectMv = readSenseMilliVolts(8);
+  gpio_pulldown_dis((gpio_num_t)batterySensePin);
+
+  // 診斷指紋：再開上拉量一次，分辨「沒接模組」（≈3300）與「模組接了但沒供電」
+  // （S 經 7.5kΩ 到地，≈470，會被按鈕模式當成按下）。只印出來，不參與判定。
+  gpio_pullup_en((gpio_num_t)batterySensePin);
+  delay(20);
+  int pullupMv = readSenseMilliVolts(8);
+  gpio_pullup_dis((gpio_num_t)batterySensePin);
+  Serial.printf("電量檢測: 指紋 開下拉 %d mV / 開上拉 %d mV（沒模組≈0/3300、模組沒電≈0/470、模組有電≈1300/1700）\n",
+                detectMv, pullupMv);
+
+  batterySenseAvailable = (detectMv >= BATTERY_DETECT_MV);
 
   if (batterySenseAvailable) {
-    analogReadResolution(12);
-    analogSetPinAttenuation(batterySensePin, ADC_11db);  // 量程約 0~2.5V 線性，涵蓋 1.20~1.68V
-    Serial.printf("電量檢測: 已啟用（GPIO %d 走 ADC，兼作 RESET 按鈕）\n", batterySensePin);
+    delay(20);  // 下拉拿掉後讓分壓回到真實電位
+    int senseMv = readSenseMilliVolts(BATTERY_SAMPLES);
+    Serial.printf("電量檢測: 已啟用（GPIO %d 走 ADC，兼作 RESET 按鈕；偵測 %d mV，分壓 %d mV → 電池約 %d mV）\n",
+                  batterySensePin, detectMv, senseMv, senseToBatteryMilliVolts(senseMv));
   } else {
     pinMode(batterySensePin, INPUT_PULLUP);
-    Serial.printf("電量檢測: 未偵測到分壓模組，GPIO %d 退回按鈕模式\n", batterySensePin);
+    Serial.printf("電量檢測: 未偵測到分壓模組（開下拉後偵測 %d mV，門檻 %d mV），GPIO %d 退回按鈕模式\n",
+                  detectMv, BATTERY_DETECT_MV, batterySensePin);
+    // 「模組接了但沒供電」保護：S 經模組下臂 7.5kΩ 通到地，開上拉只剩約 500mV，
+    // 按鈕模式會把它當成一直按著，3 秒後觸發長按重置、清光 WiFi 設定
+    // （2026-09-10 第一次接模組、VCC 沒接上，實測指紋 0/527）。
+    // 沒接模組時開上拉是 ≈3300，正常按鈕放開也是 ≈3300，所以低於 2000 一定是線上
+    // 掛了外部東西。這種狀態下停用重置按鈕，寧可少一個功能也不能自毀設定。
+    if (pullupMv < 2000) {
+      resetButtonUsable = false;
+      Serial.printf("⚠ 電量檢測: 開上拉僅 %d mV，GPIO %d 被外部拉低（分壓模組接了但沒供電？），"
+                    "本次開機停用 RESET 按鈕以免誤觸重置。請檢查模組 VCC/GND 是否接到電池\n",
+                    pullupMv, batterySensePin);
+    }
   }
 }
 

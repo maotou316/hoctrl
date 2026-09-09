@@ -46,10 +46,23 @@ GPIO 2 雖然是 ADC1_CH2，但板子沒拉出焊點，而且它是 strapping pi
 
 ## 未改裝的板子會自動退回按鈕模式
 
-`detectBatterySense()` 在開機時把腳設成 `INPUT_PULLDOWN` 讀一次：
+`detectBatterySense()` 在開機時開內部下拉、**用 ADC 讀 mV**（1.8.3 起）：
 
-- 有模組 → 分壓源阻抗僅 6kΩ，對抗內部 45kΩ 下拉後仍有約 1.48V → 讀 HIGH
-- 沒模組 → 被內部下拉扯到 GND → 讀 LOW，退回原本的 `INPUT_PULLUP` 按鈕模式
+- 有模組 → 分壓源阻抗僅 6kΩ，對抗內部 45kΩ 下拉後仍有約 1.1～1.5V → ≥600mV 判有模組
+- 沒模組 → 被內部下拉扯到 GND → ≈0mV，退回原本的 `INPUT_PULLUP` 按鈕模式
+
+**不可以用 `digitalRead` 判斷**（1.8.0 的寫法，2026-09-10 第一次接模組就翻車）：1.48V 對 C3 的
+數位輸入是灰色地帶（HIGH ≥2.5V、LOW ≤0.8V），實機讀成 LOW → 判沒模組 → 按鈕模式下分壓輸出
+1.7V 又被讀成 LOW → 一開機就「偵測到按鈕按下」。
+
+實作細節：`analogRead` 附掛腳位會拿掉上下拉，下拉要在第一次 `analogReadMilliVolts()` 之後用
+`gpio_pulldown_en()` 補、偵測完 `gpio_pulldown_dis()`（留著會並聯分壓下臂，讀值偏低約 14%）；
+`analogSetPinAttenuation()` 也要放在第一次讀之後，否則印 `Pin is not configured as analog channel`。
+
+開機印的**指紋**（開下拉 mV／開上拉 mV）三種狀態一眼分：沒模組 ≈0/3300、
+**模組接了但沒供電 ≈0/500**、模組有電 ≈1300/1700。第二種在按鈕模式會被當成一直按著、
+3 秒後清光 WiFi；指紋落在那格（開上拉 <2000）韌體會停用 RESET 按鈕並印警告，
+使用者要去檢查模組 VCC/GND 有沒有接到電池。
 
 **沒有這道偵測的話，未改裝的板子刷上這版韌體會很慘**：GPIO 1 沒了 `INPUT_PULLUP`
 又只接一顆對地按鈕，等於浮空，ADC 讀隨機值隨時可能掉進按鈕門檻 →
