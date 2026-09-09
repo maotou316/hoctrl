@@ -44,10 +44,18 @@ broker 45 秒後 LWT 踢人。開機秒數連續（只是卡住，沒重啟）�
 其他 C3 sketch（ho_relay3、ho_slave1、ho_master1 的 C3 版）2026-09-10 時**尚未加**；ho_master1
 同一份 sketch 也編成 WROOM，`Serial` 是 HardwareSerial 沒這個方法，要包 `#if ARDUINO_USB_CDC_ON_BOOT`。
 
+## 韌體擋不住假故障一
+
+ESP32-C3 **沒有** `USB_UART_CHIP_RST_DIS` 這種關掉 DTR/RTS 重置的暫存器（C6／H2 才有，
+S3 也沒有），eFuse 只有「整個關掉下載模式」這種不能用的選項。所以只能從工具與操作下手。
+
 ## 桌面測試的正確姿勢
 
-1. 燒完韌體 → 按一下 RESET 或 esptool 硬重置 → **用 MQTT 確認 `online`**，不要靠序列埠
-2. 要看序列 log 就整段測試都開著，中途不要關；關了要重做第 1 步
-3. 修正前的舊韌體，MQTT 指令測試一律開著監視做，否則指令根本沒被處理
+1. **燒錄一律用 `.\flash.ps1`**：燒完會自動再做一次 esptool 硬重置，實測這條路徑每次都正常開機
+2. **看 log 一律用 `.\monitor.ps1`**（arduino-cli monitor，`dtr=off,rts=off`），**不要開 IDE 的監視視窗**——
+   IDE 開埠、關埠都可能把晶片弄進下載模式（2026-09-10 新板實測，關監視即常開）
+3. 若還是懷疑它沒在跑：`esptool --chip esp32c3 -p COMx --after hard-reset chip-id`，
+   然後**用 MQTT 確認 `online`**，不要再開埠去看
+4. 修正前的舊韌體（<1.8.1），MQTT 指令測試一律開著監視做，否則指令根本沒被處理
 4. 手刻的極簡 MQTT 客戶端（`mqtt_pub.py`／`mqtt_sub.py`／`mqtt_seq_when_online.py`，
    只用 Python 標準函式庫）留在 scratchpad，不在就重寫，幾十行

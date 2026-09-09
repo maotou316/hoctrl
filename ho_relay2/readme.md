@@ -36,6 +36,11 @@ Set-Location A:\project\hoctrl_arduino
 
 `-Model` 的合法值是 `1,2,3,master,master-c3,slave,test`，**hoRelay2 對應 `2`**。
 腳本預設 `EraseFlash=all`，燒完 EEPROM 一併被抹掉，**需重新透過 BLE 配網**。
+燒完會自動再硬重置一次，確保晶片離開 ROM 下載模式（否則 P25 版繼電器會常開）。
+
+**看序列 log 請用 `.\monitor.ps1`，不要開 IDE 的監視視窗**——IDE 開埠、關埠時 DTR/RTS 的
+切換可能把 ESP32-C3 重置進下載模式，韌體停了、繼電器腳沒人驅動就常開。
+詳見 `.claude/rules/usb-cdc-bench-artifacts.md`。
 
 ### flash 用量要自己換算
 

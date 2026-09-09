@@ -144,3 +144,20 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 Write-Host "`n燒錄完成" -ForegroundColor Green
+
+# ── 燒完再硬重置一次 ──
+# ESP32-C3 內建 USB-Serial/JTAG 把 DTR/RTS 當自動下載電路用，esptool 上傳收尾關埠時
+# 兩條線的切換順序可能把晶片留在 ROM 下載模式：韌體沒跑、GPIO 4/7 沒人驅動，
+# P25 版繼電器會穩定常開直到按 RESET（2026-09-09 實測，誤判成硬體壞了）。
+# 明確再做一次 --after hard-reset，實測 esptool 這條路徑每次都正常開機。
+# 細節見 .claude/rules/usb-cdc-bench-artifacts.md
+$esptool = Get-ChildItem "$env:LOCALAPPDATA\Arduino15\packages\esp32\tools\esptool_py" -Filter esptool.exe -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending | Select-Object -First 1
+if ($null -ne $esptool) {
+    Write-Host "硬重置 $Port，確保離開下載模式…" -ForegroundColor Cyan
+    Start-Sleep -Milliseconds 500
+    & $esptool.FullName --chip auto -p $Port --after hard-reset chip-id 2>&1 | Select-String 'Hard resetting' | ForEach-Object { Write-Host "  $_" -ForegroundColor Green }
+    Write-Host "之後要看 log 請用 .\monitor.ps1（dtr/rts 都關），不要開 IDE 的監視視窗" -ForegroundColor Yellow
+} else {
+    Write-Host "找不到 esptool，略過硬重置；請手動按一下板上 RESET" -ForegroundColor Yellow
+}
