@@ -1,11 +1,11 @@
 ### hoRelay2
 - **開發板**: ESP32-C3 Dev Module
 - **特色**: 無聲繼電器
-- **韌體版本**: 1.6.1
+- **韌體版本**: 1.7.4
 - **GPIO 定義**:
   - BOOT 按鈕: GPIO 9
   - RESET 按鈕: GPIO 1
-  - 板載 LED: GPIO 3
+  - 板載 LED: GPIO 3（`setup()` 必須設成 `OUTPUT`；1.7.2 之前誤設為 `INPUT`，板載燈從未亮過）
   - 面板 LED: GPIO 0
   - 繼電器按鈕: GPIO 4 與 GPIO 7（兩支同時驅動，單一韌體通吃兩版板子）
     - 341305A_P25_250814 → 實際接在 GPIO 7
@@ -85,7 +85,7 @@ Set-Location A:\project\hoctrl_arduino
 | 狀態 | LED 行為 |
 |------|----------|
 | BLE 配對模式（含長按清除設定後）| 快閃 200ms（`PAIRING_BLINK`），持續不熄燈 |
-| WiFi 未連接 | 快閃 300ms（`QUICK_BLINK`），30 秒後熄燈省電 |
+| WiFi 未連接 | 快閃 300ms（`QUICK_BLINK`），滿 30 秒（`LED_TIMEOUT`）後轉為心跳閃：每 3 秒亮 100ms（`HEARTBEAT_PERIOD` / `HEARTBEAT_ON`），連不上就一直閃不熄燈 |
 | WiFi 已連、MQTT 未連 | 一長二短 |
 | WiFi 與 MQTT 都已連上 | 熄燈 |
 | 長按重置確認中 | 閃爍 250ms（`BLINK_INTERVAL`），確認後長亮 0.7 秒 |
@@ -102,7 +102,8 @@ BOOT(GPIO 9) 或 RESET(GPIO 1) **任一顆**，總共按住 5 秒：
 
 1. 按住滿 3 秒（`LONG_PRESS_TIME`）→ LED 開始以 250ms 週期閃爍
 2. 閃爍期間**持續按住**再 2 秒（`BLINK_CONFIRM_TIME`）→ LED 長亮 0.7 秒（`CONFIRM_SOLID_TIME`）
-3. 清除 EEPROM 全部 128 bytes 並重啟 → 進入 BLE 配對模式（200ms 持續快閃）
+3. 清除 EEPROM 全部 160 bytes（`EEPROM_SIZE`）、還原 WiFi driver 的 NVS 設定，
+   並重啟 → 進入 BLE 配對模式（200ms 持續快閃）
 
 中途放開即取消、計時歸零。WiFi 連線等待期間共用同一支 `waitForResetConfirm()`，
 行為與正常運作時一致。
@@ -147,7 +148,113 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ---
 
+## EEPROM 佈局
+
+`EEPROM.begin(160)`，欄位常數定義在 `ho_relay2.ino` 的 `EE_*`：
+
+| 位址 | 長度 | 欄位 |
+|------|------|------|
+| 0～31 | 32 | `ssid` |
+| 32～63 | 32 | `password` |
+| 64～95 | 32 | `mqttServer` |
+| 96 | 1 | `useCustomServer` |
+| 97 | 1 | 保留（未使用） |
+| 98～113 | 16 | `mqttUsername` |
+| 126～127 | 2 | `mqttPort`（低位元組在前） |
+| 130～145 | 16 | `mqttPassword` |
+
+**新增欄位務必先看這張表。** 1.7.3 之前 `mqttPassword` 排在 114～129，
+與 `mqttPort`(126/127) 重疊、且尾端 2 bytes 超出 `begin(128)` 的範圍，
+密碼只有前 12 字元是可靠的。
+
+---
+
 ## 版本記錄
+
+### 1.7.4
+
+**OTA 加上 MD5 驗證。** 起因是 2026-09-09 實測：同一份原始碼 **USB 燒進去一切正常、
+OTA 傳下去就開不起來**，而開不起來在這塊板子上等同**繼電器恆閉合**
+（MOS gate 無下拉電阻，見 `.claude/rules/relay-stuck-on-diagnosis.md`）——
+捕捉籠上最危險的失效方向。使用者回報舊版本也發生過，是長期問題。
+
+真正讓壞映像檔生效的是收尾那行 `Update.end(true)`：
+
+- `end(evenIfRemaining = true)` 會**跳過「寫滿了沒」的檢查**，把 `_size` 改成已寫入量直接收工
+- 而 `_verifyEnd()` 在沒有設定 MD5 時**只認映像檔開頭的 `0xE9` magic byte**
+- 兩者相加 → 只要前幾個位元組像個映像檔，後面全錯也會被接受，`otadata` 照樣切過去
+
+修正涵蓋三處（韌體／`publish.py`／App）：
+
+- 韌體 `startFirmwareUpdate()` 多收 `expectedMd5`，**缺合法 MD5（32 個十六進位字元）一律拒絕**
+  並回報 `update_rejected_no_md5`；`Update.begin()` 後呼叫 `Update.setMD5()`
+  （順序不可對調，`begin()` 會重置 MD5 狀態）
+- `Update.end(true)` 改為 `Update.end()`；失敗路徑補上 `Update.abort()`，
+  不 abort 的話半套映像檔會留在 OTA 分區、下一輪 `begin()` 也會失敗
+- 指令解析的 `StaticJsonDocument` 由 200 放大到 384（version + url + md5 三個欄位）
+- `publish.py` 發佈時算出 `.bin` 的 MD5 寫進 Firestore（Python 與 Node.js 兩條路徑都寫）
+- App 讀 `md5` 欄位，格式不合直接擋在確認對話框之前並說明原因，合法才送出
+
+**這不是把 OTA 修好，是把失效方向改掉。** 映像檔為何會在 OTA 途中損壞仍然不明；
+加了 MD5 之後驗證失敗會整份作廢、**`otadata` 不切換**，設備留在原本跑得動的韌體上，
+表現從「變磚 + 門恆開」變成「更新沒成功，繼續運作」。
+
+**相容性**：現場舊韌體用 `StaticJsonDocument<200>`，實測送出 158 bytes 的含 md5 指令
+（網址長度與真實發佈相同）解析成功並回報 `updating`，**不需要依版本決定送不送 md5**。
+
+**實測狀態**：三處均通過編譯／語法／`flutter analyze`，並已在實機上驗證舊韌體解析相容性。
+MD5 驗證本身的正向路徑（下載成功並通過比對）**尚未實機驗證**。
+
+### 1.7.3
+
+**修正「清除 WiFi 設定後第一次綁定必定失敗、第二次才成功」。**
+僅在「設備原本已連上某個 AP」時發生，因為沒連上過就不會有舊 AP 被寫進 NVS。
+
+根因是**清除設定只清了 EEPROM，沒清 WiFi driver 存在 NVS 的舊 AP**，
+開機後變成「driver 在背景連舊 AP」對撞「`connectToWiFi()` 在前景連新 AP」：
+
+- **`WiFi.persistent(false)` 排在 `WiFi.mode()` 之後，等於沒有生效。**
+  core 的 `persistent()` 只設一個旗標，真正生效的是 `mode()` 觸發的
+  `wifiLowLevelInit()` 裡那句 `if (!_persistent) esp_wifi_set_storage(WIFI_STORAGE_RAM)`。
+  順序寫反 → driver 用預設的 `WIFI_STORAGE_FLASH` 起來 → AP 照樣進 NVS。**已對調順序**
+- **`clearWiFiConfig()` 只清 EEPROM。** 已補上 `WiFi.disconnect(false, true)`
+  與 `esp_wifi_restore()`，把 driver 的持久化設定一併還原
+- **探測期間沒有關掉 core 的 auto-reconnect。** `connectToWiFi()` 每次
+  `WiFi.disconnect()` 都會觸發 core 的 `STA_DISCONNECTED` 分支去 `disconnect(); connect();`，
+  與前景的 `esp_wifi_set_config()` + `esp_wifi_connect()` 對撞，
+  4-way handshake 每次都被打斷 → 五種模式**全部** reason 15。
+  **已改為進門關閉、收尾打開**（收尾那行不可省，`_autoReconnect` 在 deinit 後仍存活、不會自己恢復）
+
+現場 log 的三個特徵都由此解釋：每個模式開頭的 reason 8（ASSOC_LEAVE，被自己人斷開）、
+五種模式一致的 reason 15、以及收尾的 `E wifi:sta is connecting, cannot set config`。
+「第二次就成功」是因為第一次探測已把 NVS 覆寫成新 AP，第二次前後景目標一致、不再互搶。
+
+一併修正 **EEPROM 佈局越界重疊**：`mqttPassword` 舊位址 114～129 與 `mqttPort`(126/127)
+重疊、尾端 2 bytes 超出 `begin(128)`，實際只有前 12 字元可靠。已搬到 130～145、
+`EEPROM.begin(160)`，並改用 `EE_*` 常數定址。**其餘欄位一格未動**，
+OTA 升級後既有設定照常運作，只有 MQTT 密碼需要重設。
+
+**實測狀態**：僅通過編譯，**尚未實機驗證**。根因為靜態推論，
+需實機重現「連線成功 → 清除 → 綁定新 SSID」確認第一次即可連上。
+
+### 1.7.2
+
+**修正「WiFi 連不上時完全沒有燈號」。** 兩個獨立缺陷疊在一起，
+造成最需要指示燈的情境（設備始終連不上）反而一顆燈都不亮：
+
+- **板載 LED 從未被驅動。** `setup()` 裡是 `pinMode(ledOnBoard, INPUT)`，
+  註釋還誤標成「初始化第二個按鈕」。GPIO 3 設成輸入模式後，全檔案 14 處
+  `digitalWrite(ledOnBoard, ...)` 全部推不動它。**已改為 `OUTPUT`**
+- **斷線 30 秒後永久熄燈。** `blinkLED()` 的 `wifiDisconnectStart` 只有
+  「WiFi 連上」才會歸零，而開機的 `connectToWiFi()` 每種 auth 模式就要等 10 秒、
+  還要輪好幾種，等它跑完進 `loop()`，`LED_TIMEOUT` 早就用光 → 連不上的設備
+  從頭到尾是暗的。**已改為滿 30 秒後轉低頻心跳閃**（每 3 秒亮 100ms，
+  duty cycle 約 3%，比原本 50% 的快閃更省電，且永遠看得出「我還沒連上」）
+
+沒有改成「每次重試重置計時」，因為補送 `esp_wifi_connect()` 的間隔是 10 秒
+（`WIFI_KICK_INTERVAL_MS`）< `LED_TIMEOUT`，那樣等於退回全速快閃、省電完全失效。
+
+**實測狀態**：僅通過編譯，**尚未實機驗證**。
 
 ### 1.7.0
 
