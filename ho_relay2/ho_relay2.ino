@@ -12,7 +12,7 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.8.1"; // 當前韌體版本
+const char* firmwareVersion = "1.8.2"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -838,16 +838,36 @@ const char* getLegacyDeviceId() {
 // reset 後的狀態不保證為低電位，越晚拉低、MOS 誤導通的時間窗就越長
 void initRelayPins() {
   for (int i = 0; i < relayPinCount; i++) {
+    // 上一輪 hold 可能還鎖著（軟體重啟、OTA 重啟後 hold 不會自己清），先解鎖才能設定
+    gpio_hold_dis((gpio_num_t)relayPins[i]);
     pinMode(relayPins[i], OUTPUT);
     digitalWrite(relayPins[i], LOW);
+    holdRelayPin(relayPins[i]);
   }
   relayState = false;
+}
+
+// 【用 pad hold 代替板子上缺的 gate 下拉電阻】兩版板子的 MOS gate 都沒有下拉，
+// 晶片沒在驅動腳位時（reset 空窗、卡在 ROM 下載模式、IDE 監視開關把 C3 重置）
+// gate 浮空或被內部上拉推高，P25 版繼電器會穩定常開（2026-09-09／10 兩塊板實測）。
+// 板子是定制的無法補焊，改用 gpio_hold_en()：把 pad 鎖在目前輸出電位，之後
+// 軟體重啟、EN 重置、下載模式都維持鎖住的電位，只有斷電重上電會清掉。
+// 代價是 hold 期間 digitalWrite 無效，所以 setRelayPins() 要先解鎖、切換、再鎖回去。
+void holdRelayPin(int pin) {
+  // 【鎖之前一定要等 pad 真的變成新電位】hold 鎖住的是「鎖定當下 pad 的實際電位」，
+  // 不是 GPIO 暫存器的值。digitalWrite 寫進暫存器到 pad 翻轉有數十 ns 延遲，
+  // 緊接著就 gpio_hold_en 會鎖到舊電位——1.8.2 第一版就是這樣：韌體回報 relay=1、
+  // 序列印「繼電器 ON」，pad 卻一直是 LOW，負載完全不動（2026-09-10 實測）。
+  delayMicroseconds(20);
+  gpio_hold_en((gpio_num_t)pin);
 }
 
 // 同時設定所有繼電器腳位的輸出
 void setRelayPins(bool on) {
   for (int i = 0; i < relayPinCount; i++) {
+    gpio_hold_dis((gpio_num_t)relayPins[i]);
     digitalWrite(relayPins[i], on ? HIGH : LOW);
+    holdRelayPin(relayPins[i]);
   }
   relayState = on;
 }

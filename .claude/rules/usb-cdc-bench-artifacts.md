@@ -44,10 +44,27 @@ broker 45 秒後 LWT 踢人。開機秒數連續（只是卡住，沒重啟）�
 其他 C3 sketch（ho_relay3、ho_slave1、ho_master1 的 C3 版）2026-09-10 時**尚未加**；ho_master1
 同一份 sketch 也編成 WROOM，`Serial` 是 HardwareSerial 沒這個方法，要包 `#if ARDUINO_USB_CDC_ON_BOOT`。
 
-## 韌體擋不住假故障一
+## 韌體擋不住重置本身，但擋得住腳位：GPIO pad hold（ho_relay2 1.8.2 起）
 
 ESP32-C3 **沒有** `USB_UART_CHIP_RST_DIS` 這種關掉 DTR/RTS 重置的暫存器（C6／H2 才有，
-S3 也沒有），eFuse 只有「整個關掉下載模式」這種不能用的選項。所以只能從工具與操作下手。
+S3 也沒有），eFuse 只有「整個關掉下載模式」這種不能用的選項。重置攔不住。
+
+但 `gpio_hold_en()` 可以把 pad 鎖在目前輸出電位，而且 hold **撐得過軟體重啟、EN 重置與
+ROM 下載模式**（2026-09-10 實測：esptool `--after no-reset` 留在下載模式 25 秒，P25 版繼電器
+不吸；IDE 監視開關後也不再常開），只有斷電重上電會清掉。等於用韌體補了那顆缺的 gate 下拉。
+寫法：`initRelayPins()` 先 `gpio_hold_dis`（上一輪的 hold 不會自己清）→ `pinMode`／`digitalWrite LOW`
+→ `gpio_hold_en`；`setRelayPins()` 每次解鎖 → 切換 → 鎖回。**hold 期間 `digitalWrite` 無效**，
+忘了解鎖繼電器就再也切不動。
+
+**切換後要 `delayMicroseconds(20)` 再鎖**：hold 鎖的是鎖定當下 pad 的實際電位，不是暫存器值。
+第一版沒等，`digitalWrite(HIGH)` 後立刻 hold 鎖到舊的 LOW——韌體回報 `relay:1`、序列印
+「繼電器 ON」、MQTT 狀態一切正常，**只有負載不動**。這種「軟體全對、實體不動」的症狀，
+先想 hold 競態，不要又去懷疑 MOS。
+
+其他 C3 sketch（ho_relay3、ho_slave1、ho_master1 C3 版）截至 2026-09-10 **尚未加**。
+
+進了下載模式後晶片「沒反應」不是當機：按 RESET、esptool 硬重置、拔電都能救回；
+hold 版本下這段期間繼電器維持斷開，所以不急。
 
 ## 桌面測試的正確姿勢
 
