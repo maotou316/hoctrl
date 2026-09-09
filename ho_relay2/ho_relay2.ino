@@ -12,7 +12,7 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.7.4"; // 當前韌體版本
+const char* firmwareVersion = "1.8.0"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -63,6 +63,49 @@ const int ledOnFace = 0;     // 面板 LED 在 GPIO 0
 // 這樣可避免腳位設錯時該腳未初始化而浮空，導致 MOS 誤導通、繼電器恆閉燒毀設備。
 const int relayPins[] = {4, 7};
 const int relayPinCount = sizeof(relayPins) / sizeof(relayPins[0]);
+
+// ── 電量檢測：GPIO 1 一支腳同時當「電池分壓量測」與「RESET 按鈕」──
+//
+// 為什麼擠在同一支腳：ESP32-C3 能接 ADC1 的只有 GPIO 0~4（ADC2 的 GPIO 5 在
+// WiFi 開啟時讀不到值，這台設備全程掛著 WiFi/MQTT，等於不能用），而板子上
+// 實際拉出可焊接的只有 GPIO 0（面板 LED）與 GPIO 1（RESET 按鈕）。
+//
+// 能共用的原理：按鈕的動作本來就是「把腳拉到 GND」，在 ADC 眼裡就是電壓掉到 0。
+// 所以全程只讀 ADC，不切 pinMode，就同時得到兩件事：
+//   1.20~1.68V → 電池 6.0~8.4V（2S 鋰電，模組原廠 5 倍分壓，不需改電阻）
+//   < 0.5V     → RESET 按鈕被按下
+// 按下時是 0V，離電池空電的 1.20V 有 2.4 倍距離，不可能誤判。
+//
+// 接線：分壓模組 S 腳接 GPIO 1，按鈕維持原本的 GPIO 1 ↔ GND。
+// 模組的 "+" 腳不用接（純電阻分壓，那支腳沒作用）。S 腳對 GND 要加 100nF，
+// 否則模組 6kΩ 的輸出阻抗擋不住 ESP32 ADC 取樣電容造成的抖動。
+const int batterySensePin = 1;                    // 與 resetButton 同一支腳
+
+// 選配的 100kΩ 上拉（GPIO 1 → 3.3V）會讓讀值線性偏移，換算係數因此有兩組。
+// 加上拉的用意是防「分壓模組焊點脫落」：沒有它，模組一掉線 GPIO 1 就浮空，
+// ADC 讀隨機值有機率掉進按鈕門檻而誤觸重置、把 WiFi 設定清光。
+// 加了之後脫落 = 讀到接近 3.3V，會被 BATTERY_OPEN_MV 判為量測異常。
+#define BATTERY_HAS_PULLUP 0                      // 焊了 100kΩ 上拉就改成 1
+#if BATTERY_HAS_PULLUP
+const float BATTERY_SCALE = 5.3f;                 // Vbat = (Vadc - offset) * scale
+const int BATTERY_OFFSET_MV = 187;                // 100k 上拉造成的固定抬升
+#else
+const float BATTERY_SCALE = 5.0f;                 // 模組原廠分壓比
+const int BATTERY_OFFSET_MV = 0;
+#endif
+
+const int BATTERY_BUTTON_MV = 500;    // ADC 低於此值 → 判定 RESET 按鈕按下
+const int BATTERY_OPEN_MV = 2500;     // ADC 高於此值 → 判定分壓模組脫落／量測異常
+const int BATTERY_SAMPLES = 8;        // 電量量測的取樣次數（按鈕偵測只取 1 次，不能拖慢 loop）
+const unsigned long BATTERY_READ_INTERVAL_MS = 5000;  // 電量重新量測的間隔
+
+// 分壓模組是否真的焊上去了（開機時自動偵測，見 detectBatterySense()）。
+// 沒焊的板子退回原本的 INPUT_PULLUP 按鈕模式，單一韌體通吃改裝前後兩種板子，
+// 與繼電器「GPIO 4/7 兩支同時驅動」是同一套哲學。
+bool batterySenseAvailable = false;
+int lastBatteryMilliVolts = 0;        // 最近一次有效的電池電壓（mV），0 代表還沒量到
+int lastBatteryPercent = -1;          // 最近一次有效的電量百分比，-1 代表未知
+unsigned long lastBatteryReadTime = 0;
 
 // 其他全域變數
 unsigned long buttonPressTime = 0;    // 記錄按下的時間
@@ -198,6 +241,10 @@ bool anyResetButtonPressed();
 void publishStatus();
 void smartConnectStep();
 void resetMqttProbe();
+void detectBatterySense();
+bool isResetButtonPressed();
+void updateBatteryReading();
+void addBatteryToStatus(JsonDocument& doc);
 
 // ── EEPROM 佈局 ──
 //
@@ -353,6 +400,112 @@ void clearWiFiConfig() {
   ESP.restart();
 }
 
+// ── 電量檢測相關函式 ──
+
+// 開機時偵測分壓模組是否存在，決定 GPIO 1 走 ADC 模式還是原本的 INPUT_PULLUP 按鈕模式。
+//
+// 原理：把腳設成 INPUT_PULLDOWN 讀一次。
+//   有模組 → 分壓源阻抗僅 6kΩ，對抗內部 45kΩ 下拉後仍有約 1.48V → 讀 HIGH
+//   沒模組 → 腳被內部下拉直接扯到 GND → 讀 LOW
+// 沒有這道偵測的話，未改裝的板子刷上這版韌體會很慘：GPIO 1 沒了 INPUT_PULLUP
+// 又只接一顆對地按鈕，等於浮空，ADC 讀隨機值隨時可能掉進按鈕門檻而誤觸重置。
+//
+// 誤判情境：開機瞬間按住 RESET 按鈕會把腳短路到地，被判成「沒有模組」。
+// 可接受 —— 按住按鈕開機本來就不是合法流程（見 checkStuckButtons() 的註釋），
+// 放開後重新上電即恢復。
+void detectBatterySense() {
+  pinMode(batterySensePin, INPUT_PULLDOWN);
+  delay(20);  // 等內部下拉把腳位拉穩
+  int highCount = 0;
+  for (int i = 0; i < 5; i++) {
+    if (digitalRead(batterySensePin) == HIGH) highCount++;
+    delay(5);
+  }
+  batterySenseAvailable = (highCount >= 4);
+
+  if (batterySenseAvailable) {
+    analogReadResolution(12);
+    analogSetPinAttenuation(batterySensePin, ADC_11db);  // 量程約 0~2.5V 線性，涵蓋 1.20~1.68V
+    Serial.printf("電量檢測: 已啟用（GPIO %d 走 ADC，兼作 RESET 按鈕）\n", batterySensePin);
+  } else {
+    pinMode(batterySensePin, INPUT_PULLUP);
+    Serial.printf("電量檢測: 未偵測到分壓模組，GPIO %d 退回按鈕模式\n", batterySensePin);
+  }
+}
+
+// 讀 GPIO 1 的電壓（mV）。用 analogReadMilliVolts() 而非 analogRead()：
+// 前者會套用 eFuse 裡的出廠校準，ESP32 的 ADC 非線性很嚴重，自己乘係數會差到 5% 以上。
+int readSenseMilliVolts(int samples) {
+  long total = 0;
+  for (int i = 0; i < samples; i++) {
+    total += analogReadMilliVolts(batterySensePin);
+  }
+  return (int)(total / samples);
+}
+
+// 把分壓後的讀值換算回電池電壓（mV）
+int senseToBatteryMilliVolts(int senseMv) {
+  int corrected = senseMv - BATTERY_OFFSET_MV;
+  if (corrected < 0) corrected = 0;
+  return (int)(corrected * BATTERY_SCALE);
+}
+
+// 2S 鋰電的放電曲線查表（單顆 SOC 曲線 ×2）。
+// 不用線性換算是因為鋰電中段極為平坦：7.74V 到 7.58V 之間就跨掉 20% 電量，
+// 而線性法會把這段算成 6%，App 上會看到「電量卡在 60% 很久然後瞬間掉光」。
+int batteryPercentFromMilliVolts(int mv) {
+  static const int curve[][2] = {
+    {8400, 100}, {8120, 90}, {7960, 80}, {7840, 70}, {7740, 60}, {7640, 50},
+    {7580, 40}, {7540, 30}, {7480, 20}, {7360, 10}, {6900, 5}, {6000, 0}
+  };
+  const int points = sizeof(curve) / sizeof(curve[0]);
+
+  if (mv >= curve[0][0]) return 100;
+  if (mv <= curve[points - 1][0]) return 0;
+
+  for (int i = 0; i < points - 1; i++) {
+    if (mv <= curve[i][0] && mv > curve[i + 1][0]) {
+      int mvSpan = curve[i][0] - curve[i + 1][0];
+      int pctSpan = curve[i][1] - curve[i + 1][1];
+      return curve[i + 1][1] + (mv - curve[i + 1][0]) * pctSpan / mvSpan;
+    }
+  }
+  return 0;
+}
+
+// RESET 按鈕是否被按下。
+// ADC 模式只取樣一次：這個函式在 loop 每一圈都會跑，8 次取樣會拖慢整個迴圈。
+bool isResetButtonPressed() {
+  if (!batterySenseAvailable) {
+    return digitalRead(batterySensePin) == LOW;
+  }
+  return analogReadMilliVolts(batterySensePin) < BATTERY_BUTTON_MV;
+}
+
+// 定期更新電池讀值。按鈕按住時腳被拉到地、模組脫落時讀值飄高，
+// 這兩種情況都不覆寫 lastBatteryMilliVolts —— 否則 App 會在使用者長按重置的那幾秒
+// 看到電量瞬間掉到 0，跳出「沒電」警告。
+void updateBatteryReading() {
+  if (!batterySenseAvailable) return;
+  if (millis() - lastBatteryReadTime < BATTERY_READ_INTERVAL_MS) return;
+  lastBatteryReadTime = millis();
+
+  int senseMv = readSenseMilliVolts(BATTERY_SAMPLES);
+  if (senseMv < BATTERY_BUTTON_MV || senseMv > BATTERY_OPEN_MV) return;  // 按鈕按住／量測異常，沿用舊值
+
+  lastBatteryMilliVolts = senseToBatteryMilliVolts(senseMv);
+  lastBatteryPercent = batteryPercentFromMilliVolts(lastBatteryMilliVolts);
+}
+
+// 把電量資訊掛進 status JSON。publishStatus() 與 publishStatusWithServer() 共用。
+void addBatteryToStatus(JsonDocument& doc) {
+  if (!batterySenseAvailable) return;
+  JsonObject battery = doc.createNestedObject("battery");
+  battery["mv"] = lastBatteryMilliVolts;
+  battery["percent"] = lastBatteryPercent;
+  battery["valid"] = (lastBatteryPercent >= 0);
+}
+
 // 開機按鈕自檢：短暫取樣兩支按鈕腳，整段都是 LOW 即判定卡住並停用其重置功能
 // 必須在 pinMode(..., INPUT_PULLUP) 之後、進入任何重置流程之前呼叫
 // 注意：這也會擋掉「按住重置鍵再上電」的操作，但那本來就不是合法流程
@@ -364,7 +517,9 @@ void checkStuckButtons() {
 
   for (int i = 0; i < totalSamples; i++) {
     if (digitalRead(bootButton) == LOW) bootLowCount++;
-    if (digitalRead(resetButton) == LOW) resetLowCount++;
+    // ADC 模式下「恆低」多了一種可能：電池電壓低到分壓後不足 0.5V（即電池 2.5V）。
+    // 2S 鋰電到那個電壓保護板早就斷電、板子也不會通電，實務上仍等同按鈕短路。
+    if (isResetButtonPressed()) resetLowCount++;
     delay(BTN_SELFTEST_INTERVAL);
   }
 
@@ -388,7 +543,7 @@ void checkStuckButtons() {
 // 是否有「可用的」按鈕正被按下；診斷判定卡住的腳一律視為未按下
 bool anyResetButtonPressed() {
   if (bootButtonUsable && digitalRead(bootButton) == LOW) return true;
-  if (resetButtonUsable && digitalRead(resetButton) == LOW) return true;
+  if (resetButtonUsable && isResetButtonPressed()) return true;
   return false;
 }
 
@@ -930,10 +1085,14 @@ void setup()
   digitalWrite(ledOnFace, LOW);  // 關閉 LED
 
   pinMode(bootButton, INPUT_PULLUP);  // 改用 INPUT_PULLUP
-  pinMode(resetButton, INPUT_PULLUP);  // 改用 INPUT_PULLUP
-  delay(50);  // 等內部提升電阻把腳位拉穩再取樣
+
+  // GPIO 1 的 pinMode 由此決定（有分壓模組走 ADC、沒有則退回 INPUT_PULLUP），
+  // 必須早於 checkStuckButtons() —— 自檢是靠 isResetButtonPressed() 取樣的。
+  detectBatterySense();
+  delay(50);  // 等內部提升電阻／分壓網路把腳位拉穩再取樣
 
   checkStuckButtons();  // 必須早於任何重置流程，卡住的腳會在此被排除
+  updateBatteryReading();  // 先量一次，避免上線後的第一筆 status 電量是空的
 
   loadWiFiConfig();
 
@@ -999,7 +1158,7 @@ void loop()
   }
   // 讀取按鈕當前狀態（開機診斷判定卡在 LOW 的腳一律視為 HIGH，不參與重置流程）
   bool currentBootState = bootButtonUsable ? digitalRead(bootButton) : HIGH;
-  bool currentResetState = resetButtonUsable ? digitalRead(resetButton) : HIGH;
+  bool currentResetState = (resetButtonUsable && isResetButtonPressed()) ? LOW : HIGH;
 
   // 檢查按鈕是否被按下（從 HIGH 變成 LOW）
   if ((currentBootState == LOW && lastBootButtonState == HIGH) || 
@@ -1062,6 +1221,9 @@ void loop()
   // 更新按鈕上次狀態
   lastBootButtonState = currentBootState;
   lastResetButtonState = currentResetState;
+
+  // 電量量測（內部自帶 5 秒間隔限頻，按鈕按住期間會沿用舊值不覆寫）
+  updateBatteryReading();
 
   // 當不在按鈕長按流程時，根據連接狀態控制 LED 閃燈
   if (!isBlinking) {
@@ -1593,13 +1755,18 @@ void publishStatus() {
   JsonObject device = doc.createNestedObject("device");
   device["relay"] = relayState ? 1 : 0;
   // device["free_heap"] = ESP.getFreeHeap();
-  
+
   if (isUpdating) {
     device["update_progress"] = updateProgress;
   }
-  
+
+  // 電量（沒焊分壓模組的板子不會有這個欄位，App 端要容忍它缺席）。
+  // 約多吃 46 bytes —— PubSubClient 的緩衝區設在 512（見 quickConnectToIndex()
+  // 的說明），加上去之後這份 JSON 約 250 bytes，還有餘裕，但再加欄位前要重算。
+  addBatteryToStatus(doc);
+
   char buffer[1024];  // 將緩衝區大小也增加到 1024
-  
+
   // 計算序列化後的大小
   size_t jsonSize = measureJson(doc);
   Serial.print("JSON 大小: ");
@@ -1660,6 +1827,8 @@ void publishStatusWithServer(const char* server) {
   if (isUpdating) {
     device["update_progress"] = updateProgress;
   }
+
+  addBatteryToStatus(doc);
 
   char buffer[1024];
   serializeJson(doc, buffer);
