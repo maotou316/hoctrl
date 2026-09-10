@@ -13,7 +13,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### hoRelay1
 - **開發板**: uPesy ESP32 WROOM DevKit (Type-C)
 - **硬體**: 1 路光耦隔離繼電器驅動模塊
-- **韌體版本**: 1.0.5
 - **GPIO 定義**:
   - BOOT 按鈕: GPIO 0
   - 第二按鈕: GPIO 14
@@ -23,13 +22,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### hoRelay2
 - **開發板**: ESP32-C3 Dev Module
 - **特色**: 無聲繼電器
-- **韌體版本**: 1.2.1
 - **GPIO 定義**:
   - BOOT 按鈕: GPIO 9
-  - RESET 按鈕: GPIO 1
+  - RESET 按鈕: GPIO 1（**同時是電池電量的 ADC 輸入**，見下方「電量檢測」與 `.claude/rules/gpio1-adc-button-shared.md`）
   - 板載 LED: GPIO 3
   - 面板 LED: GPIO 0
-  - 繼電器按鈕: GPIO 4
+  - 繼電器按鈕: GPIO 4 與 GPIO 7（兩支同時驅動，單一韌體通吃兩版板子）
+    - PCB 絲印 341305A_P25_250814 → 實際接 GPIO 7；341305A_Y176_250318 → 實際接 GPIO 4
+    - 兩支腳都在 `setup()` 第一行由 `initRelayPins()` 拉低，避免未初始化的腳浮空導致 MOS 誤導通、繼電器恆閉燒毀設備
 - **開發板設定**:
   - USB CDC On Boot: Enabled
   - CPU Frequency: 160MHz (WiFi)
@@ -71,6 +71,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **AP 模式**: 當 WiFi 未連線時自動啟動
   - 提供 Web 介面進行設定
   - 同時啟動 BLE 配對模式
+  - ⚠ **這一條只適用 hoRelay1。hoRelay2 沒有 AP 模式**（連 `WebServer.h` 都沒 include）：
+    它的 `bleConfigMode` 只在 `setup()` 讀到「EEPROM 沒存 SSID」時才設為 true，
+    `loop()` 裡沒有任何 fallback。SSID 被改掉或 AP 永久消失時，唯一的復原手段是實體長按 5 秒。
+    詳見 `.claude/rules/wifi-mqtt-reconnect-antipatterns.md` 的「已知未處理」
 
 ### 3. MQTT 通訊架構
 
@@ -122,28 +126,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `wifi`: WiFi 資訊（SSID, IP, RSSI）
   - `mqtt`: MQTT 連線資訊
   - `device`: 設備資訊（記憶體、運行時間）
+  - `battery`: 電量（hoRelay2 且焊了分壓模組才有，**App 端必須容忍這個物件缺席**）
+    - `mv`: 電池電壓（毫伏）
+    - `percent`: 電量百分比，走 2S 鋰電放電曲線查表，非線性換算
+    - `valid`: 讀值是否有效；還沒量到第一筆時為 false
 
 ### 4. OTA 韌體更新
 
 - **觸發方式**: MQTT 指令或 Web 介面
-- **更新指令格式**:
+- **更新指令格式**（MQTT 主題 `hoban/{device_id}/control`，內容為 `update:` 加上這段 JSON）:
 ```json
 {
-  "version": "1.0.6",
-  "url": "https://example.com/firmware.bin"
+  "version": "<新版本號>",
+  "url": "https://example.com/firmware.bin",
+  "md5": "<韌體 .bin 的 MD5，32 個十六進位字元>"
 }
 ```
+- **`md5` 是必填**：設備下載走 `setInsecure()` 不驗 TLS 憑證，而 `Update.end()`
+  在沒設定 MD5 時只認映像檔開頭的 `0xE9`，內容壞掉照樣會被接受並切換啟動分區 →
+  設備開不起來。而繼電器板的 MOS gate 沒有下拉電阻，開不起來等同**繼電器恆閉合**。
+  韌體收不到合法 MD5 會直接拒絕並回報 `update_rejected_no_md5`。
 - **更新過程**: LED 快速閃爍（200ms 間隔）
 - **更新狀態**: 透過 MQTT 發布更新進度
 
 ### 5. LED 狀態指示
 
-| 狀態 | LED 行為 |
-|------|----------|
-| 韌體更新中 | 快速閃爍 (200ms) |
-| AP 模式 | 慢速閃爍 (1000ms) |
-| 正常運作 | 恆亮 |
-| WiFi 未連接 | 閃爍 |
+hoRelay2 的實際行為（`blinkLED()`）：
+
+| 狀態 | 判斷條件 | LED 行為 |
+|------|----------|----------|
+| BLE 配對模式（含長按清除設定後） | `bleConfigMode` | 快閃 200ms（`PAIRING_BLINK`），**不熄燈** |
+| WiFi 未連接 | `WiFi.status() != WL_CONNECTED` | 快閃 300ms（`QUICK_BLINK`），30 秒後熄燈省電 |
+| WiFi 已連、MQTT 未連 | — | 一長二短 |
+| WiFi 與 MQTT 都已連上 | — | 熄燈 |
+| 長按重置確認中 | `isBlinking`（在 `loop()` 直接控腳，繞過 `blinkLED()`） | 閃爍 250ms（`BLINK_INTERVAL`），確認後長亮 0.7 秒 |
+
+配對模式 200ms 與 WiFi 未連接 300ms 刻意取不同值，肉眼可分辨兩種狀態。
+
+hoRelay2 的 `isUpdating` **不會**影響 LED（韌體更新中沿用當下的連線狀態閃法）；
+「韌體更新中 200ms 快閃」是 hoRelay1 的行為。
 
 ### 6. Web 管理介面
 
@@ -222,8 +243,30 @@ arduino-cli upload -p COM3 --fqbn esp32:esp32:esp32c3 ho_relay2
 - JSON 文件大小通常設為 200 bytes
 
 ### 長按重置功能
-- BOOT 按鈕長按 3 秒 → LED 閃爍 3 秒
-- 在閃爍期間再按第二按鈕 → 清除設定並重啟
+
+hoRelay2（BOOT GPIO 9 或 RESET GPIO 1 任一顆，總共按住 5 秒）：
+- 按住滿 3 秒（`LONG_PRESS_TIME`）→ LED 以 250ms 週期閃爍（`BLINK_INTERVAL`）
+- 閃爍期間**持續按住**再 2 秒（`BLINK_CONFIRM_TIME`）→ LED 長亮 0.7 秒（`CONFIRM_SOLID_TIME`）→ 清除 EEPROM 並重啟
+- 中途放開即取消，計時歸零
+- WiFi 連線等待期間共用 `waitForResetConfirm()`，行為與正常運作時一致
+  （1.7.0 之前另有 `interruptibleDelay()` 也共用它，該函式已隨 WiFi 重連重寫一併移除）
+
+hoRelay1 / hoRelay3 仍為舊行為（長按 3 秒 → 閃爍 3 秒 → 確認重置）。
+
+hoRelay2 另有**開機按鈕自檢**（`checkStuckButtons()`）：開機取樣 500ms，整段都是 LOW 的腳
+判定為短路／未接，本次開機停用其重置功能。防止一顆壞按鈕造成「開機即清除設定 → 重啟 →
+再清除」的無限迴圈（2026-08-14 實際發生過，RESET 按鈕 GPIO 1 內部短路）。
+副作用：「按住按鈕再上電」會被擋掉，放開後重新上電即恢復。
+詳見 `.claude/rules/button-pin-stuck-low.md`。
+
+### hoRelay2 開機瞬間繼電器短暫通電（硬體限制）
+
+上電時繼電器會短暫通電再斷掉，**這是硬體限制、韌體無法根治**，不要再嘗試用軟體解決。
+
+- **成因**: GPIO 4/7 是 ESP32-C3 的 JTAG 腳（MTMS/MTDO），reset 後由 ROM 配置、不保證為低電位；上電到第一行使用者程式之間約 200~500ms 的空窗，韌體管不到
+- **已做的緩解**: `initRelayPins()` 放在 `setup()` 第一行（早於 `Serial.begin()`），把窗口壓到只剩 ROM 空窗。**修改 `setup()` 時務必保持它在第一行**
+- **根治方式**: 需硬體在 MOS gate 對地加 10kΩ 下拉電阻，下一版 layout 補上
+- 詳見 `ho_relay2/readme.md` 的「已知硬體限制」章節
 
 ### Web 介面開發
 - 使用 Bootstrap CDN (5.3.3)
@@ -239,9 +282,28 @@ arduino-cli upload -p COM3 --fqbn esp32:esp32:esp32c3 ho_relay2
 - **多伺服器**: 韌體和 App 使用相同的 5 個伺服器列表
 - **狀態同步**: 透過 MQTT 訊息實時同步設備狀態
 
+## 版本號規則（強制）
+
+**任何 `.ino` 韌體檔有修改，同一次修改就必須提升該檔的 `firmwareVersion`**，不可沿用舊版本號。
+
+- `ho_relay2/ho_relay2.ino` → `const char* firmwareVersion`（檔案開頭附近）
+- `ho_relay1/ho_relay1.ino`、`ho_relay3/ho_relay3.ino`、`ho_master1/ho_master1.ino` → 同名常數
+- `ho_slave1/ho_slave1.ino` → 改 `HO_SLAVE_FW_MAJOR/MINOR/PATCH` 巨集
+
+遞增原則（語意化版本）：
+- 修 bug、微調行為 → PATCH
+- 新增功能、新 MQTT 指令／欄位 → MINOR
+- 破壞與 App／既有設備的相容性 → MAJOR
+
+版本號是 OTA 判斷是否需要更新、以及 App 顯示設備韌體版本的唯一依據；沒升版的韌體上傳後設備不會更新。
+
+**本文件不記錄任何具體版本號。** 目前版本一律以各專案的 `.ino` 常數為準，
+變更記錄寫在各專案的 `readme.md`。寫進這裡只會過時，然後誤導下一個人。
+（`publish.py` 發佈時會自動把 `.ino` 的版本號加 1 並寫回，不需要手動改。）
+
 ## 版本發佈流程
 
-1. 更新 `firmwareVersion` 常數
+1. 更新 `firmwareVersion` 常數（見上方「版本號規則（強制）」）
 2. 更新 `readme.md` 版本記錄
 3. 編譯韌體
 4. 測試功能

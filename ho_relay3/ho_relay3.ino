@@ -30,6 +30,20 @@ BLEServer *pServer = NULL;
 BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
+// 設定已存、等待重啟的時間點；0 代表沒有待處理的重啟。
+//
+// 為什麼不能在 onWrite() 裡直接 ESP.restart()：esp32 core 3.x 的
+// BLECharacteristic::handleGATTServerEvent()（ESP_GATTS_WRITE_EVT）是
+// 「先呼叫 onWrite()，回來之後才 esp_ble_gatts_send_response()」。
+// 在回調裡重開機，那個 ATT 寫入回應永遠送不出去，App 端的
+// write(withoutResponse: false) 只會等到連線被重開機切斷 —— 設定明明已經
+// 存進 NVS，App 卻顯示「與設備的藍牙連線已中斷」並放棄新增設備。
+// 舊版 core 是先送回應再呼叫 onWrite，所以這個寫法以前不會出事。
+//
+// 擋不住什麼：這只保證「回應有機會送出」。App 若在這 2 秒內自己離開頁面、
+// 或封包在空中掉了，一樣會走到斷線那條路，那一層靠 App 端的補救判定。
+volatile unsigned long bleRestartAt = 0;
+
 
 const char* firmwareVersion = "1.3.5"; // 當前韌體版本
 const char* deviceModel = "hoRelay2"; // 設備型號
@@ -51,6 +65,7 @@ bool isBlinking = false;              // LED 閃爍狀態
 bool lastBootButtonState = HIGH;      // BOOT 按鈕上次狀態
 bool lastResetButtonState = HIGH;     // RESET 按鈕上次狀態
 String deviceIdString;                // 儲存格式化後的設備 ID
+String legacyDeviceIdString;          // 舊版（MAC 反序）設備 ID，僅用於相容尚未更新的 App
 int failedAttempts = 0;               // MQTT 重試次數計數器
 bool relayState = false;              // 繼電器狀態
 bool bleConfigMode = false;           // BLE 配對模式標誌
@@ -346,8 +361,11 @@ class MyCallbacks: public BLECharacteristicCallbacks {
                         pCharacteristic->notify();
 
                         free(buffer);
-                        delay(2000);
-                        ESP.restart();
+                        // 排程重啟而非就地重啟：先讓 onWrite() 返回，
+                        // BLE stack 才送得出 ATT 寫入回應（見 bleRestartAt 宣告）
+                        bleRestartAt = millis() + 2000;
+                        if (bleRestartAt == 0) bleRestartAt = 1;
+                        return;
                     } else {
                         // 錯誤回應
                         StaticJsonDocument<200> response;
@@ -380,21 +398,45 @@ const char* getDeviceId() {
   if (deviceIdString.length() == 0) {  // 如果還沒有產生過
     uint64_t chipId = ESP.getEfuseMac();
     uint8_t* chipIdBytes = (uint8_t*)&chipId;
-    
-    // 按照網路順序（從左到右）組合 MAC 位址
+
+    // ESP.getEfuseMac() 以小端序把 mac[0]..mac[5] 寫進 uint64 的最低 6 個位元組，
+    // 因此 chipIdBytes[0] 就是 mac[0]。由 [0] 印到 [5] 才是網路順序（與 WiFi.macAddress() 一致）
     char tempId[23];
-    snprintf(tempId, 23, "hoban-%02x%02x%02x%02x%02x%02x", 
-      chipIdBytes[5],  // 最高位元組
+    snprintf(tempId, 23, "hoban-%02x%02x%02x%02x%02x%02x",
+      chipIdBytes[0],  // mac[0]（廠商 OUI 開頭）
+      chipIdBytes[1],
+      chipIdBytes[2],
+      chipIdBytes[3],
+      chipIdBytes[4],
+      chipIdBytes[5]   // mac[5]
+    );
+
+    deviceIdString = String(tempId);
+  }
+  return deviceIdString.c_str();
+}
+
+// 舊版設備 ID（MAC 反序輸出，舊格式）
+// 只用來額外訂閱舊的 control 主題，讓尚未更新的 App 仍能控制設備，避免 OTA 後失聯。
+// 狀態一律只發布到新的正序主題，待所有 App 完成遷移後可移除本函式。
+const char* getLegacyDeviceId() {
+  if (legacyDeviceIdString.length() == 0) {
+    uint64_t chipId = ESP.getEfuseMac();
+    uint8_t* chipIdBytes = (uint8_t*)&chipId;
+
+    char tempId[23];
+    snprintf(tempId, 23, "hoban-%02x%02x%02x%02x%02x%02x",
+      chipIdBytes[5],
       chipIdBytes[4],
       chipIdBytes[3],
       chipIdBytes[2],
       chipIdBytes[1],
-      chipIdBytes[0]   // 最低位元組
+      chipIdBytes[0]
     );
-    
-    deviceIdString = String(tempId);
+
+    legacyDeviceIdString = String(tempId);
   }
-  return deviceIdString.c_str();
+  return legacyDeviceIdString.c_str();
 }
 
 // 打開繼電器和燈（不自動關閉）
@@ -465,10 +507,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.println(length);
 
   String expectedTopic = String("hoban/") + deviceId + "/control";
+  // 舊版主題（MAC 反序）仍然受理，避免尚未更新的 App 無法控制
+  String legacyTopic = String("hoban/") + getLegacyDeviceId() + "/control";
   Serial.print("預期主題: ");
   Serial.println(expectedTopic);
 
-  if (String(topic) == expectedTopic) {
+  String topicStr = String(topic);
+  if (topicStr == expectedTopic || topicStr == legacyTopic) {
+    if (topicStr == legacyTopic) {
+      Serial.println("⚠ 收到舊版主題指令（App 尚未更新設備 ID）");
+    }
     Serial.println("✓ 主題匹配，處理指令...");
 
     if (message == "status") {
@@ -621,6 +669,13 @@ void setup()
 
 void loop()
 {
+
+  // ── BLE 配網完成後的排程重啟 ──
+  // onWrite() 不能就地重啟，否則 ATT 寫入回應送不出去（見 bleRestartAt 宣告）。
+  if (bleRestartAt != 0 && (long)(millis() - bleRestartAt) >= 0) {
+    Serial.println("[BLE] 重新啟動");
+    ESP.restart();
+  }
   // 讀取按鈕當前狀態
   bool currentBootState = digitalRead(bootButton);
   bool currentResetState = digitalRead(resetButton);
@@ -1122,6 +1177,13 @@ bool quickConnectDefault() {
                     controlTopic.c_str(),
                     subscribeSuccess ? "成功" : "失敗");
 
+      // 同時訂閱舊版（MAC 反序）控制主題，讓尚未更新的 App 仍能控制設備
+      String legacyControlTopic = String("hoban/") + getLegacyDeviceId() + "/control";
+      bool legacySubscribeSuccess = mqttClient.subscribe(legacyControlTopic.c_str());
+      Serial.printf("訂閱舊版控制主題: %s - %s\n",
+                    legacyControlTopic.c_str(),
+                    legacySubscribeSuccess ? "成功" : "失敗");
+
       // 發布上線狀態（包含伺服器資訊）
       publishStatusWithServer(DEFAULT_MQTT_SERVER);
 
@@ -1182,6 +1244,13 @@ bool quickConnectCustom() {
       Serial.printf("訂閱控制主題: %s - %s\n",
                     controlTopic.c_str(),
                     subscribeSuccess ? "成功" : "失敗");
+
+      // 同時訂閱舊版（MAC 反序）控制主題，讓尚未更新的 App 仍能控制設備
+      String legacyControlTopic = String("hoban/") + getLegacyDeviceId() + "/control";
+      bool legacySubscribeSuccess = mqttClient.subscribe(legacyControlTopic.c_str());
+      Serial.printf("訂閱舊版控制主題: %s - %s\n",
+                    legacyControlTopic.c_str(),
+                    legacySubscribeSuccess ? "成功" : "失敗");
 
       // 發布上線狀態（包含伺服器資訊）
       publishStatusWithServer(mqttServer);

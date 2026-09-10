@@ -14,6 +14,7 @@ import sys
 import subprocess
 import json
 import re
+import hashlib
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -406,7 +407,23 @@ def _find_service_account_key(project_dir):
             return path
     return None
 
-def update_firestore(project_dir, model, version, download_url, changelog, min_version):
+def compute_md5(bin_path):
+    """算出韌體 .bin 的 MD5，寫進 Firestore 供設備下載後比對。
+
+    設備下載韌體走的是 client.setInsecure()（不驗 TLS 憑證），HTTPS 在那條路上
+    只提供加密、不提供來源鑑別；而 Update.end() 在沒有設定 MD5 時只認映像檔開頭的
+    0xE9 magic byte，內容壞掉照樣會被接受並切換 otadata → 設備開不起來。
+    hoRelay2 的 MOS gate 沒有下拉電阻，開不起來就等於繼電器恆閉合，
+    所以這個欄位不是可選的（見 .claude/rules/ota-md5-required.md）。
+    """
+    h = hashlib.md5()
+    with open(bin_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def update_firestore(project_dir, model, version, download_url, changelog, min_version, md5=None):
     print_header("更新 Firestore 記錄")
 
     # 方法1: 使用 Python Firebase Admin SDK
@@ -434,6 +451,8 @@ def update_firestore(project_dir, model, version, download_url, changelog, min_v
             'min_version': min_version,
             'publish_time': firestore.SERVER_TIMESTAMP
         }
+        if md5:
+            update_data['md5'] = md5
         db.collection('firmware_updates').document(model).set(update_data, merge=True)
         print_color("✓ Firestore 更新成功", Colors.GREEN)
         print_color(f"文件路徑: firmware_updates/{model}", Colors.WHITE)
@@ -447,7 +466,7 @@ def update_firestore(project_dir, model, version, download_url, changelog, min_v
                 check=True
             )
             print_color("✓ 安裝成功，重新嘗試更新 Firestore...", Colors.GREEN)
-            return update_firestore(project_dir, model, version, download_url, changelog, min_version)
+            return update_firestore(project_dir, model, version, download_url, changelog, min_version, md5)
         except subprocess.CalledProcessError:
             print_color("❌ 自動安裝 google-cloud-firestore 失敗", Colors.RED)
     except Exception as e:
@@ -455,6 +474,7 @@ def update_firestore(project_dir, model, version, download_url, changelog, min_v
 
     # 方法2: 使用 Node.js 腳本
     flutter_dir = Path("../hoctrl")
+    md5_line = ("," + chr(10) + "  md5: '" + md5 + "'") if md5 else ""
     node_script = f"""
 const admin = require('firebase-admin');
 const serviceAccount = require('./serviceAccountKey.json');
@@ -469,7 +489,7 @@ const updateData = {{
   download_url: '{download_url}',
   changelog: `{changelog}`,
   min_version: '{min_version}',
-  publish_time: admin.firestore.Timestamp.now()
+  publish_time: admin.firestore.Timestamp.now(){md5_line}
 }};
 
 db.collection('firmware_updates')
@@ -641,7 +661,10 @@ def main():
                 sys.exit(1)
                 continue
 
-            update_firestore(project_dir, vmodel, version, download_url, changelog, args.min_version)
+            md5 = compute_md5(bin_path)
+            print_color(f"MD5: {md5}", Colors.GRAY)
+
+            update_firestore(project_dir, vmodel, version, download_url, changelog, args.min_version, md5)
             results.append({'model': vmodel, 'success': True, 'url': download_url})
 
         # 摘要
@@ -678,7 +701,10 @@ def main():
             print_color("\n❌ 上傳失敗，無法繼續", Colors.RED)
             sys.exit(1)
 
-        firestore_ok = update_firestore(project_dir, model, version, download_url, changelog, args.min_version)
+        md5 = compute_md5(bin_path)
+        print_color(f"MD5: {md5}", Colors.GRAY)
+
+        firestore_ok = update_firestore(project_dir, model, version, download_url, changelog, args.min_version, md5)
 
         if firestore_ok:
             print_color("\n╔════════════════════════════════════════╗", Colors.GREEN)
