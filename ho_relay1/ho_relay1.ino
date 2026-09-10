@@ -26,6 +26,20 @@ BLEServer *pServer = NULL;
 BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
+// 設定已存、等待重啟的時間點；0 代表沒有待處理的重啟。
+//
+// 為什麼不能在 onWrite() 裡直接 ESP.restart()：esp32 core 3.x 的
+// BLECharacteristic::handleGATTServerEvent()（ESP_GATTS_WRITE_EVT）是
+// 「先呼叫 onWrite()，回來之後才 esp_ble_gatts_send_response()」。
+// 在回調裡重開機，那個 ATT 寫入回應永遠送不出去，App 端的
+// write(withoutResponse: false) 只會等到連線被重開機切斷 —— 設定明明已經
+// 存進 NVS，App 卻顯示「與設備的藍牙連線已中斷」並放棄新增設備。
+// 舊版 core 是先送回應再呼叫 onWrite，所以這個寫法以前不會出事。
+//
+// 擋不住什麼：這只保證「回應有機會送出」。App 若在這 2 秒內自己離開頁面、
+// 或封包在空中掉了，一樣會走到斷線那條路，那一層靠 App 端的補救判定。
+volatile unsigned long bleRestartAt = 0;
+
 // BLE 連接回調
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -160,8 +174,11 @@ class MyCallbacks: public BLECharacteristicCallbacks {
                         pCharacteristic->notify();
                         
                         free(buffer);
-                        delay(2000);
-                        ESP.restart();
+                        // 排程重啟而非就地重啟：先讓 onWrite() 返回，
+                        // BLE stack 才送得出 ATT 寫入回應（見 bleRestartAt 宣告）
+                        bleRestartAt = millis() + 2000;
+                        if (bleRestartAt == 0) bleRestartAt = 1;
+                        return;
                     } else {
                         // 錯誤回應
                         StaticJsonDocument<200> response;
@@ -578,6 +595,13 @@ void setup()
 
 void loop()
 {
+
+  // ── BLE 配網完成後的排程重啟 ──
+  // onWrite() 不能就地重啟，否則 ATT 寫入回應送不出去（見 bleRestartAt 宣告）。
+  if (bleRestartAt != 0 && (long)(millis() - bleRestartAt) >= 0) {
+    Serial.println("[BLE] 重新啟動");
+    ESP.restart();
+  }
   server.handleClient();
 
   // 在 AP 模式下處理 BLE

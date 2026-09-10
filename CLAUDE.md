@@ -13,7 +13,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### hoRelay1
 - **開發板**: uPesy ESP32 WROOM DevKit (Type-C)
 - **硬體**: 1 路光耦隔離繼電器驅動模塊
-- **韌體版本**: 1.0.5
 - **GPIO 定義**:
   - BOOT 按鈕: GPIO 0
   - 第二按鈕: GPIO 14
@@ -23,10 +22,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### hoRelay2
 - **開發板**: ESP32-C3 Dev Module
 - **特色**: 無聲繼電器
-- **韌體版本**: 1.2.1
 - **GPIO 定義**:
   - BOOT 按鈕: GPIO 9
-  - RESET 按鈕: GPIO 1
+  - RESET 按鈕: GPIO 1（**同時是電池電量的 ADC 輸入**，見下方「電量檢測」與 `.claude/rules/gpio1-adc-button-shared.md`）
   - 板載 LED: GPIO 3
   - 面板 LED: GPIO 0
   - 繼電器按鈕: GPIO 4 與 GPIO 7（兩支同時驅動，單一韌體通吃兩版板子）
@@ -128,17 +126,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `wifi`: WiFi 資訊（SSID, IP, RSSI）
   - `mqtt`: MQTT 連線資訊
   - `device`: 設備資訊（記憶體、運行時間）
+  - `battery`: 電量（hoRelay2 且焊了分壓模組才有，**App 端必須容忍這個物件缺席**）
+    - `mv`: 電池電壓（毫伏）
+    - `percent`: 電量百分比，走 2S 鋰電放電曲線查表，非線性換算
+    - `valid`: 讀值是否有效；還沒量到第一筆時為 false
 
 ### 4. OTA 韌體更新
 
 - **觸發方式**: MQTT 指令或 Web 介面
-- **更新指令格式**:
+- **更新指令格式**（MQTT 主題 `hoban/{device_id}/control`，內容為 `update:` 加上這段 JSON）:
 ```json
 {
-  "version": "1.0.6",
-  "url": "https://example.com/firmware.bin"
+  "version": "<新版本號>",
+  "url": "https://example.com/firmware.bin",
+  "md5": "<韌體 .bin 的 MD5，32 個十六進位字元>"
 }
 ```
+- **`md5` 是必填**：設備下載走 `setInsecure()` 不驗 TLS 憑證，而 `Update.end()`
+  在沒設定 MD5 時只認映像檔開頭的 `0xE9`，內容壞掉照樣會被接受並切換啟動分區 →
+  設備開不起來。而繼電器板的 MOS gate 沒有下拉電阻，開不起來等同**繼電器恆閉合**。
+  韌體收不到合法 MD5 會直接拒絕並回報 `update_rejected_no_md5`。
 - **更新過程**: LED 快速閃爍（200ms 間隔）
 - **更新狀態**: 透過 MQTT 發布更新進度
 
@@ -275,9 +282,28 @@ hoRelay2 另有**開機按鈕自檢**（`checkStuckButtons()`）：開機取樣 
 - **多伺服器**: 韌體和 App 使用相同的 5 個伺服器列表
 - **狀態同步**: 透過 MQTT 訊息實時同步設備狀態
 
+## 版本號規則（強制）
+
+**任何 `.ino` 韌體檔有修改，同一次修改就必須提升該檔的 `firmwareVersion`**，不可沿用舊版本號。
+
+- `ho_relay2/ho_relay2.ino` → `const char* firmwareVersion`（檔案開頭附近）
+- `ho_relay1/ho_relay1.ino`、`ho_relay3/ho_relay3.ino`、`ho_master1/ho_master1.ino` → 同名常數
+- `ho_slave1/ho_slave1.ino` → 改 `HO_SLAVE_FW_MAJOR/MINOR/PATCH` 巨集
+
+遞增原則（語意化版本）：
+- 修 bug、微調行為 → PATCH
+- 新增功能、新 MQTT 指令／欄位 → MINOR
+- 破壞與 App／既有設備的相容性 → MAJOR
+
+版本號是 OTA 判斷是否需要更新、以及 App 顯示設備韌體版本的唯一依據；沒升版的韌體上傳後設備不會更新。
+
+**本文件不記錄任何具體版本號。** 目前版本一律以各專案的 `.ino` 常數為準，
+變更記錄寫在各專案的 `readme.md`。寫進這裡只會過時，然後誤導下一個人。
+（`publish.py` 發佈時會自動把 `.ino` 的版本號加 1 並寫回，不需要手動改。）
+
 ## 版本發佈流程
 
-1. 更新 `firmwareVersion` 常數
+1. 更新 `firmwareVersion` 常數（見上方「版本號規則（強制）」）
 2. 更新 `readme.md` 版本記錄
 3. 編譯韌體
 4. 測試功能

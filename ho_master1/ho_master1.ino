@@ -891,6 +891,20 @@ BLECharacteristic* pCharacteristic = NULL;
 bool deviceConnected = false;
 bool bleConfigMode = false;   // 是否處於 BLE 配網模式（開機時沒有 WiFi 設定才會開啟）
 
+// 設定已存、等待重啟的時間點；0 代表沒有待處理的重啟。
+//
+// 為什麼不能在 onWrite() 裡直接 ESP.restart()：esp32 core 3.x 的
+// BLECharacteristic::handleGATTServerEvent()（ESP_GATTS_WRITE_EVT）是
+// 「先呼叫 onWrite()，回來之後才 esp_ble_gatts_send_response()」。
+// 在回調裡重開機，那個 ATT 寫入回應永遠送不出去，App 端的
+// write(withoutResponse: false) 只會等到連線被重開機切斷 —— 設定明明已經
+// 存進 NVS，App 卻顯示「與設備的藍牙連線已中斷」並放棄新增設備。
+// 舊版 core 是先送回應再呼叫 onWrite，所以這個寫法以前不會出事。
+//
+// 擋不住什麼：這只保證「回應有機會送出」。App 若在這 2 秒內自己離開頁面、
+// 或封包在空中掉了，一樣會走到斷線那條路，那一層靠 App 端的補救判定。
+volatile unsigned long bleRestartAt = 0;
+
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* srv) override {
     deviceConnected = true;
@@ -996,9 +1010,13 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 
     free(buffer);
 
+    // 排程重啟而非就地重啟：先讓 onWrite() 返回，BLE stack 才送得出 ATT 寫入
+    // 回應（理由見 bleRestartAt 的宣告）。這 2 秒的等待改由 loop() 消化，
+    // 期間 maintainEspNow() 照常發心跳，已配對的 slave 不會失聯關籠 ——
+    // 與原本 espNowDelay(2000) 的效果相同，只是不再卡住 BLE 回調。
     Serial.println("[BLE] 設定已儲存，2 秒後重新啟動");
-    espNowDelay(2000);   // 維持心跳，避免已配對的 slave 在重啟前失聯
-    ESP.restart();
+    bleRestartAt = millis() + 2000;
+    if (bleRestartAt == 0) bleRestartAt = 1;   // 0 是「沒有待處理重啟」的哨兵值
   }
 };
 
@@ -6086,6 +6104,14 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  // ── BLE 配網完成後的排程重啟 ──
+  // 放在 loop() 最前面：這一輪不需要再做任何事，設定已經寫進 NVS。
+  // wrap-safe 寫法與檔案內其他計時比較一致，millis() 溢位時仍成立。
+  if (bleRestartAt != 0 && (long)(now - bleRestartAt) >= 0) {
+    Serial.println("[BLE] 重新啟動");
+    ESP.restart();
+  }
 
   // review 修正（Critical）：每輪 loop() 開頭重置本輪的「阻塞 publish 名額」，
   // 保證本輪最多只發生一次會阻塞的 mqttClient.publish()（見 mqttPublishBudgetUsed
