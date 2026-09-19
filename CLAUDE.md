@@ -80,13 +80,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 #### 多伺服器策略
 
-系統支援 **5 個預設 MQTT 伺服器** + 自訂伺服器：
+系統支援 **4 個預設 MQTT 伺服器** + 自訂伺服器：
 
 1. **mqttgo.io** (台灣 MQTT Go)
-2. **broker.hoban.tw** (齁斑社企，需認證)
-3. **mqtt.eclipseprojects.io** (Eclipse)
-4. **broker.emqx.io** (EMQX 公共)
-5. **broker.hivemq.com** (HiveMQ 公共)
+2. **mqtt.eclipseprojects.io** (Eclipse)
+3. **broker.emqx.io** (EMQX 公共)
+4. **broker.hivemq.com** (HiveMQ 公共)
+
+（`broker.hoban.tw`〔齁斑社企〕已於 2026-09-19 移除：帳密為佔位符，App 與韌體都
+連不上。若日後取得真帳密要加回，App 與韌體要同步且帳密改讀設定檔而非寫死。）
 
 #### 智慧連線機制
 

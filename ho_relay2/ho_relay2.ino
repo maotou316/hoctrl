@@ -188,9 +188,9 @@ struct MqttServerConfig {
   const char* password;
 };
 
+// 與 App multi_mqtt_service.dart 一致；broker.hoban.tw 2026-09-19 移除（帳密佔位符）
 const MqttServerConfig DEFAULT_SERVERS[] = {
   {"mqttgo.io",               1883, NULL,         NULL},
-  {"broker.hoban.tw",         1883, "hoban_user", "hoban_pass"},
   {"mqtt.eclipseprojects.io", 1883, NULL,         NULL},
   {"broker.emqx.io",          1883, NULL,         NULL},
   {"broker.hivemq.com",       1883, NULL,         NULL},

@@ -47,13 +47,15 @@ ESP32 系列開發板的動物管制遠端繼電器控制系統韌體專案。
 
 ### 多伺服器策略
 
-系統內建 5 個預設 MQTT 伺服器 + 自訂伺服器支援：
+系統內建 4 個預設 MQTT 伺服器 + 自訂伺服器支援：
 
 1. **mqttgo.io** (台灣 MQTT Go)
-2. **broker.hoban.tw** (齁斑社企，需認證)
-3. **mqtt.eclipseprojects.io** (Eclipse)
-4. **broker.emqx.io** (EMQX 公共)
-5. **broker.hivemq.com** (HiveMQ 公共)
+2. **mqtt.eclipseprojects.io** (Eclipse)
+3. **broker.emqx.io** (EMQX 公共)
+4. **broker.hivemq.com** (HiveMQ 公共)
+
+（`broker.hoban.tw`〔齁斑社企〕已於 2026-09-19 移除：帳密為佔位符，App 與韌體都
+連不上。）
 
 ### 主題架構
 
