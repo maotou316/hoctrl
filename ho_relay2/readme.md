@@ -224,6 +224,27 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ## 版本記錄
 
+### 1.9.0
+
+**WiFi 改用 Modem-sleep（`WIFI_PS_MIN_MODEM`），延長電池待機時間。**
+
+2S 18650 3200mAh 實測（2026-09-23，舊韌體 1.8.5、繼電器未吸合）：電池端待機 **0.09 A**，
+可用約 2900 mAh ÷ 90 mA ≈ 32 小時。耗電大戶是 `WiFi.setSleep(false)`（`WIFI_PS_NONE`）讓射頻常開。
+
+- 新增編譯開關 `WIFI_MODEM_SLEEP`（預設 1）。射頻只在每個 DTIM beacon 醒來看有沒有自己的封包，
+  CPU 照跑、TCP／MQTT 連線不斷。預期待機降到 25～40 mA（約 3～4.5 天）
+- 睡眠模式與發射功率收進 `applyWiFiPowerSettings()`，開機與 `connectToWiFi()` 收尾共用
+  （兩者是驅動層設定，`esp_wifi_deinit()` 後會失效，必須重套）
+- OTA 下載期間強制 `setSleep(false)`，失敗時還原；成功直接重開機
+
+**代價**：收指令多約 100～300 ms 延遲；部分路由器對睡眠中設備處理不良，可能提早踢線或丟封包
+——這正是 1.8.5 以前禁用睡眠的原因。
+
+**還原方式**：把 `WIFI_MODEM_SLEEP` 改為 `0` 重新編譯即回到 1.8.5 的射頻常開行為，
+詳見 `.claude/rules/wifi-modem-sleep-rollback.md`。
+
+**實測狀態**：僅編譯通過（2026-09-23），尚未實機量測待機電流、也尚未驗證斷線率。
+
 ### 1.8.4
 
 **ADC 模式下「電池斷開」不再被當成長按 RESET 而清光 WiFi 設定。**
@@ -491,7 +512,7 @@ OTA 升級後既有設定照常運作，只有 MQTT 密碼需要重設。
   `FIND_BEST_SERVER` 指令也改走這條路（原本在 callback 裡直呼 `smartConnect()`，阻塞 111 秒）
 - `currentServerIndex` 改為失敗也輪替，不再連續重試同一台死 broker
 - 早退原因碼補上 210/211/212；`setScanTimeout(8000)`（core 預設 60 秒）
-- `connectToWiFi()` 收尾會**還原 auth config 並重套 `setSleep(false)` / `setTxPower()`**
+- `connectToWiFi()` 收尾會**還原 auth config 並重套睡眠模式 / `setTxPower()`**（`applyWiFiPowerSettings()`，睡眠模式由 `WIFI_MODEM_SLEEP` 決定）
   —— 這兩者是驅動層設定，`esp_wifi_deinit()` 後不會自動恢復
 - 移除死變數 `failedAttempts`（三處寫入、零處讀取）與死函式 `interruptibleDelay()`
 
