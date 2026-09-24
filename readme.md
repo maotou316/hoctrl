@@ -197,7 +197,15 @@ python publish.py 3 -c "新增藍牙配對功能" -m 1.0.0 -y
 | `HOLUCAM_FIRMWARE_PUBLISH_TOKEN` | 後台發版 token（機密，與後台伺服器設定同值） | 無；沒設就黃色警告並略過後台登記，不中止發版 |
 | `HOLUCAM_API_BASE` | HoLuCam 後台網址 | `https://holucam.neuter.online` |
 
-有設 token 但登記失敗（例如 503 `firmware-publish-disabled`、401 `invalid-publish-token`、400 驗證錯誤）時會印出錯誤碼與訊息，結尾摘要列出失敗項，並以結束代碼 1 結束。
+有設 token 但登記失敗（例如 503 `firmware-publish-disabled`、401 `invalid-publish-token`、400 驗證錯誤如 `invalid-body`、`invalid-model`、`invalid-md5`、`url-too-long`）時會印出錯誤碼與訊息，結尾摘要列出失敗項，並以結束代碼 1 結束。
+
+**部署順序**：先部署 HoLuCam 後台並設定 `FIRMWARE_PUBLISH_TOKEN`，之後才在發版機設定 `HOLUCAM_FIRMWARE_PUBLISH_TOKEN`。反過來的話，發版機有 token、後台卻還沒啟用，登記會回 503 並以結束代碼 1 結束。後台的 `FIRMWARE_PUBLISH_TOKEN` 少於 32 字元會視同未設定（同樣回 503 `firmware-publish-disabled`）。
+
+`HOLUCAM_API_BASE` 必須是 `https://`（只有 `http://localhost`、`http://127.0.0.1` 可用 http）；token 含換行等控制字元也會直接判定失敗，兩者都不會送出 token。
+
+登記失敗時韌體已上傳、Firestore 已寫、`.ino` 版號也已 +1：**不要重跑 publish.py（會再跳一個版號），請到 HoLuCam 後台「韌體管理」頁手動登記。**
+
+`.ino` 的 `deviceModel` 與 `MODEL_CONFIGS` 的 `expected_model` 不符（或與其他型號撞名）時，會在改版號與編譯前就中止，不上傳、不寫 Firestore、不登記後台。
 
 ```powershell
 $env:HOLUCAM_FIRMWARE_PUBLISH_TOKEN = "（向後台管理者索取）"

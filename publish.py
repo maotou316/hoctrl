@@ -9,6 +9,7 @@ hoRelay 韌體發布自動化腳本（支援 hoRelay1～3）
 環境變數（HoLuCam 後台登記用）:
   HOLUCAM_FIRMWARE_PUBLISH_TOKEN  後台發版 token；沒設就略過後台登記（黃色警告，不中止發版）
   HOLUCAM_API_BASE                後台網址，預設 https://holucam.neuter.online
+                                  （必須 https；只有 http://localhost、http://127.0.0.1 可用 http）
 
 用法:
   python publish.py 2                     # 發布 hoRelay2
@@ -39,6 +40,9 @@ MODEL_CONFIGS = {
         'ino': 'ho_relay1.ino',
         'fqbn': 'esp32:esp32:esp32',
         'label': 'hoRelay1 (ESP32 WROOM)',
+        # 沒有 variants 的型號，.ino 的 deviceModel 必須等於這個值才准發版
+        # （見 validate_device_model()）
+        'expected_model': 'hoRelay1',
     },
     2: {
         'dir': 'ho_relay2',
@@ -56,6 +60,10 @@ MODEL_CONFIGS = {
         'ino': 'ho_relay3.ino',
         'fqbn': 'esp32:esp32:esp32c3:CDCOnBoot=cdc,CPUFreq=160,DebugLevel=error,EraseFlash=all,FlashFreq=80,FlashMode=dio,FlashSize=4M,JTAGAdapter=default,PartitionScheme=custom,UploadSpeed=921600,ZigbeeMode=default',
         'label': 'hoRelay v3.0 齁斑自製電路板',
+        # ⚠ ho_relay3.ino 目前把 deviceModel 誤寫成 "hoRelay2"，照舊流程會把 hoRelay3 的
+        #   韌體發到 hoRelay2 的 Firestore 文件與 HoLuCam 後台，讓 hoRelay2 設備刷到錯的韌體。
+        #   所以這裡寫明預期型號，對不上就在編譯前中止（先修 .ino 才能發）。
+        'expected_model': 'hoRelay3',
     },
 }
 
@@ -127,6 +135,37 @@ def check_requirements():
     else:
         print_color("⚠ 未安裝 gsutil (可選，但推薦安裝以自動上傳)", Colors.YELLOW)
     return all_installed
+
+# ── 型號檢查 ────────────────────────────────────────────────────────
+
+def validate_device_model(relay, parsed_model, configs=None):
+    """檢查從 .ino 讀到的 deviceModel 能不能拿來發版。回傳錯誤說明，沒問題回 None。
+
+    發版會以 model 當 Firestore 文件 ID 與 HoLuCam 後台的型號鍵，型號寫錯＝把韌體
+    推給另一種硬體（例如 hoRelay3 的韌體蓋掉 hoRelay2 的發佈資料），設備刷了可能開不起來。
+    所以只要有一點對不上就擋下來，而且要在「遞增版號、編譯、上傳」之前擋。
+    有 variants 的型號由 variants 決定 model，不走這個檢查。
+    """
+    configs = configs or MODEL_CONFIGS
+    cfg = configs[relay]
+    if cfg.get('variants'):
+        return None
+    expected = cfg.get('expected_model')
+    if not expected:
+        return f"MODEL_CONFIGS[{relay}] 沒有設定 expected_model，無法確認型號，請先補上"
+    if parsed_model != expected:
+        return (f"{cfg['ino']} 的 deviceModel 是 \"{parsed_model}\"，"
+                f"但型號 {relay} 預期是 \"{expected}\"")
+    # 與其他型號的預期型號／variants 撞名（防 MODEL_CONFIGS 本身設錯）
+    for other_relay, other_cfg in configs.items():
+        if other_relay == relay:
+            continue
+        others = [other_cfg.get('expected_model')]
+        others += [v['model'] for v in (other_cfg.get('variants') or [])]
+        if parsed_model in others:
+            return (f"deviceModel \"{parsed_model}\" 與型號 {other_relay}"
+                    f"（{other_cfg['label']}）的型號撞名")
+    return None
 
 # ── 版本管理 ────────────────────────────────────────────────────────
 
@@ -231,12 +270,9 @@ def build_firmware(project_dir, fqbn, model, variant=None):
             print_color(f"❌ {model} 編譯失敗", Colors.RED)
             return None
 
-        bin_files = list(Path(build_path).glob('*.bin'))
-        if not bin_files:
-            print_color(f"❌ 找不到 {model} 編譯後的 .bin 檔案", Colors.RED)
+        bin_file = pick_app_image(build_path)
+        if not bin_file:
             return None
-
-        bin_file = bin_files[0]
         file_size = bin_file.stat().st_size / 1024
         print_color(f"✓ {model} 編譯成功: {bin_file.name}", Colors.GREEN)
         print_color(f"檔案大小: {file_size:.2f} KB", Colors.WHITE)
@@ -244,6 +280,24 @@ def build_firmware(project_dir, fqbn, model, variant=None):
     except Exception as e:
         print_color(f"❌ {model} 編譯過程出錯: {e}", Colors.RED)
         return None
+
+def pick_app_image(build_path):
+    """從 arduino-cli 的輸出目錄挑出「主程式映像」（{sketch}.ino.bin）。
+
+    輸出目錄還會有 .ino.bootloader.bin、.ino.partitions.bin、.ino.merged.bin，
+    OTA 只能用主程式映像；以前 glob('*.bin')[0] 是任取一個，挑到別的會刷壞設備。
+    找不到或不只一個就回 None（呼叫端中止）。
+    """
+    candidates = sorted(Path(build_path).glob('*.ino.bin'))
+    if len(candidates) != 1:
+        found = ', '.join(p.name for p in Path(build_path).glob('*.bin')) or '（無）'
+        if not candidates:
+            print_color("❌ 找不到主程式映像 *.ino.bin，中止", Colors.RED)
+        else:
+            print_color("❌ 主程式映像 *.ino.bin 不只一個，無法判斷要用哪個，中止", Colors.RED)
+        print_color(f"   輸出目錄的 .bin：{found}", Colors.GRAY)
+        return None
+    return candidates[0]
 
 # ── 上傳韌體 ────────────────────────────────────────────────────────
 
@@ -257,6 +311,11 @@ def get_firebase_project_id():
         print_color(f"⚠ 無法讀取 Firebase 專案 ID: {e}", Colors.YELLOW)
         return None
 
+def release_bin_path(project_dir, model, version):
+    """這次發版實際上傳的檔案路徑；main() 也用它算 MD5，確保兩邊是同一個檔。"""
+    return os.path.join(project_dir, 'build', f"{model}_v{version}.bin")
+
+
 def upload_to_firebase(bin_path, project_dir, model, version, changelog="更新"):
     print_header("上傳韌體")
 
@@ -265,6 +324,20 @@ def upload_to_firebase(bin_path, project_dir, model, version, changelog="更新"
 
     print_color(f"上傳檔案: {file_name}", Colors.YELLOW)
 
+    # 一律把這次新編譯的產物複製成 {model}_v{version}.bin（覆蓋同名舊檔），之後每一種
+    # 上傳方式都用這份。以前同名檔已存在就直接上傳舊檔，會跟 main() 以新產物算出的
+    # MD5 對不上，設備下載後比對失敗（或更糟：上傳到錯的韌體）。
+    renamed_file = release_bin_path(project_dir, model, version)
+    build_dir = os.path.dirname(renamed_file)
+    try:
+        os.makedirs(build_dir, exist_ok=True)
+        if os.path.abspath(bin_path) != os.path.abspath(renamed_file):
+            shutil.copyfile(bin_path, renamed_file)
+        bin_path = renamed_file
+    except Exception as e:
+        print_color(f"❌ 無法準備上傳檔 {renamed_file}：{e}", Colors.RED)
+        return None
+
     # 方法1: 使用 GitHub Releases (優先)
     if check_command('gh'):
         try:
@@ -272,14 +345,6 @@ def upload_to_firebase(bin_path, project_dir, model, version, changelog="更新"
             gh_cmd = r'C:\Program Files\GitHub CLI\gh.exe' if platform.system() == 'Windows' else 'gh'
             repo = os.getenv('GITHUB_REPO', 'maotou316/hoctrl-firmware')
             tag_name = f"v{version}"
-
-            build_dir = os.path.join(project_dir, 'build')
-            renamed_file = os.path.join(build_dir, f'{model}_v{version}.bin')
-            if bin_path != renamed_file and not os.path.exists(renamed_file):
-                shutil.copy(bin_path, renamed_file)
-                bin_path = renamed_file
-            elif os.path.exists(renamed_file):
-                bin_path = renamed_file
 
             print_color(f"Repository: {repo}", Colors.GRAY)
             print_color(f"Tag: {tag_name}", Colors.GRAY)
@@ -952,6 +1017,10 @@ def update_firestore(project_dir, model, version, download_url, changelog, min_v
 
 HOLUCAM_API_BASE_DEFAULT = 'https://holucam.neuter.online'
 
+# 走到後台登記時，韌體已上傳、Firestore 已寫、.ino 版號也已 +1，重跑只會再發一個新版號
+HOLUCAM_MANUAL_REGISTER_HINT = ("不要重跑 publish.py（會再跳一個版號），"
+                                "請到 HoLuCam 後台「韌體管理」頁手動登記")
+
 
 def _holucam_api_base():
     return (os.getenv('HOLUCAM_API_BASE') or HOLUCAM_API_BASE_DEFAULT).strip().rstrip('/')
@@ -959,6 +1028,44 @@ def _holucam_api_base():
 
 def _holucam_publish_token():
     return (os.getenv('HOLUCAM_FIRMWARE_PUBLISH_TOKEN') or '').strip()
+
+
+# 只有本機測試可以用 http；其他一律要 https，否則 token 會以明文送出去。
+_HOLUCAM_HTTP_ALLOWED_HOSTS = ('localhost', '127.0.0.1')
+
+
+def validate_holucam_api_base(api_base):
+    """檢查 HOLUCAM_API_BASE。回傳錯誤說明，沒問題回 None（純函式，不打網路）。"""
+    try:
+        parsed = urllib.parse.urlsplit(api_base)
+        host = parsed.hostname
+        has_userinfo = bool(parsed.username or parsed.password)
+    except ValueError:
+        return "HOLUCAM_API_BASE 不是合法網址"
+    scheme = (parsed.scheme or '').lower()
+    if not host:
+        return "HOLUCAM_API_BASE 不是合法網址（缺主機名稱）"
+    if has_userinfo:
+        return "HOLUCAM_API_BASE 不可含帳號密碼"
+    if scheme == 'https':
+        return None
+    if scheme == 'http' and host.lower() in _HOLUCAM_HTTP_ALLOWED_HOSTS:
+        return None
+    return ("HOLUCAM_API_BASE 必須是 https://（只有 http://localhost、http://127.0.0.1 "
+            "可用 http），為避免 token 明文外洩，不送出")
+
+
+def validate_holucam_token(token):
+    """檢查 token 能不能放進 HTTP header。回傳錯誤說明（絕不含 token 本身），沒問題回 None。
+
+    含 CR/LF 等控制字元的 token 放進 header 會被 urllib 拒絕，而那個例外訊息會把整個
+    header 值（含 token）印出來；所以先擋，也順便擋 header injection。
+    """
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in token):
+        return "HOLUCAM_FIRMWARE_PUBLISH_TOKEN 含換行或其他控制字元，請重新設定（不印出 token 內容）"
+    if any(ord(ch) > 0x7e for ch in token):
+        return "HOLUCAM_FIRMWARE_PUBLISH_TOKEN 含非 ASCII 字元，請重新設定（不印出 token 內容）"
+    return None
 
 
 def build_holucam_release_request(api_base, model, version, download_url, changelog,
@@ -1009,26 +1116,41 @@ def register_holucam_backend(model, version, download_url, changelog, min_versio
                     "（新版 HoLuCam App 會看不到這一版，請之後到後台韌體頁手動登記）", Colors.YELLOW)
         return 'skipped', '未設定 HOLUCAM_FIRMWARE_PUBLISH_TOKEN'
 
-    url, body = build_holucam_release_request(
-        _holucam_api_base(), model, version, download_url, changelog, min_version, md5
-    )
-    print_color(f"PUT {url}", Colors.GRAY)
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode('utf-8'),
-        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-        method='PUT',
-    )
+    token_error = validate_holucam_token(token)
+    if token_error:
+        print_color(f"❌ HoLuCam 後台登記失敗（{model}）：{token_error}", Colors.RED)
+        return 'failed', token_error
+
+    api_base = _holucam_api_base()
+    base_error = validate_holucam_api_base(api_base)
+    if base_error:
+        print_color(f"❌ HoLuCam 後台登記失敗（{model}）：{base_error}", Colors.RED)
+        return 'failed', base_error
+
     try:
+        url, body = build_holucam_release_request(
+            api_base, model, version, download_url, changelog, min_version, md5
+        )
+        print_color(f"PUT {url}", Colors.GRAY)
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode('utf-8'),
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            method='PUT',
+        )
         with urllib.request.urlopen(req, timeout=60) as res:
-            raw = res.read().decode('utf-8')
             status = res.status
+            raw = res.read().decode('utf-8', errors='replace')
             try:
                 parsed = json.loads(raw) if raw else {}
             except ValueError:
                 parsed = raw
     except urllib.error.HTTPError as e:
-        raw = e.read().decode('utf-8', errors='replace')
+        # 讀錯誤內容本身也可能失敗（連線中斷等），不可讓它中斷整輪（後面還有別的變體）
+        try:
+            raw = e.read().decode('utf-8', errors='replace')
+        except Exception as read_err:
+            raw = f"（讀取錯誤回應失敗：{type(read_err).__name__}）"
         try:
             parsed = json.loads(raw)
         except ValueError:
@@ -1042,7 +1164,12 @@ def register_holucam_backend(model, version, download_url, changelog, min_versio
             print_color("   HOLUCAM_FIRMWARE_PUBLISH_TOKEN 與後台設定不一致", Colors.YELLOW)
         return 'failed', detail
     except Exception as e:
-        detail = f"連線失敗：{e}"
+        # 只印例外類別名稱：部分例外（例如 header 驗證失敗）的訊息會帶出 Authorization
+        # header 的值，也就是 token。URLError 另外補上 reason 的類別名稱（同樣不印內容）。
+        reason = ''
+        if isinstance(e, urllib.error.URLError):
+            reason = f"（{type(e.reason).__name__}）"
+        detail = f"連線失敗：{type(e).__name__}{reason}"
         print_color(f"❌ HoLuCam 後台登記失敗（{model}）：{detail}", Colors.RED)
         return 'failed', detail
 
@@ -1070,7 +1197,7 @@ def print_holucam_summary(holucam_results):
             has_failure = True
             print_color(f"  ❌ {r['model']} 失敗：{r['reason']}", Colors.RED)
     if has_failure:
-        print_color("⚠ 新版 HoLuCam App 看不到標 ❌ 的型號新版，請修正後到後台韌體頁手動登記",
+        print_color("⚠ 新版 HoLuCam App 看不到標 ❌ 的型號新版。" + HOLUCAM_MANUAL_REGISTER_HINT,
                     Colors.YELLOW)
     return has_failure
 
@@ -1144,6 +1271,14 @@ def main():
     version = firmware_info['version']
     model = firmware_info['model']
 
+    # 型號檢查一定要在「遞增版號（會改 .ino）、編譯、上傳、寫 Firestore、登記後台」之前
+    model_error = validate_device_model(relay, model)
+    if model_error:
+        print_color(f"\n❌ 型號不符，中止發版：{model_error}", Colors.RED)
+        print_color("   沒有改版號、沒有編譯、沒有上傳、沒有寫 Firestore、也沒有登記 HoLuCam 後台；"
+                    "請先修正 .ino 的 deviceModel 再發版", Colors.RED)
+        sys.exit(1)
+
     # 自動將版本號加 1
     print_header("遞增版本號")
     old_version = version
@@ -1191,7 +1326,8 @@ def main():
                 sys.exit(1)
                 continue
 
-            md5 = compute_md5(bin_path)
+            # 對「實際上傳的那個檔」算 MD5
+            md5 = compute_md5(release_bin_path(project_dir, vmodel, version))
             print_color(f"MD5: {md5}", Colors.GRAY)
 
             # ↓ Firestore 發佈登記要實際反映到摘要上：只要有任何一個 Firebase 專案沒寫進去，
@@ -1240,7 +1376,8 @@ def main():
             print_color("\n❌ 上傳失敗，無法繼續", Colors.RED)
             sys.exit(1)
 
-        md5 = compute_md5(bin_path)
+        # 對「實際上傳的那個檔」算 MD5
+        md5 = compute_md5(release_bin_path(project_dir, model, version))
         print_color(f"MD5: {md5}", Colors.GRAY)
 
         firestore_ok = update_firestore(project_dir, model, version, download_url, changelog, args.min_version, md5)
@@ -1248,13 +1385,23 @@ def main():
             model, version, download_url, changelog, args.min_version, md5)
         holucam_results.append({'model': model, 'status': hl_status, 'reason': hl_reason})
 
-        if firestore_ok:
+        # 與多變體流程一致：Firestore 與 HoLuCam 後台都沒失敗才印綠色完成
+        hl_failed = hl_status == 'failed'
+        if firestore_ok and not hl_failed:
             print_color("\n╔════════════════════════════════════════╗", Colors.GREEN)
             print_color("║        ✓ 韌體發布完成！              ║", Colors.GREEN)
             print_color("╚════════════════════════════════════════╝", Colors.GREEN)
             print_color(f"\n版本: {version}", Colors.WHITE)
             print_color(f"下載 URL: {download_url}", Colors.WHITE)
             print_color("\n設備將在下次連線時收到更新通知\n", Colors.YELLOW)
+        elif firestore_ok:
+            print_color("\n╔════════════════════════════════════════╗", Colors.YELLOW)
+            print_color("║  ⚠ 韌體已上傳，但 HoLuCam 後台未登記 ║", Colors.YELLOW)
+            print_color("╚════════════════════════════════════════╝", Colors.YELLOW)
+            print_color(f"\n版本: {version}", Colors.WHITE)
+            print_color(f"下載 URL: {download_url}", Colors.WHITE)
+            print_color("\nhoCtrl 會收到更新通知；新版 HoLuCam App 要等後台登記後才看得到\n",
+                        Colors.YELLOW)
         else:
             print_color("\n╔════════════════════════════════════════╗", Colors.YELLOW)
             print_color("║    ⚠ 韌體已上傳，但 Firestore 未更新 ║", Colors.YELLOW)
@@ -1268,6 +1415,7 @@ def main():
     # 沒設 token 的「略過」不算失敗。
     if any(r['status'] == 'failed' for r in holucam_results):
         print_color("\n❌ HoLuCam 後台登記有失敗項（見上方摘要），結束代碼 1", Colors.RED)
+        print_color(f"   {HOLUCAM_MANUAL_REGISTER_HINT}", Colors.RED)
         sys.exit(1)
 
 if __name__ == '__main__':
