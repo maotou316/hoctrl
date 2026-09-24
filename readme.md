@@ -186,6 +186,23 @@ python publish.py 3 -c "新增藍牙配對功能" -m 1.0.0 -y
 4. **編譯韌體** — 使用 arduino-cli 編譯，產出 `.bin` 檔案
 5. **上傳韌體** — 依序嘗試 GitHub Releases → Firebase Storage → gsutil → 手動上傳
 6. **更新 Firestore** — 寫入 `firmware_updates/{model}` 文件，設備下次連線時收到更新通知
+   - `hoctrl`：hoCtrl（齁控）App 讀這裡
+   - `holucam-be6c6`：只為還沒升級的舊版 HoLuCam App 保留
+7. **登記 HoLuCam 後台** — 對每個型號（含 hoRelay2／hoRelay2-1 變體）`PUT {HOLUCAM_API_BASE}/api/firmware-publish/releases/{model}`。HoLuCam App 與網頁後台現在以後台為準
+
+### HoLuCam 後台登記的環境變數
+
+| 變數 | 說明 | 預設值 |
+|------|------|--------|
+| `HOLUCAM_FIRMWARE_PUBLISH_TOKEN` | 後台發版 token（機密，與後台伺服器設定同值） | 無；沒設就黃色警告並略過後台登記，不中止發版 |
+| `HOLUCAM_API_BASE` | HoLuCam 後台網址 | `https://holucam.neuter.online` |
+
+有設 token 但登記失敗（例如 503 `firmware-publish-disabled`、401 `invalid-publish-token`、400 驗證錯誤）時會印出錯誤碼與訊息，結尾摘要列出失敗項，並以結束代碼 1 結束。
+
+```powershell
+$env:HOLUCAM_FIRMWARE_PUBLISH_TOKEN = "（向後台管理者索取）"
+python publish.py 2 -c "修正 WiFi 連接問題"
+```
 
 ### 上傳優先順序
 

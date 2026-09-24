@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
 hoRelay 韌體發布自動化腳本（支援 hoRelay1～3）
-此腳本會編譯韌體、上傳到 GitHub Releases / Firebase Storage 並更新 Firestore 記錄
+此腳本會編譯韌體、上傳到 GitHub Releases / Firebase Storage，並登記發佈資料：
+  - Firestore hoctrl：hoCtrl（齁控）App 讀這裡
+  - HoLuCam 後台（MySQL FirmwareRelease）：HoLuCam App 與網頁後台現在以這裡為準
+  - Firestore holucam-be6c6：只為還沒升級的舊版 HoLuCam App 保留
+
+環境變數（HoLuCam 後台登記用）:
+  HOLUCAM_FIRMWARE_PUBLISH_TOKEN  後台發版 token；沒設就略過後台登記（黃色警告，不中止發版）
+  HOLUCAM_API_BASE                後台網址，預設 https://holucam.neuter.online
 
 用法:
   python publish.py 2                     # 發布 hoRelay2
@@ -404,7 +411,12 @@ def upload_to_firebase(bin_path, project_dir, model, version, changelog="更新"
 # 控制器硬體與韌體只有一批（hoRelay2／hoRelay2-1…），但目前有兩個 App 各自提供
 # 韌體更新功能，而且各自讀「自己 Firebase 專案」的 firmware_updates/{型號}：
 #   • hoCtrl （齁控）      → Firebase 專案 hoctrl
-#   • HoLuCam（獵捕監控）  → Firebase 專案 holucam-be6c6
+#   • HoLuCam（獵捕監控）  → Firebase 專案 holucam-be6c6（僅舊版 App）
+#
+# ⚠ HoLuCam 已改以「後台 MySQL FirmwareRelease」為準（新版 App 與網頁後台都讀後台，
+#   由下方 register_holucam_backend() 登記）。holucam-be6c6 這份 Firestore 只為了
+#   還沒升級的舊版 HoLuCam App 保留；等舊版 App 都淘汰後才能從清單拿掉，在那之前不要刪。
+#
 # 兩邊欄位是同一套：version / md5 / min_version / download_url / changelog /
 # publish_time（另外的 publisher / updater / update_time 是 App 韌體管理頁寫的
 # 使用者 uid，發版腳本不寫，也不跨專案複製——別的專案對不到那個 uid）。
@@ -422,7 +434,8 @@ FIRESTORE_TARGET_PROJECTS = [
     # holucam-be6c6：這台發版機沒有它的 service account key，也沒裝 gcloud（所以連
     #         ADC 都沒有），因此走「firebase CLI 已登入的使用者憑證 + Firestore REST
     #         API」。理由見 _firebase_cli_access_token() 與 firestore_rest_set_merge()。
-    {'project_id': 'holucam-be6c6', 'label': 'HoLuCam（獵捕監控）', 'legacy_path': False},
+    #         ⚠ 只為舊版 HoLuCam App 保留；新版 App 讀後台（見 register_holucam_backend）。
+    {'project_id': 'holucam-be6c6', 'label': 'HoLuCam（獵捕監控，舊版 App）', 'legacy_path': False},
 ]
 
 # firebase CLI 把登入後的 refresh token 存在這裡（firebase-tools 的 configstore）。
@@ -923,6 +936,144 @@ def update_firestore(project_dir, model, version, download_url, changelog, min_v
                 "請手動補登記後再宣布發版完成", Colors.YELLOW)
     return False
 
+# ── HoLuCam 後台登記 ────────────────────────────────────────────────
+#
+# HoLuCam App 與網頁後台已改讀後台 MySQL 的 FirmwareRelease（以後台為準），
+# Firestore holucam-be6c6 那份只為「還沒升級的舊版 App」保留。所以發版時除了寫
+# Firestore，還要把同一份資料 PUT 到後台：
+#   PUT {HOLUCAM_API_BASE}/api/firmware-publish/releases/{model}
+#   Authorization: Bearer {HOLUCAM_FIRMWARE_PUBLISH_TOKEN}
+# body 與後台 admin 版 PUT /api/admin/firmware/releases/:model 完全相同
+# （version／downloadUrl／md5／minVersion／changelog，駝峰命名，與 Firestore 的底線命名不同）。
+# 後台會自己再驗 version（x.y.z）、md5（32 hex）、網址（https、可列印 ASCII、長度塞得進設備的
+# JSON 緩衝區）；這裡不重複驗，驗證失敗時把後台回的 code／message 原樣印出來。
+#
+# 沒設 token → 黃色警告並略過（不讓發版失敗）；有設但 PUT 失敗 → 紅色錯誤、結尾 exit 1。
+
+HOLUCAM_API_BASE_DEFAULT = 'https://holucam.neuter.online'
+
+
+def _holucam_api_base():
+    return (os.getenv('HOLUCAM_API_BASE') or HOLUCAM_API_BASE_DEFAULT).strip().rstrip('/')
+
+
+def _holucam_publish_token():
+    return (os.getenv('HOLUCAM_FIRMWARE_PUBLISH_TOKEN') or '').strip()
+
+
+def build_holucam_release_request(api_base, model, version, download_url, changelog,
+                                  min_version, md5):
+    """組出 PUT 的網址與 body（純函式，不打網路，方便單獨驗證）。"""
+    url = (f"{api_base.rstrip('/')}/api/firmware-publish/releases/"
+           f"{urllib.parse.quote(model, safe='')}")
+    body = {
+        'version': version,
+        'downloadUrl': download_url,
+        # 後台會轉小寫，這裡先轉，讓印出來的內容與存進 DB 的一致
+        'md5': (md5 or '').lower(),
+        'minVersion': min_version or None,
+        'changelog': changelog or None,
+    }
+    return url, body
+
+
+def _holucam_error_detail(status, body):
+    """從後台錯誤回應抽出 (code, message)。
+
+    兩種形狀都要吃：
+      - 直接的 { ok:false, error:{ code, message } }
+      - h3 createError：{ statusCode, statusMessage, message, data:{ ok:false, error:{ code, message } } }
+    """
+    if isinstance(body, dict):
+        err = body.get('error')
+        if not isinstance(err, dict):
+            data = body.get('data')
+            err = data.get('error') if isinstance(data, dict) else None
+        if isinstance(err, dict) and (err.get('code') or err.get('message')):
+            return err.get('code') or f'HTTP {status}', err.get('message') or ''
+        return (body.get('statusMessage') or f'HTTP {status}',
+                body.get('message') or str(body)[:500])
+    return f'HTTP {status}', str(body)[:500]
+
+
+def register_holucam_backend(model, version, download_url, changelog, min_version, md5):
+    """把一個型號的發佈資料登記到 HoLuCam 後台。
+
+    回傳 (狀態, 說明)，狀態為 'ok'／'skipped'／'failed'。
+    'skipped' 只在沒設 token 時出現，不算發版失敗。
+    """
+    print_header(f"登記 HoLuCam 後台：{model}")
+    token = _holucam_publish_token()
+    if not token:
+        print_color("⚠ 未設定 HOLUCAM_FIRMWARE_PUBLISH_TOKEN，略過 HoLuCam 後台登記"
+                    "（新版 HoLuCam App 會看不到這一版，請之後到後台韌體頁手動登記）", Colors.YELLOW)
+        return 'skipped', '未設定 HOLUCAM_FIRMWARE_PUBLISH_TOKEN'
+
+    url, body = build_holucam_release_request(
+        _holucam_api_base(), model, version, download_url, changelog, min_version, md5
+    )
+    print_color(f"PUT {url}", Colors.GRAY)
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode('utf-8'),
+        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+        method='PUT',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            raw = res.read().decode('utf-8')
+            status = res.status
+            try:
+                parsed = json.loads(raw) if raw else {}
+            except ValueError:
+                parsed = raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode('utf-8', errors='replace')
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = raw
+        code, message = _holucam_error_detail(e.code, parsed)
+        detail = f"HTTP {e.code} {code}：{message}"
+        print_color(f"❌ HoLuCam 後台登記失敗（{model}）：{detail}", Colors.RED)
+        if e.code == 503:
+            print_color("   後台的韌體發版端點未啟用（伺服器沒設定發版 token）", Colors.YELLOW)
+        elif e.code == 401:
+            print_color("   HOLUCAM_FIRMWARE_PUBLISH_TOKEN 與後台設定不一致", Colors.YELLOW)
+        return 'failed', detail
+    except Exception as e:
+        detail = f"連線失敗：{e}"
+        print_color(f"❌ HoLuCam 後台登記失敗（{model}）：{detail}", Colors.RED)
+        return 'failed', detail
+
+    if isinstance(parsed, dict) and parsed.get('ok') is True:
+        print_color(f"✓ HoLuCam 後台登記成功：{model} v{version}", Colors.GREEN)
+        return 'ok', ''
+    code, message = _holucam_error_detail(status, parsed)
+    detail = f"HTTP {status} 回應非預期：{code} {message}"
+    print_color(f"❌ HoLuCam 後台登記失敗（{model}）：{detail}", Colors.RED)
+    return 'failed', detail
+
+
+def print_holucam_summary(holucam_results):
+    """結尾摘要：列出 HoLuCam 後台登記結果。回傳是否有失敗項。"""
+    if not holucam_results:
+        return False
+    print_color("\nHoLuCam 後台登記：", Colors.WHITE)
+    has_failure = False
+    for r in holucam_results:
+        if r['status'] == 'ok':
+            print_color(f"  ✓ {r['model']}", Colors.GREEN)
+        elif r['status'] == 'skipped':
+            print_color(f"  ⚠ {r['model']} 已略過（{r['reason']}）", Colors.YELLOW)
+        else:
+            has_failure = True
+            print_color(f"  ❌ {r['model']} 失敗：{r['reason']}", Colors.RED)
+    if has_failure:
+        print_color("⚠ 新版 HoLuCam App 看不到標 ❌ 的型號新版，請修正後到後台韌體頁手動登記",
+                    Colors.YELLOW)
+    return has_failure
+
 # ── 主程式 ──────────────────────────────────────────────────────────
 
 def select_relay():
@@ -1018,6 +1169,7 @@ def main():
 
     # 判斷是否有多變體
     variants = cfg.get('variants')
+    holucam_results = []  # 每個型號的 HoLuCam 後台登記結果，結尾摘要與 exit code 用
 
     if variants:
         # 多變體：逐一編譯、上傳、更新
@@ -1045,7 +1197,13 @@ def main():
             # ↓ Firestore 發佈登記要實際反映到摘要上：只要有任何一個 Firebase 專案沒寫進去，
             #   這個變體就不算發版成功（舊版寫死 success=True，寫失敗也看不出來）。
             firestore_ok = update_firestore(project_dir, vmodel, version, download_url, changelog, args.min_version, md5)
-            results.append({'model': vmodel, 'success': firestore_ok, 'url': download_url})
+            # ↓ HoLuCam 後台登記（新版 HoLuCam App 以後台為準）；沒設 token 只警告略過，不算失敗
+            hl_status, hl_reason = register_holucam_backend(
+                vmodel, version, download_url, changelog, args.min_version, md5)
+            holucam_results.append({'model': vmodel, 'status': hl_status, 'reason': hl_reason})
+            results.append({'model': vmodel,
+                            'success': firestore_ok and hl_status != 'failed',
+                            'url': download_url})
 
         # 摘要
         success_count = sum(1 for r in results if r['success'])
@@ -1065,6 +1223,7 @@ def main():
             status = "✓" if r['success'] else "❌"
             url_info = f" - {r['url']}" if r.get('url') else ""
             print_color(f"  {status} {r['model']}{url_info}", Colors.GREEN if r['success'] else Colors.RED)
+        print_holucam_summary(holucam_results)
         print_color("\n設備將在下次連線時收到更新通知\n", Colors.YELLOW)
 
     else:
@@ -1085,6 +1244,9 @@ def main():
         print_color(f"MD5: {md5}", Colors.GRAY)
 
         firestore_ok = update_firestore(project_dir, model, version, download_url, changelog, args.min_version, md5)
+        hl_status, hl_reason = register_holucam_backend(
+            model, version, download_url, changelog, args.min_version, md5)
+        holucam_results.append({'model': model, 'status': hl_status, 'reason': hl_reason})
 
         if firestore_ok:
             print_color("\n╔════════════════════════════════════════╗", Colors.GREEN)
@@ -1100,6 +1262,13 @@ def main():
             print_color(f"\n版本: {version}", Colors.WHITE)
             print_color(f"下載 URL: {download_url}", Colors.WHITE)
             print_color("\n請手動更新 Firestore 後，設備才會收到更新通知\n", Colors.YELLOW)
+        print_holucam_summary(holucam_results)
+
+    # HoLuCam 後台有設 token 卻登記失敗 → exit 1，讓發版的人（或 CI）一定注意到。
+    # 沒設 token 的「略過」不算失敗。
+    if any(r['status'] == 'failed' for r in holucam_results):
+        print_color("\n❌ HoLuCam 後台登記有失敗項（見上方摘要），結束代碼 1", Colors.RED)
+        sys.exit(1)
 
 if __name__ == '__main__':
     try:

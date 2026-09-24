@@ -146,6 +146,24 @@ firmware/{model}/{model}_v{version}.bin
 }
 ```
 
+會寫進兩個 Firebase 專案：`hoctrl`（齁控 App）與 `holucam-be6c6`（**只為舊版 HoLuCam App 保留**）。
+
+### 7. 登記 HoLuCam 後台
+HoLuCam App 與網頁後台現在讀後台 MySQL 的 `FirmwareRelease`，所以每個型號（hoRelay2 與 hoRelay2-1 各一次）還會：
+
+```
+PUT {HOLUCAM_API_BASE}/api/firmware-publish/releases/{model}
+Authorization: Bearer {HOLUCAM_FIRMWARE_PUBLISH_TOKEN}
+{ "version", "downloadUrl", "md5", "minVersion", "changelog" }
+```
+
+| 環境變數 | 說明 |
+|----------|------|
+| `HOLUCAM_FIRMWARE_PUBLISH_TOKEN` | 後台發版 token（機密）。沒設 → 黃色警告「略過 HoLuCam 後台登記」，發版照常完成 |
+| `HOLUCAM_API_BASE` | 後台網址，預設 `https://holucam.neuter.online` |
+
+有設 token 卻登記失敗時會印出後台回的錯誤碼（如 `firmware-publish-disabled`、`invalid-publish-token`、`invalid-md5`、`url-too-long`）與訊息，結尾列出失敗項並以結束代碼 1 結束。
+
 ## 手動上傳步驟（無 gsutil）
 
 如果未安裝 gsutil，需要手動上傳：
