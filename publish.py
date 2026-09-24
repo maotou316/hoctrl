@@ -17,8 +17,11 @@ import re
 import hashlib
 import argparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import shutil
+import urllib.request
+import urllib.parse
+import urllib.error
 import platform
 
 # ── 每個型號的硬體設定 ──────────────────────────────────────────────
@@ -396,8 +399,50 @@ def upload_to_firebase(bin_path, project_dir, model, version, changelog="更新"
 
 # ── Firestore 更新 ──────────────────────────────────────────────────
 
+# ★ 為什麼同一份資料要寫進「兩個」Firebase 專案 ★
+#
+# 控制器硬體與韌體只有一批（hoRelay2／hoRelay2-1…），但目前有兩個 App 各自提供
+# 韌體更新功能，而且各自讀「自己 Firebase 專案」的 firmware_updates/{型號}：
+#   • hoCtrl （齁控）      → Firebase 專案 hoctrl
+#   • HoLuCam（獵捕監控）  → Firebase 專案 holucam-be6c6
+# 兩邊欄位是同一套：version / md5 / min_version / download_url / changelog /
+# publish_time（另外的 publisher / updater / update_time 是 App 韌體管理頁寫的
+# 使用者 uid，發版腳本不寫，也不跨專案複製——別的專案對不到那個 uid）。
+#
+# 以前這支腳本只寫 hoctrl，holucam-be6c6 那份靠人工複製，結果就是停在被複製過去的
+# 那一版（2026-09 時停在 1.8.5），HoLuCam 的使用者從此看不到新韌體。
+# 所以發版時要對清單裡「每一個」專案各寫一次同一份資料。
+#
+# ⚠ 這不是複製貼上的重複程式碼，請不要「順手」刪掉其中一個專案。
+# ⚠ 日後要再加第三個 App，只要在這個清單裡加一筆。
+FIRESTORE_TARGET_PROJECTS = [
+    # hoctrl：維持原有憑證路徑（serviceAccountKey.json → 預設認證 ADC → Node 腳本），
+    #         這條路跑很久了，不要動它的行為。
+    {'project_id': 'hoctrl', 'label': 'hoCtrl（齁控）', 'legacy_path': True},
+    # holucam-be6c6：這台發版機沒有它的 service account key，也沒裝 gcloud（所以連
+    #         ADC 都沒有），因此走「firebase CLI 已登入的使用者憑證 + Firestore REST
+    #         API」。理由見 _firebase_cli_access_token() 與 firestore_rest_set_merge()。
+    {'project_id': 'holucam-be6c6', 'label': 'HoLuCam（獵捕監控）', 'legacy_path': False},
+]
+
+# firebase CLI 把登入後的 refresh token 存在這裡（firebase-tools 的 configstore）。
+FIREBASE_TOOLS_CONFIG_PATH = os.path.join(
+    os.path.expanduser('~'), '.config', 'configstore', 'firebase-tools.json'
+)
+# firebase-tools 自己的 installed-app OAuth client。這組值**公開寫在 firebase-tools
+# 的原始碼裡**（installed app 沒有真正的機密），所以可以直接放在這裡；它只是用來把
+# 上面那個 refresh token 換成 access token，換不到任何額外權限。
+FIREBASE_CLI_CLIENT_ID = '563584335869-fgrhgmd47bqnekij5i8b5pr03ho849e6.apps.googleusercontent.com'
+FIREBASE_CLI_CLIENT_SECRET = 'j9iVZfS8kkCEFUPaAeJV0sAi'
+
+FIRESTORE_COLLECTION = 'firmware_updates'
+
+# 同一次發版會寫多個型號 × 多個專案，access token 取一次就夠。
+_FIREBASE_CLI_TOKEN_CACHE = {'token': None}
+
+
 def _find_service_account_key(project_dir):
-    """在多個位置搜尋 serviceAccountKey.json"""
+    """在多個位置搜尋 serviceAccountKey.json（hoctrl 專用，路徑不要改）"""
     candidates = [
         os.path.join(project_dir, 'serviceAccountKey.json'),
         os.path.join('..', 'hoctrl', 'serviceAccountKey.json'),
@@ -406,6 +451,28 @@ def _find_service_account_key(project_dir):
         if os.path.exists(path):
             return path
     return None
+
+
+def _find_service_account_key_for_project(project_id, project_dir):
+    """找某個專案「專屬」的 service account key（hoctrl 以外的專案用）。
+
+    目前這台機器上沒有 holucam-be6c6 的 key，所以一定回 None、接著走 CLI 憑證；
+    但日後只要把 key 放到下面任一個位置（或設環境變數），就會自動優先採用，
+    不必再改程式。
+    """
+    env_name = 'FIRESTORE_SA_KEY_' + project_id.upper().replace('-', '_')
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.environ.get(env_name),
+        os.path.join(script_dir, f'serviceAccountKey.{project_id}.json'),
+        os.path.join(project_dir, f'serviceAccountKey.{project_id}.json'),
+        os.path.join('..', project_id, 'serviceAccountKey.json'),
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
 
 def compute_md5(bin_path):
     """算出韌體 .bin 的 MD5，寫進 Firestore 供設備下載後比對。
@@ -423,9 +490,180 @@ def compute_md5(bin_path):
     return h.hexdigest()
 
 
-def update_firestore(project_dir, model, version, download_url, changelog, min_version, md5=None):
-    print_header("更新 Firestore 記錄")
+# ── firebase CLI 使用者憑證 + Firestore REST API ─────────────────────
+#
+# 為什麼不用 service account？因為這台發版機上就是沒有 holucam-be6c6 的 key，
+# 也沒裝 gcloud（所以連 ADC 都沒有）。唯一現成、而且已經被授權的憑證，就是
+# 「firebase CLI 登入的那個使用者」。
+#
+# ⚠ holucam-be6c6 的 firestore.rules 對 firmware_updates 是 allow write: if false，
+#   但那只約束 client SDK。這裡走的是 Cloud Firestore REST API + 使用者 OAuth token，
+#   判權靠 Cloud API／IAM，**不受 Firestore 安全規則限制**（已實測寫入成功）。
+#   所以不必、也不要為了發版去放寬那個專案的安全規則。
 
+def _firebase_cli_access_token(force_refresh=False):
+    """用 firebase CLI 存下來的 refresh token 換一個 access token。
+
+    回傳 access token 字串；失敗直接 raise，讓呼叫端把原因印出來。
+    """
+    if not force_refresh and _FIREBASE_CLI_TOKEN_CACHE['token']:
+        return _FIREBASE_CLI_TOKEN_CACHE['token']
+
+    if not os.path.exists(FIREBASE_TOOLS_CONFIG_PATH):
+        raise RuntimeError(
+            f"找不到 firebase CLI 設定檔 {FIREBASE_TOOLS_CONFIG_PATH}，請先執行 firebase login"
+        )
+    with open(FIREBASE_TOOLS_CONFIG_PATH, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    refresh_token = (cfg.get('tokens') or {}).get('refresh_token')
+    if not refresh_token:
+        raise RuntimeError("firebase CLI 設定檔裡沒有 refresh_token，請重新執行 firebase login")
+
+    body = urllib.parse.urlencode({
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token,
+        'client_id': FIREBASE_CLI_CLIENT_ID,
+        'client_secret': FIREBASE_CLI_CLIENT_SECRET,
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        'https://oauth2.googleapis.com/token',
+        data=body,
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            payload = json.loads(res.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode('utf-8', errors='replace')
+        raise RuntimeError(f"以 firebase CLI 憑證換 access token 失敗（HTTP {e.code}）：{detail}")
+
+    token = payload.get('access_token')
+    if not token:
+        raise RuntimeError("OAuth 回應裡沒有 access_token")
+    _FIREBASE_CLI_TOKEN_CACHE['token'] = token
+    return token
+
+
+def _rfc3339_utc(dt=None):
+    """產生 Firestore REST 要的 RFC3339 UTC 時間字串（毫秒精度）。
+
+    REST API 沒有 firestore.SERVER_TIMESTAMP 這種東西，所以 publish_time 用
+    「發版當下的 UTC 時間」。差別只有網路往返那幾百毫秒，對韌體更新判斷沒有影響。
+    """
+    dt = dt or datetime.now(timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime('%Y-%m-%dT%H:%M:%S.') + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _firestore_rest_value(value):
+    """把 Python 值包成 Firestore REST 的 typed value。"""
+    if isinstance(value, datetime):
+        return {'timestampValue': _rfc3339_utc(value)}
+    return {'stringValue': str(value)}
+
+
+def _firestore_rest_doc_url(project_id, collection, doc_id=None):
+    base = (f"https://firestore.googleapis.com/v1/projects/{urllib.parse.quote(project_id)}"
+            f"/databases/(default)/documents/{urllib.parse.quote(collection)}")
+    if doc_id is None:
+        return base
+    return f"{base}/{urllib.parse.quote(doc_id, safe='')}"
+
+
+def _firestore_rest_call(url, access_token, method='GET', payload=None):
+    """打一次 Firestore REST API，回傳 (HTTP 狀態碼, 解析後的 JSON 或原始字串)。"""
+    data = json.dumps(payload).encode('utf-8') if payload is not None else None
+    headers = {'Authorization': f'Bearer {access_token}'}
+    if data is not None:
+        headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            raw = res.read().decode('utf-8')
+            return res.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode('utf-8', errors='replace')
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, raw
+
+
+def _firestore_rest_error(body):
+    if isinstance(body, dict):
+        err = body.get('error') or {}
+        msg = err.get('message') or err.get('status')
+        if msg:
+            return msg
+    return str(body)[:500]
+
+
+def firestore_rest_get(project_id, doc_id=None, collection=FIRESTORE_COLLECTION,
+                       access_token=None):
+    """【唯讀】用 CLI 憑證讀 firmware_updates（給人工驗證／除錯用）。
+
+    doc_id 給 None 就列整個 collection。發版流程不會呼叫這個函式，它存在的目的是
+    讓人可以在「不寫入任何資料」的前提下，確認憑證與 URL 組法是對的。
+    回傳 (HTTP 狀態碼, JSON)。
+    """
+    access_token = access_token or _firebase_cli_access_token()
+    return _firestore_rest_call(
+        _firestore_rest_doc_url(project_id, collection, doc_id), access_token
+    )
+
+
+def firestore_rest_set_merge(project_id, doc_id, data, collection=FIRESTORE_COLLECTION,
+                             access_token=None):
+    """用 REST API 做等同 set(merge=True) 的寫入，回傳 (成功?, 說明)。
+
+    PATCH 一定要帶 updateMask.fieldPaths 逐欄指定，否則 REST 的 PATCH 會把整份文件
+    換成 request body（＝整份覆蓋），App 自己寫的 publisher / updater / update_time
+    就會被抹掉。文件還不存在時 PATCH 也會建立，這裡仍保留 404 → POST
+    ?documentId=<型號> 的退路，免得哪天 API 行為改變就寫不進去。
+    """
+    access_token = access_token or _firebase_cli_access_token()
+    fields = {k: _firestore_rest_value(v) for k, v in data.items()}
+
+    mask = '&'.join(
+        f"updateMask.fieldPaths={urllib.parse.quote(k, safe='')}" for k in data
+    )
+    patch_url = f"{_firestore_rest_doc_url(project_id, collection, doc_id)}?{mask}"
+    status, body = _firestore_rest_call(patch_url, access_token, 'PATCH', {'fields': fields})
+    if 200 <= status < 300:
+        return True, 'PATCH 逐欄合併成功'
+    if status != 404:
+        return False, f"PATCH 失敗（HTTP {status}）：{_firestore_rest_error(body)}"
+
+    # 文件不存在 → 建立
+    create_url = (f"{_firestore_rest_doc_url(project_id, collection)}"
+                  f"?documentId={urllib.parse.quote(doc_id, safe='')}")
+    status, body = _firestore_rest_call(create_url, access_token, 'POST', {'fields': fields})
+    if 200 <= status < 300:
+        return True, '文件不存在，已新建'
+    return False, f"建立文件失敗（HTTP {status}）：{_firestore_rest_error(body)}"
+
+
+def firestore_rest_delete(project_id, doc_id, collection=FIRESTORE_COLLECTION,
+                          access_token=None):
+    """用 REST API 刪除一份文件。只給自我驗證用（刪掉測試文件），發版流程不會呼叫。"""
+    access_token = access_token or _firebase_cli_access_token()
+    status, body = _firestore_rest_call(
+        _firestore_rest_doc_url(project_id, collection, doc_id), access_token, 'DELETE'
+    )
+    if 200 <= status < 300:
+        return True, ''
+    return False, f"HTTP {status}：{_firestore_rest_error(body)}"
+
+
+# ── 各專案的寫入實作 ────────────────────────────────────────────────
+
+def _update_firestore_hoctrl(project_dir, model, version, download_url, changelog,
+                             min_version, md5=None):
+    """hoctrl 的原有寫入路徑：Python SDK（SA key → 預設認證）→ Node 腳本 → 手動提示。
+
+    ⚠ 這個函式是從舊版 update_firestore() 原封不動搬過來的，行為刻意保持不變。
+    """
     # 方法1: 使用 Python Firebase Admin SDK
     try:
         from google.cloud import firestore
@@ -466,7 +704,8 @@ def update_firestore(project_dir, model, version, download_url, changelog, min_v
                 check=True
             )
             print_color("✓ 安裝成功，重新嘗試更新 Firestore...", Colors.GREEN)
-            return update_firestore(project_dir, model, version, download_url, changelog, min_version, md5)
+            return _update_firestore_hoctrl(project_dir, model, version, download_url,
+                                            changelog, min_version, md5)
         except subprocess.CalledProcessError:
             print_color("❌ 自動安裝 google-cloud-firestore 失敗", Colors.RED)
     except Exception as e:
@@ -543,6 +782,145 @@ db.collection('firmware_updates')
     print_color(f"   - min_version: {min_version}", Colors.GRAY)
     print_color(f"   - publish_time: (使用 Timestamp.now())", Colors.GRAY)
 
+    return False
+
+
+def _update_firestore_with_service_account(project_id, key_path, model, version,
+                                           download_url, changelog, min_version, md5=None):
+    """用某個專案「專屬」的 service account key 寫入（未來放了 key 就會走這條）。"""
+    from google.cloud import firestore
+    from google.oauth2 import service_account
+
+    credentials = service_account.Credentials.from_service_account_file(key_path)
+    db = firestore.Client(credentials=credentials, project=project_id)
+    update_data = {
+        'version': version,
+        'download_url': download_url,
+        'changelog': changelog,
+        'min_version': min_version,
+        'publish_time': firestore.SERVER_TIMESTAMP,
+    }
+    if md5:
+        update_data['md5'] = md5
+    db.collection(FIRESTORE_COLLECTION).document(model).set(update_data, merge=True)
+
+
+def _update_firestore_secondary(project_id, project_dir, model, version, download_url,
+                                changelog, min_version, md5=None):
+    """hoctrl 以外的專案：依序嘗試「專屬 SA key → firebase CLI 憑證 + REST」。
+
+    兩條都失敗才算這個專案失敗，並把每一條的失敗原因都留在回傳值裡。
+    回傳 (成功?, 失敗原因)。
+    """
+    failures = []
+
+    # 嘗試1：專屬 service account key（優先，因為它不依賴某個人的 CLI 登入狀態）
+    key_path = _find_service_account_key_for_project(project_id, project_dir)
+    if key_path:
+        print_color(f"使用 Service Account: {key_path}", Colors.GRAY)
+        try:
+            _update_firestore_with_service_account(
+                project_id, key_path, model, version, download_url,
+                changelog, min_version, md5
+            )
+            print_color(f"✓ {project_id} 更新成功（service account）", Colors.GREEN)
+            print_color(f"文件路徑: {FIRESTORE_COLLECTION}/{model}", Colors.WHITE)
+            return True, ''
+        except Exception as e:
+            failures.append(f"service account（{key_path}）失敗：{e}")
+            print_color(f"⚠ service account 寫入失敗，改試 firebase CLI 憑證：{e}", Colors.YELLOW)
+    else:
+        print_color(f"找不到 {project_id} 專屬的 service account key，改用 firebase CLI 憑證",
+                    Colors.GRAY)
+
+    # 嘗試2：firebase CLI 已登入的使用者憑證 + Firestore REST API
+    try:
+        access_token = _firebase_cli_access_token()
+    except Exception as e:
+        failures.append(f"取 firebase CLI access token 失敗：{e}")
+        print_color(f"❌ 取 firebase CLI access token 失敗：{e}", Colors.RED)
+        return False, '；'.join(failures)
+
+    update_data = {
+        'version': version,
+        'download_url': download_url,
+        'changelog': changelog,
+        'min_version': min_version,
+        # REST 沒有 SERVER_TIMESTAMP，用發版當下的 UTC 時間
+        'publish_time': datetime.now(timezone.utc),
+    }
+    if md5:
+        update_data['md5'] = md5
+
+    print_color("使用 firebase CLI 使用者憑證打 Firestore REST API...", Colors.YELLOW)
+    try:
+        ok, detail = firestore_rest_set_merge(project_id, model, update_data,
+                                              access_token=access_token)
+    except Exception as e:
+        failures.append(f"REST 寫入發生例外：{e}")
+        print_color(f"❌ REST 寫入發生例外：{e}", Colors.RED)
+        return False, '；'.join(failures)
+
+    if ok:
+        print_color(f"✓ {project_id} 更新成功（REST／{detail}）", Colors.GREEN)
+        print_color(f"文件路徑: {FIRESTORE_COLLECTION}/{model}", Colors.WHITE)
+        return True, ''
+
+    failures.append(f"REST 寫入失敗：{detail}")
+    print_color(f"❌ {project_id} REST 寫入失敗：{detail}", Colors.RED)
+    return False, '；'.join(failures)
+
+
+def update_firestore(project_dir, model, version, download_url, changelog, min_version, md5=None):
+    """把同一份韌體發佈資料登記到 FIRESTORE_TARGET_PROJECTS 裡的每一個 Firebase 專案。
+
+    ⚠ 回傳值的定義是「全部成功」：任何一個專案失敗就回 False。
+      絕對不要改成「有一個成功就算成功」——那會讓發版的人以為兩個 App 都拿到新韌體，
+      實際上其中一個 App 的使用者永遠停在舊版，而且沒有人會發現。
+    """
+    targets = FIRESTORE_TARGET_PROJECTS
+    print_header(f"更新 Firestore 記錄（{len(targets)} 個專案）")
+    print_color(f"文件: {FIRESTORE_COLLECTION}/{model}   版本: {version}", Colors.WHITE)
+
+    results = []
+    for target in targets:
+        project_id = target['project_id']
+        label = target['label']
+        print_color(f"\n── {label} / {project_id} " + "─" * 18, Colors.CYAN)
+        try:
+            if target.get('legacy_path'):
+                ok = _update_firestore_hoctrl(project_dir, model, version, download_url,
+                                              changelog, min_version, md5)
+                reason = '' if ok else 'Python SDK 與 Node.js 都失敗（原因見上方訊息）'
+            else:
+                ok, reason = _update_firestore_secondary(
+                    project_id, project_dir, model, version, download_url,
+                    changelog, min_version, md5
+                )
+        except Exception as e:
+            ok, reason = False, f"未預期的例外：{e}"
+            print_color(f"❌ {project_id} 更新失敗: {e}", Colors.RED)
+            if os.getenv('DEBUG'):
+                import traceback
+                traceback.print_exc()
+        results.append({'project_id': project_id, 'label': label, 'ok': ok, 'reason': reason})
+
+    ok_count = sum(1 for r in results if r['ok'])
+    print_color("")
+    if ok_count == len(results):
+        print_color(f"✓ Firestore 登記全部成功（{ok_count}/{len(results)} 個專案）", Colors.GREEN)
+        for r in results:
+            print_color(f"   ✓ {r['label']} / {r['project_id']}", Colors.GREEN)
+        return True
+
+    print_color(f"❌ Firestore 登記未全部成功（{ok_count}/{len(results)} 個專案）", Colors.RED)
+    for r in results:
+        if r['ok']:
+            print_color(f"   ✓ {r['label']} / {r['project_id']}", Colors.GREEN)
+        else:
+            print_color(f"   ❌ {r['label']} / {r['project_id']} 失敗：{r['reason']}", Colors.RED)
+    print_color(f"⚠ 標 ❌ 的 App 使用者「看不到」{model} v{version}，"
+                "請手動補登記後再宣布發版完成", Colors.YELLOW)
     return False
 
 # ── 主程式 ──────────────────────────────────────────────────────────
@@ -664,8 +1042,10 @@ def main():
             md5 = compute_md5(bin_path)
             print_color(f"MD5: {md5}", Colors.GRAY)
 
-            update_firestore(project_dir, vmodel, version, download_url, changelog, args.min_version, md5)
-            results.append({'model': vmodel, 'success': True, 'url': download_url})
+            # ↓ Firestore 發佈登記要實際反映到摘要上：只要有任何一個 Firebase 專案沒寫進去，
+            #   這個變體就不算發版成功（舊版寫死 success=True，寫失敗也看不出來）。
+            firestore_ok = update_firestore(project_dir, vmodel, version, download_url, changelog, args.min_version, md5)
+            results.append({'model': vmodel, 'success': firestore_ok, 'url': download_url})
 
         # 摘要
         success_count = sum(1 for r in results if r['success'])
