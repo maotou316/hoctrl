@@ -42,7 +42,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **開發板**: ESP32-C3 SuperMini
 - **用途**: 2S 鋰電電量偵測，深度睡眠每 10 分鐘回報一次（不是繼電器）
 - **GPIO 定義**:
-  - 電池 ADC: GPIO 3（1MΩ／220kΩ 分壓，中點對地 100nF）
+  - 電池 ADC: GPIO 3（與 hoRelay2 相同的 5 倍分壓模組 S 腳，S 對地 100nF；+ 腳不接）
   - 板載 LED: GPIO 8（低電位亮）
 - **供電**: 電池經低 Iq 降壓到 3.3V 接 3V3 腳，**不可接 5V 腳**（板上 LDO 輸入上限約 6V）
 - **沒有 BLE、沒有 EEPROM**：WiFi 寫死在 `ho_battery1/config.h`

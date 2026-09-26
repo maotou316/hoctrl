@@ -5,8 +5,8 @@
 #include "battery_curve.h"
 #include "policy.h"
 
-// ── 分壓換算：1MΩ/220kΩ，比例 5.545 ──
-static_assert(battery::adcToBatteryMv(1515) == 8400, "8.4V 滿電的 ADC 讀值要換算回 8400mV");
+// ── 分壓換算：5 倍分壓模組（30k/7.5k），比例 5.0 ──
+static_assert(battery::adcToBatteryMv(1680) == 8400, "8.4V 滿電的 ADC 讀值要換算回 8400mV");
 static_assert(battery::adcToBatteryMv(0) == 0, "0mV 換算後仍為 0");
 
 // ── 讀值有效區間 900～2400mV（電池約 5.0～13.3V），邊界含等號 ──
