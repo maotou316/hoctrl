@@ -260,6 +260,8 @@ void failAndSleep(const char* why) {
 
 // PubSubClient 的 callback 是在 mqttClient.loop() 裡面被呼叫的，
 // 在這裡直接跑 OTA 會卡住 loop() 幾十秒，所以只把內容存下來。
+// 注意：mqttClient.setBufferSize(512) 的緩衝區收發共用，指令超過約 470 bytes 會被
+// PubSubClient 靜默丟棄（連這個 callback 都不會被呼叫），所以 OTA 網址要盡量短。
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (length == 0) return;  // 我們自己清除 retained 時發的空訊息會繞回來，忽略
   pendingCommand = "";
@@ -328,6 +330,9 @@ void runOta(const char* url, const char* md5) {
   const unsigned long start = millis();
   bool ledOn = false;
   unsigned long lastBlink = start;
+  unsigned long lastMqttLoop = start;  // OTA 最久可跑 120 秒，遠超過 keepAlive 15 秒，
+                                       // 下載中若完全不呼叫 loop()，broker 會判定斷線把連線收掉，
+                                       // 之後的 update_success/update_failed 會發不出去（spec §8 要求回報失敗原因）
 
   while (http.connected() && written < contentLength && millis() - start < wake::kOtaTimeoutMs) {
     const size_t avail = stream->available();
@@ -339,6 +344,10 @@ void runOta(const char* url, const char* md5) {
       ledOn = !ledOn;
       digitalWrite(ledPin, ledOn ? LOW : HIGH);
       lastBlink = millis();
+    }
+    if (millis() - lastMqttLoop >= 1000) {  // 頻率拉低：太頻繁呼叫會排擠下載吞吐量
+      mqttClient.loop();
+      lastMqttLoop = millis();
     }
     delay(1);
   }
@@ -370,8 +379,16 @@ void handlePendingCommand() {
 
   // 先清掉 retained 指令，再做任何判斷。順序不能反：
   // 若下載或檢查失敗後才清，或拒絕路徑忘了清，每次醒來都會重新執行，OTA 失敗時會耗盡電池。
-  mqttClient.publish(controlTopic().c_str(), (const uint8_t*)"", 0, true);
+  // 下面兩個防護（清除失敗中止、同版本不刷）合起來確保：即使 retained 指令一時清不掉
+  // 或被重複送達，最多也只會多刷一次機，不會每次醒來都重跑。
+  const bool cleared = mqttClient.publish(controlTopic().c_str(), (const uint8_t*)"", 0, true);
   mqttClient.loop();
+  if (!cleared) {
+    // 清除失敗（例如 1.5 秒等待窗結束前連線剛好斷了）：這次放棄處理，
+    // 下次醒來 retained 指令還在，會重新走一次清除，而不是在沒清乾淨的狀態下先刷機。
+    Serial.println("清除 retained 指令失敗，本次醒來放棄處理，下次醒來重試清除");
+    return;
+  }
 
   JsonDocument doc;
   if (deserializeJson(doc, pendingCommand.substring(7))) {
@@ -383,6 +400,12 @@ void handlePendingCommand() {
   const char* md5 = doc["md5"];
   const char* version = doc["version"];
   Serial.printf("更新指令：版本 %s，網址 %s\n", version ? version : "(無)", url ? url : "(無)");
+
+  if (version != nullptr && strcmp(version, firmwareVersion) == 0) {
+    // 已經是這個版本：多半是同一個 retained 指令被重複送達，不需要再刷一次。
+    Serial.println("指令版本與目前韌體相同，略過 OTA");
+    return;
+  }
 
   if (url == nullptr) {
     publishOtaResult("update_failed");
