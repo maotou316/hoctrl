@@ -11,6 +11,9 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Update.h>
 
 #include "config.h"
 #include "battery_curve.h"
@@ -61,6 +64,7 @@ const int DEFAULT_SERVER_COUNT = sizeof(DEFAULT_SERVERS) / sizeof(DEFAULT_SERVER
 WiFiClient netClient;
 PubSubClient mqttClient(netClient);
 const char* activeServer = "";
+String pendingCommand;  // callback 只負責收下來，實際處理在 handlePendingCommand()
 
 const char* getDeviceId() {
   if (deviceIdString.length() == 0) {
@@ -235,7 +239,7 @@ bool publishStatus(uint32_t nextWakeS) {
   sleepInfo["boot_count"] = bootCount;
   sleepInfo["wake_reason"] = wakeReason;
 
-  char buf[480];  // 留 32 bytes 給 PubSubClient 512 緩衝區裡的 topic 與標頭
+  char buf[474];  // 留 38 bytes 給 PubSubClient 512 緩衝區（5 bytes 固定標頭 + 2 bytes topic 長度 + 31 bytes topic）
   const size_t len = serializeJson(doc, buf, sizeof(buf));
   if (len == 0 || len >= sizeof(buf) - 1) {
     Serial.printf("狀態 JSON 過大（%u bytes），放不進緩衝區\n", (unsigned)measureJson(doc));
@@ -252,6 +256,147 @@ void failAndSleep(const char* why) {
   consecutiveFailures++;
   Serial.printf("%s，連續失敗 %lu 次\n", why, (unsigned long)consecutiveFailures);
   goToSleep(wake::backoffSleepSeconds(consecutiveFailures));
+}
+
+// PubSubClient 的 callback 是在 mqttClient.loop() 裡面被呼叫的，
+// 在這裡直接跑 OTA 會卡住 loop() 幾十秒，所以只把內容存下來。
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (length == 0) return;  // 我們自己清除 retained 時發的空訊息會繞回來，忽略
+  pendingCommand = "";
+  pendingCommand.reserve(length);
+  for (unsigned int i = 0; i < length; i++) pendingCommand += (char)payload[i];
+  Serial.printf("收到指令（%s）：%s\n", topic, pendingCommand.c_str());
+}
+
+void receiveCommands() {
+  mqttClient.setCallback(mqttCallback);
+  if (!mqttClient.subscribe(controlTopic().c_str())) {
+    Serial.println("訂閱控制主題失敗");
+    return;
+  }
+  // 等 broker 重播 retained 指令；同時讓前面 publish 的封包送出
+  const unsigned long start = millis();
+  while (millis() - start < wake::kCommandWindowMs && budgetLeftMs() > 0) {
+    mqttClient.loop();
+    delay(10);
+  }
+}
+
+// OTA 結果字串與 hoRelay2 相同，但不 retained：
+// 休眠設備的 retained 狀態是 App 平常唯一看得到的資料，被字串蓋掉要等 10 分鐘才恢復。
+void publishOtaResult(const char* res) {
+  mqttClient.publish(statusTopic().c_str(), res, false);
+  mqttClient.loop();
+  Serial.printf("OTA：%s\n", res);
+}
+
+void runOta(const char* url, const char* md5) {
+  publishOtaResult("updating");
+  WiFi.setSleep(false);  // 下載期間射頻常開，modem-sleep 會讓下載慢數倍
+
+  WiFiClientSecure client;
+  client.setInsecure();  // 不驗憑證，完整性完全靠 MD5（呼叫端已確認格式）
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub Release 會轉址
+  http.setTimeout(15000);
+
+  if (!http.begin(client, url)) {
+    publishOtaResult("update_failed");
+    return;
+  }
+  const int code = http.GET();
+  const int contentLength = http.getSize();
+  if (code != HTTP_CODE_OK || contentLength <= 0 || contentLength > (int)ESP.getFreeSketchSpace()) {
+    Serial.printf("OTA 下載失敗：HTTP %d，大小 %d\n", code, contentLength);
+    http.end();
+    publishOtaResult("update_failed");
+    return;
+  }
+
+  // setMD5() 必須在 begin() 之後：begin() 會重置內部的 MD5 狀態
+  if (!Update.begin(contentLength) || !Update.setMD5(md5)) {
+    Serial.printf("Update 初始化失敗，錯誤碼 %d\n", Update.getError());
+    Update.abort();
+    http.end();
+    publishOtaResult("update_failed");
+    return;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t buff[1024];
+  int written = 0;
+  const unsigned long start = millis();
+  bool ledOn = false;
+  unsigned long lastBlink = start;
+
+  while (http.connected() && written < contentLength && millis() - start < wake::kOtaTimeoutMs) {
+    const size_t avail = stream->available();
+    if (avail) {
+      const size_t n = stream->readBytes(buff, min(avail, sizeof(buff)));
+      written += Update.write(buff, n);
+    }
+    if (millis() - lastBlink >= 200) {  // 更新中 LED 快閃
+      ledOn = !ledOn;
+      digitalWrite(ledPin, ledOn ? LOW : HIGH);
+      lastBlink = millis();
+    }
+    delay(1);
+  }
+  http.end();
+  digitalWrite(ledPin, HIGH);
+
+  // 不可用 end(true)：那會跳過「寫滿了沒」的檢查，截斷的映像檔也會被接受（hoRelay2 的教訓）
+  if (written == contentLength && Update.end()) {
+    publishOtaResult("update_success");
+    mqttClient.disconnect();
+    delay(200);
+    ESP.restart();  // 重啟後 wake_reason = software，會立刻發一則新狀態
+  }
+
+  Serial.printf("OTA 失敗：寫入 %d/%d bytes，錯誤碼 %d%s\n", written, contentLength, Update.getError(),
+                Update.getError() == UPDATE_ERROR_MD5 ? "（MD5 不符）" : "");
+  Update.abort();  // otadata 不會切換，設備維持現有韌體
+  publishOtaResult("update_failed");
+}
+
+void handlePendingCommand() {
+  if (pendingCommand.length() == 0) return;
+
+  if (!pendingCommand.startsWith("update:")) {
+    // status 本來就不需要處理（醒來已經發過）；其他指令這個型號不支援
+    Serial.printf("忽略指令：%s\n", pendingCommand.c_str());
+    return;
+  }
+
+  // 先清掉 retained 指令，再做任何判斷。順序不能反：
+  // 若下載或檢查失敗後才清，或拒絕路徑忘了清，每次醒來都會重新執行，OTA 失敗時會耗盡電池。
+  mqttClient.publish(controlTopic().c_str(), (const uint8_t*)"", 0, true);
+  mqttClient.loop();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, pendingCommand.substring(7))) {
+    Serial.println("更新指令 JSON 解析失敗");
+    publishOtaResult("update_failed");
+    return;
+  }
+  const char* url = doc["url"];
+  const char* md5 = doc["md5"];
+  const char* version = doc["version"];
+  Serial.printf("更新指令：版本 %s，網址 %s\n", version ? version : "(無)", url ? url : "(無)");
+
+  if (url == nullptr) {
+    publishOtaResult("update_failed");
+    return;
+  }
+  if (!ota::isValidMd5(md5)) {
+    publishOtaResult("update_rejected_no_md5");
+    return;
+  }
+  if (!wake::otaBatteryOk(batteryValid, batteryMv)) {
+    publishOtaResult("update_rejected_low_battery");
+    return;
+  }
+  runOta(url, md5);
 }
 
 void setup() {
@@ -291,12 +436,8 @@ void setup() {
     digitalWrite(ledPin, HIGH);
   }
 
-  // 給 publish 的 TCP 封包時間送出，否則緊接著斷線可能把它丟掉（Task 5 會換成收指令的等待窗）
-  const unsigned long flushStart = millis();
-  while (millis() - flushStart < 300) {
-    mqttClient.loop();
-    delay(10);
-  }
+  receiveCommands();       // 1.5 秒等待窗同時讓 publish 的封包送出
+  handlePendingCommand();  // OTA 成功會直接重啟，不會回到這裡
   mqttClient.disconnect();
 
   goToSleep(wake::kNormalSleepS);
