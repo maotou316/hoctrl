@@ -19,6 +19,10 @@ constexpr uint32_t kCommandWindowMs = 1500;     // 等 broker 重播 retained �
 constexpr uint32_t kNtpTimeoutMs = 2000;        // NTP 對時上限
 constexpr uint32_t kOtaTimeoutMs = 120000;      // OTA 下載上限
 
+// 開始下一台 broker 連線前，剩餘預算至少要有這麼多：單台最壞情況約 8 秒
+// （TCP 連線逾時 3 秒＋CONNACK 逾時 5 秒），留一點餘裕避免試到一半被 20 秒硬上限腰斬
+constexpr uint32_t kMinBrokerAttemptMs = 9000;
+
 // 連續失敗 failures 次之後這次要睡多久：0、1 → 600；2 → 1200；3 → 2400；≥4 → 3600。
 // 第一次失敗不退避：偶發一次連不上（分享器重開、broker 抖動）很常見，不值得晚 10 分鐘回報。
 constexpr uint32_t backoffSleepSeconds(uint32_t failures) {

@@ -37,9 +37,10 @@
 | ADC 腳 | **GPIO 3**（ADC1_CH3） | C3 只有 GPIO 0～4 是 ADC1；ADC2 在 WiFi 開啟時讀不到；GPIO 2 是 strapping pin |
 | LED | GPIO 8（板載，低電位亮） | SuperMini 板載 |
 | 按鈕 | BOOT（GPIO 9）、RESET（EN） | 板載 |
+| 電源 LED | **必須拆掉**（或拆限流電阻） | SuperMini 板上另有一顆接 3V3 的常亮電源指示 LED，只要有電就亮，常時耗電約 1～3mA，遠超過睡眠電流目標（≤ 60µA），不拆掉這個目標必然達不到 |
 
 分壓電阻的 100nF 在高阻抗分壓下是**必要**的：ADC 取樣電容從 181kΩ 等效源阻抗充電不夠快，
-沒有電容時讀值會偏低且抖動。上電後量測前要等電容穩定（見 5.1 的 `delay`）。
+沒有電容時讀值會偏低且抖動。上電後量測前要等電容穩定（見 5.1，`analogSetPinAttenuation()` 之後 `delay(20)`）。
 
 電阻誤差造成的比例偏差以 `BATTERY_SCALE` 常數校正，首台實機用電表量一次後寫死。
 
@@ -106,6 +107,8 @@ ho_battery1/
 ### 5.1 量測
 - **在開 WiFi 之前量**：WiFi 發射時電流大，電池內阻造成的壓降會讓讀值偏低
 - `analogReadResolution(12)`、第一次讀之後 `analogSetPinAttenuation(pin, ADC_11db)`
+- `analogSetPinAttenuation()` 之後 `delay(20)`：讓 ADC 腳切換到新的衰減設定後、分壓中點的
+  100nF 電容重新穩定，不然讀值會偏低且抖動
 - 用 `analogReadMilliVolts()`（有 eFuse 出廠校準），不用 `analogRead()` 自己乘係數
 - 先丟棄 2 次、再取 16 次平均
 - 電池 mV = ADC mV × `BATTERY_SCALE`
@@ -150,6 +153,10 @@ ho_battery1/
 
 - 處理 `update:` **之前**先發一則空的 retained 訊息到 control 主題清除它，
   否則每次醒來都會重複執行（OTA 失敗時會無限重試下載，耗盡電池）
+- **操作規則：update 指令每次都要以 retained 同時發到全部 4 台 broker**——設備只從上次連上的
+  那台收指令，只發部分 broker 會有時收不到，日後換 broker 時還可能收到某台上殘留的舊指令而降版；
+  放棄某次更新時，一樣要在全部 4 台都發空的 retained 訊息清除，否則沒清到的那台會在設備連上它時
+  把舊指令重新交出來
 - 若清除 retained 指令失敗（例如發布當下連線剛好斷了），本次醒來放棄處理該指令，
   不嘗試刷機；retained 指令仍留在 broker 上，下次醒來會重新走一次清除
 - 若指令中的 `version` 與目前執行中的 `firmwareVersion` 相同，只清除 retained 指令、

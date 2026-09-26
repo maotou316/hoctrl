@@ -99,6 +99,7 @@ void measureBattery() {
   // （順序反了會印 "Pin is not configured as analog channel"，hoRelay2 踩過）
   analogReadMilliVolts(batterySensePin);
   analogSetPinAttenuation(batterySensePin, ADC_11db);  // 線性區約 0~2.5V，涵蓋 1.08~1.51V
+  delay(20);  // 讓 ADC 腳切換衰減設定後、分壓中點的 100nF 電容重新穩定，避免讀值偏低且抖動
 
   for (int i = 0; i < BATTERY_DISCARD; i++) {
     analogReadMilliVolts(batterySensePin);
@@ -176,9 +177,12 @@ bool connectMqtt() {
   // clientId 帶 bootCount：上一次醒來的連線若還沒被 broker 清掉，同一個 ID 會互踢
   const String clientId = String(getDeviceId()) + "-" + bootCount;
 
+  int attemptsMade = 0;  // 這次醒來實際試過幾台，全部失敗時用來推進 lastBrokerIndex
   for (int attempt = 0; attempt < DEFAULT_SERVER_COUNT; attempt++) {
-    if (budgetLeftMs() < 2000) break;  // 剩不到一次連線的時間，不如早點睡
+    // 單台最壞情況約 8 秒（TCP 3 秒＋CONNACK 逾時 5 秒），剩不到這個預算就不值得再試，早點睡
+    if (budgetLeftMs() < wake::kMinBrokerAttemptMs) break;
     const int idx = broker::attemptIndex(lastBrokerIndex, DEFAULT_SERVER_COUNT, attempt);
+    attemptsMade++;
     const MqttServerConfig& cfg = DEFAULT_SERVERS[idx];
     Serial.printf("MQTT 連線 [%d] %s ... ", idx, cfg.server);
     mqttClient.setServer(cfg.server, cfg.port);
@@ -191,11 +195,18 @@ bool connectMqtt() {
     }
     Serial.printf("失敗（state %d）\n", mqttClient.state());
   }
+  // 全部失敗：把 lastBrokerIndex 往後推「這次實際試過的台數」，讓下次醒來從沒試過的那台開始，
+  // 避免永遠卡在同兩台慢失敗的 broker 上（例如預算只夠試 2 台時，下次該從第 3 台試起）
+  lastBrokerIndex = broker::attemptIndex(lastBrokerIndex, DEFAULT_SERVER_COUNT, attemptsMade);
   return false;
 }
 
-// 深度睡眠期間 RTC 時鐘會繼續走，所以之前對過時的話，這次對時失敗仍有可用的時間。
-// 每次醒來都重對：RTC 慢速時鐘的誤差約 5%，10 分鐘就可能漂 30 秒。
+// 若 RTC 時鐘先前已經對時成功過，深度睡眠期間它會繼續走，time(nullptr) 在呼叫當下
+// 就已經有效，下面的等待迴圈幾乎立刻結束——本次 measured_at 用的其實是這個 RTC 時鐘推算出來的
+// 舊時間，不是這次剛拿到的 SNTP 結果。configTime() 觸發的 SNTP 對時是背景非同步進行，
+// 真正的新時間會在稍後（receiveCommands() 的收指令窗內）才寫回系統時鐘，校正的是「下一次」
+// 醒來讀到的時間。每次醒來都重新呼叫是因為 RTC 慢速時鐘的誤差約 5%，10 分鐘就可能漂 30 秒，
+// 需要持續追上。
 void syncTime() {
   configTime(0, 0, "pool.ntp.org", "time.google.com");  // UTC，measured_at 用 Unix 秒
   const unsigned long start = millis();
@@ -430,6 +441,25 @@ void setup() {
 
   bootCount++;
   wakeReason = detectWakeReason();
+
+  // 只在非定時喚醒時才檢查：深度睡眠的正常喚醒固定走 ESP_SLEEP_WAKEUP_TIMER，
+  // reset_reason 是 ESP_RST_DEEPSLEEP，不會誤觸下面的分支。
+  // brownout／panic／看門狗重置不是深度睡眠喚醒：RTC_DATA_ATTR 變數（consecutiveFailures 等）
+  // 會被重新初始化成 0，若照常往下跑到 connectWiFi() 拉大電流，電壓撐不住會再次 brownout，
+  // 形成「不退避、持續耗電、完全不回報任何狀態」的無限重開機迴圈。
+  if (strcmp(wakeReason, "timer") != 0) {
+    const esp_reset_reason_t resetReason = esp_reset_reason();
+    if (resetReason == ESP_RST_BROWNOUT) {
+      Serial.println("偵測到 brownout 重置，睡 1 小時避免無限重開機耗電");
+      goToSleep(wake::kLowBatterySleepS);
+    }
+    if (resetReason == ESP_RST_PANIC || resetReason == ESP_RST_INT_WDT ||
+        resetReason == ESP_RST_TASK_WDT || resetReason == ESP_RST_WDT) {
+      Serial.println("偵測到例外／看門狗重置，睡眠後重試");
+      goToSleep(wake::kNormalSleepS);
+    }
+  }
+
   // 手動上電／按 RESET 時多等一下讓電腦的 USB CDC 接上，才看得到 log；定時喚醒不等，省電
   if (strcmp(wakeReason, "timer") != 0) {
     delay(1500);
