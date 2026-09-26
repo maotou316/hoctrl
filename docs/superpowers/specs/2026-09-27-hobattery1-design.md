@@ -150,7 +150,13 @@ ho_battery1/
 
 - 處理 `update:` **之前**先發一則空的 retained 訊息到 control 主題清除它，
   否則每次醒來都會重複執行（OTA 失敗時會無限重試下載，耗盡電池）
-- OTA 下載期間不受 20 秒預算限制，但設 **120 秒**上限；
+- 若清除 retained 指令失敗（例如發布當下連線剛好斷了），本次醒來放棄處理該指令，
+  不嘗試刷機；retained 指令仍留在 broker 上，下次醒來會重新走一次清除
+- 若指令中的 `version` 與目前執行中的 `firmwareVersion` 相同，只清除 retained 指令、
+  不進行刷機（多半是同一個 retained 指令被重複送達，不需要也不應該重刷）
+- OTA 下載期間不受 20 秒預算限制，但設 **120 秒**上限；下載迴圈中每約 1 秒呼叫一次
+  `mqttClient.loop()` 讓 MQTT 連線保持存活（下載耗時遠超過 keepAlive 15 秒，
+  完全不呼叫會被 broker 判定斷線，導致下載完成後的結果訊息發不出去）；
   下載前要求電池 ≥ 7000mV（約 10%），不足則回報 `update_rejected_low_battery` 並跳過
 - OTA 結果字串（`updating`、`update_success`、`update_failed`、`update_rejected_*`）與 hoRelay2 相同，
   但**不 retained**：休眠設備的 retained 狀態是 App 平常唯一看得到的資料，被字串蓋掉就要等 10 分鐘才恢復成 JSON。
@@ -180,7 +186,7 @@ ho_battery1/
 |---|---|
 | `status` | `sleeping`（發完就睡）／`updating`（OTA 中） |
 | `timestamp` | 本次醒來經過的秒數（與 hoRelay2 同義：`millis()/1000`） |
-| `measured_at` | 量測時的 Unix 時間（秒）；NTP 失敗時為 0 |
+| `measured_at` | 量測時的 Unix 時間（秒）；深度睡眠期間 RTC 時鐘會繼續走，NTP 對時失敗時沿用「上次對時成功的時間＋經過的時間」推算，只有從未對時成功過才為 0 |
 | `sleep.next_wake_s` | 這次實際要睡多久（含退避），App 可據此推算「下次應該何時回報」 |
 | `sleep.wake_reason` | `timer`（定時喚醒）／`power_on`（上電或按 RESET；C3 的 RESET 是 EN 腳，晶片分不出兩者）／`software`（OTA 後重啟） |
 
@@ -201,7 +207,7 @@ ho_battery1/
 |---|---|
 | 讀值 `valid == false` | 照常回報（`percent: -1`），不套用電池保護 |
 | WiFi／MQTT 全失敗 | 退避睡眠，不重試 |
-| NTP 失敗 | `measured_at: 0`，照常發布 |
+| NTP 失敗 | `measured_at` 沿用 RTC 時鐘推算的時間（深度睡眠期間持續走），照常發布；只有從未對時成功過才是 0 |
 | 發布失敗 | 不重試，當作連線失敗計入退避 |
 | OTA 失敗 | 回報錯誤原因後睡 600 秒，retained 指令已先清除所以不會重試 |
 | 20 秒預算用完 | 直接睡眠 |
