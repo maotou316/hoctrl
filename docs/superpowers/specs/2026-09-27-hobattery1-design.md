@@ -152,7 +152,10 @@ ho_battery1/
   否則每次醒來都會重複執行（OTA 失敗時會無限重試下載，耗盡電池）
 - OTA 下載期間不受 20 秒預算限制，但設 **120 秒**上限；
   下載前要求電池 ≥ 7000mV（約 10%），不足則回報 `update_rejected_low_battery` 並跳過
-- OTA 進度／結果發到 `hoban/{device_id}/status`（`status: "updating"`），格式同 hoRelay2
+- OTA 結果字串（`updating`、`update_success`、`update_failed`、`update_rejected_*`）與 hoRelay2 相同，
+  但**不 retained**：休眠設備的 retained 狀態是 App 平常唯一看得到的資料，被字串蓋掉就要等 10 分鐘才恢復成 JSON。
+  OTA 成功重啟後會立刻發一則新的 retained 狀態（`wake_reason: software`）
+- **不設 LWT（遺囑訊息）**：休眠設備每次都會斷線，異常斷線時 LWT 會用 offline 蓋掉最新的 retained 狀態
 
 ## 6. 狀態 JSON
 
@@ -179,7 +182,7 @@ ho_battery1/
 | `timestamp` | 本次醒來經過的秒數（與 hoRelay2 同義：`millis()/1000`） |
 | `measured_at` | 量測時的 Unix 時間（秒）；NTP 失敗時為 0 |
 | `sleep.next_wake_s` | 這次實際要睡多久（含退避），App 可據此推算「下次應該何時回報」 |
-| `sleep.wake_reason` | `timer`／`reset`／`power_on` |
+| `sleep.wake_reason` | `timer`（定時喚醒）／`power_on`（上電或按 RESET；C3 的 RESET 是 EN 腳，晶片分不出兩者）／`software`（OTA 後重啟） |
 
 估計約 330 bytes，緩衝區 512 足夠；加欄位前要重算。
 
