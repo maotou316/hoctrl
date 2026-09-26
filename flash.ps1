@@ -10,7 +10,7 @@
 #     擴充自帶的 0.31.0。擴充的板子清單解析不了 esp32 core 3.3.7，所以改走指令。
 
 param(
-    [ValidateSet('1', '2', '3', 'master', 'master-c3', 'slave', 'test')]
+    [ValidateSet('1', '2', '3', 'master', 'master-c3', 'slave', 'test', 'battery')]
     [string]$Model = '2',
     [switch]$Upload,
     [switch]$KeepConfig,
@@ -64,6 +64,11 @@ $configs = @{
         Dir  = 'ho_espnow_test'
         Fqbn = 'esp32:esp32:esp32c3:CDCOnBoot=cdc,CPUFreq=160,DebugLevel=error,EraseFlash={0},FlashFreq=80,FlashMode=dio,FlashSize=4M,JTAGAdapter=default,PartitionScheme=default,UploadSpeed=921600,ZigbeeMode=default'
         Label = 'ESP-NOW 協定測試'
+    }
+    'battery' = @{
+        Dir  = 'ho_battery1'
+        Fqbn = 'esp32:esp32:esp32c3:CDCOnBoot=cdc,CPUFreq=160,DebugLevel=error,EraseFlash={0},FlashFreq=80,FlashMode=dio,FlashSize=4M,JTAGAdapter=default,PartitionScheme=custom,UploadSpeed=921600,ZigbeeMode=default'
+        Label = 'hoBattery1 (ESP32-C3 SuperMini，2S 電量偵測，深度睡眠)'
     }
 }
 
