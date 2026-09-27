@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 硬體型號
 
-專案包含兩個硬體版本：
+專案包含以下硬體型號：
 
 ### hoRelay1
 - **開發板**: uPesy ESP32 WROOM DevKit (Type-C)
@@ -37,6 +37,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - Partition Scheme: Custom (使用 partitions.csv)
   - Upload Speed: 921600
   - Flash Mode: DIO
+
+### hoBattery1
+- **開發板**: ESP32-C3 SuperMini
+- **用途**: 2S 鋰電電量偵測，深度睡眠每 10 分鐘回報一次（不是繼電器）
+- **GPIO 定義**:
+  - 電池 ADC: GPIO 3（與 hoRelay2 相同的 5 倍分壓模組 S 腳，S 對地 100nF；+ 腳不接）
+  - 板載 LED: GPIO 8（低電位亮）
+- **供電**: 電池經低 Iq 降壓到 3.3V 接 3V3 腳，**不可接 5V 腳**（板上 LDO 輸入上限約 6V）
+- **沒有 BLE、沒有 EEPROM**：WiFi 寫死在 `ho_battery1/config.h`
+- **指令必須 retained 發送**：設備大部分時間在睡，非 retained 指令收不到
+- 規格：`docs/superpowers/specs/2026-09-27-hobattery1-design.md`
 
 ## 核心功能架構
 
@@ -289,7 +300,7 @@ hoRelay2 另有**開機按鈕自檢**（`checkStuckButtons()`）：開機取樣 
 **任何 `.ino` 韌體檔有修改，同一次修改就必須提升該檔的 `firmwareVersion`**，不可沿用舊版本號。
 
 - `ho_relay2/ho_relay2.ino` → `const char* firmwareVersion`（檔案開頭附近）
-- `ho_relay1/ho_relay1.ino`、`ho_relay3/ho_relay3.ino`、`ho_master1/ho_master1.ino` → 同名常數
+- `ho_relay1/ho_relay1.ino`、`ho_relay3/ho_relay3.ino`、`ho_master1/ho_master1.ino`、`ho_battery1/ho_battery1.ino` → 同名常數
 - `ho_slave1/ho_slave1.ino` → 改 `HO_SLAVE_FW_MAJOR/MINOR/PATCH` 巨集
 
 遞增原則（語意化版本）：
