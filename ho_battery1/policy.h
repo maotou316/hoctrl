@@ -12,8 +12,9 @@ constexpr uint32_t kLowBatterySleepS = 3600;  // 電池過低時的睡眠時間
 constexpr int kLowBatteryMv = 6200;     // 每顆 3.1V：低於此值不開 WiFi，避免鋰電過放
 constexpr int kOtaMinBatteryMv = 7000;  // 約 10%：OTA 下載要醒著一兩分鐘，電量不夠會刷到一半斷電
 
-constexpr uint32_t kWakeBudgetMs = 20000;       // 單次醒來的硬上限（OTA 除外）
-constexpr uint32_t kWifiTimeoutMs = 10000;      // WiFi 連線總上限
+constexpr uint32_t kWakeBudgetMs = 20000;       // WiFi 連上之後的預算（MQTT、NTP、收指令），OTA 除外
+constexpr uint32_t kWifiTimeoutMs = 60000;      // WiFi 連線總上限（2026-09-27 使用者要求：盡量連上再睡）
+constexpr uint32_t kWifiRetrySleepS = 60;       // WiFi 連不上時只睡 1 分鐘就重試，不走退避
 constexpr uint32_t kWifiCacheTimeoutMs = 4000;  // 用快取的 channel/BSSID 快速連線的上限
 constexpr uint32_t kCommandWindowMs = 1500;     // 等 broker 重播 retained 指令的時間
 constexpr uint32_t kNtpTimeoutMs = 2000;        // NTP 對時上限

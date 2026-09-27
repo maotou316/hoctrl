@@ -26,6 +26,8 @@ static_assert(battery::percentFromMv(6000) == 0, "空電 0");
 static_assert(battery::percentFromMv(5000) == 0, "低於空電夾到 0");
 
 // ── broker 連線的最小預算門檻：pin 死數值，改動要同步檢查 connectMqtt() 的註解與 readme ──
+static_assert(wake::kWifiTimeoutMs == 60000, "WiFi 最多等 60 秒");
+static_assert(wake::kWifiRetrySleepS == 60, "WiFi 連不上只睡 1 分鐘");
 static_assert(wake::kMinBrokerAttemptMs == 9000, "單台最壞約 8 秒，9000 是設計值，改動需同步文件");
 
 // ── 退避：連續失敗第 n 次後睡多久。第一次失敗仍睡 600，之後倍增，上限 3600 ──

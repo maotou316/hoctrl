@@ -44,6 +44,7 @@ bool batteryValid = false;
 unsigned long measuredAtMs = 0;
 
 unsigned long wakeStartMs = 0;
+unsigned long budgetStartMs = 0;  // 預算從 WiFi 連上才開始算（WiFi 本身另有 kWifiTimeoutMs 上限）
 const char* wakeReason = "power_on";
 String deviceIdString;
 
@@ -79,9 +80,9 @@ const char* getDeviceId() {
   return deviceIdString.c_str();
 }
 
-// 本次醒來還剩多少預算（ms），用完回傳 0
+// WiFi 連上之後還剩多少預算（ms），用完回傳 0
 uint32_t budgetLeftMs() {
-  const unsigned long used = millis() - wakeStartMs;
+  const unsigned long used = millis() - budgetStartMs;
   return used >= wake::kWakeBudgetMs ? 0 : wake::kWakeBudgetMs - used;
 }
 
@@ -133,7 +134,7 @@ String statusTopic() { return String("hoban/") + getDeviceId() + "/status"; }
 String controlTopic() { return String("hoban/") + getDeviceId() + "/control"; }
 
 bool waitWiFi(unsigned long deadlineMs) {
-  while (WiFi.status() != WL_CONNECTED && (long)(deadlineMs - millis()) > 0 && budgetLeftMs() > 0) {
+  while (WiFi.status() != WL_CONNECTED && (long)(deadlineMs - millis()) > 0) {
     delay(50);
   }
   return WiFi.status() == WL_CONNECTED;
@@ -480,7 +481,14 @@ void setup() {
     goToSleep(wake::kLowBatterySleepS);
   }
 
-  if (!connectWiFi()) failAndSleep("WiFi 連不上");
+  // WiFi 連不上不走退避：只睡 1 分鐘就重試，讓設備盡快回到線上（使用者要求）。
+  // 代價：分享器長時間故障時，每分鐘醒來等 60 秒，耗電約為一直醒著的一半。
+  if (!connectWiFi()) {
+    Serial.printf("WiFi %lu 秒內連不上，%lu 秒後重試\n",
+                  (unsigned long)(wake::kWifiTimeoutMs / 1000), (unsigned long)wake::kWifiRetrySleepS);
+    goToSleep(wake::kWifiRetrySleepS);
+  }
+  budgetStartMs = millis();
   if (!connectMqtt()) failAndSleep("MQTT 全部 broker 都連不上");
 
   syncTime();
