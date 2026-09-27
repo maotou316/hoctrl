@@ -133,15 +133,47 @@ void goToSleep(uint32_t seconds) {
 String statusTopic() { return String("hoban/") + getDeviceId() + "/status"; }
 String controlTopic() { return String("hoban/") + getDeviceId() + "/control"; }
 
+// 診斷用：記下最後一次斷線原因碼（201 找不到基地台、15 四向交握逾時多半是密碼錯、2/4 認證或關聯被拒）
+volatile int lastWifiDisconnectReason = 0;
+
+// 等待期間每 5 秒印一次進度，接著 USB 看的人才知道韌體還活著、卡在哪一步
 bool waitWiFi(unsigned long deadlineMs) {
+  const unsigned long start = millis();
+  unsigned long lastReport = start;
   while (WiFi.status() != WL_CONNECTED && (long)(deadlineMs - millis()) > 0) {
+    if (millis() - lastReport >= 5000) {
+      lastReport = millis();
+      Serial.printf("  WiFi 連線中… %lu 秒（status %d，最後斷線原因 %d）\n",
+                    (millis() - start) / 1000, (int)WiFi.status(), lastWifiDisconnectReason);
+    }
     delay(50);
   }
   return WiFi.status() == WL_CONNECTED;
 }
 
-// 診斷用：記下最後一次斷線原因碼（201 找不到基地台、15 四向交握逾時多半是密碼錯、2/4 認證或關聯被拒）
-volatile int lastWifiDisconnectReason = 0;
+// 連不上時掃一次附近的 WiFi：看不看得到目標 SSID、訊號多強，用來分辨天線／距離問題與分享器問題
+void printWiFiScan() {
+  Serial.println("掃描附近的 WiFi…");
+  WiFi.disconnect();
+  // 還在嘗試連線時掃描會直接回 -2（WIFI_SCAN_FAILED），先等斷線完成、失敗再重試
+  delay(300);
+  int n = WiFi.scanNetworks();
+  for (int retry = 0; n < 0 && retry < 3; retry++) {
+    delay(500);
+    n = WiFi.scanNetworks();
+  }
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    const bool isTarget = WiFi.SSID(i) == WIFI_SSID;
+    found = found || isTarget;
+    if (isTarget || i < 8) {
+      Serial.printf("  %s %-24s RSSI %4d  channel %2d\n", isTarget ? "→" : " ",
+                    WiFi.SSID(i).c_str(), (int)WiFi.RSSI(i), (int)WiFi.channel(i));
+    }
+  }
+  Serial.printf("共 %d 個基地台，%s\n", n, found ? "看得到 " WIFI_SSID : "看不到 " WIFI_SSID "（天線、距離或分享器沒開 2.4GHz）");
+  WiFi.scanDelete();
+}
 
 bool connectWiFi() {
   WiFi.persistent(false);  // 帳密寫死在韌體，不需要每次寫 NVS
@@ -149,6 +181,9 @@ bool connectWiFi() {
     lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.mode(WIFI_STA);
+  // SuperMini 天線匹配差：預設 19.5dBm 發射時訊號失真，實測一直停在斷線原因 2（AUTH_EXPIRE）連不上。
+  // 降到 8.5dBm 是社群對這款板子的常見解法（2026-09-27 實機排查）。必須在 mode() 之後、begin() 之前設定。
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
   const unsigned long deadline = millis() + wake::kWifiTimeoutMs;
 
   if (wifiCacheValid) {
@@ -164,9 +199,11 @@ bool connectWiFi() {
     WiFi.disconnect();
   }
 
+  Serial.printf("WiFi 連線中：%s（最多 %lu 秒）\n", WIFI_SSID, (unsigned long)(wake::kWifiTimeoutMs / 1000));
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   if (!waitWiFi(deadline)) {
     Serial.printf("WiFi 連線逾時（status %d，最後斷線原因 %d）\n", (int)WiFi.status(), lastWifiDisconnectReason);
+    printWiFiScan();
     return false;
   }
   wifiChannel = WiFi.channel();
