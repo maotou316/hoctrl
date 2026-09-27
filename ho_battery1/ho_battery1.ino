@@ -139,8 +139,14 @@ bool waitWiFi(unsigned long deadlineMs) {
   return WiFi.status() == WL_CONNECTED;
 }
 
+// 診斷用：記下最後一次斷線原因碼（201 找不到基地台、15 四向交握逾時多半是密碼錯、2/4 認證或關聯被拒）
+volatile int lastWifiDisconnectReason = 0;
+
 bool connectWiFi() {
   WiFi.persistent(false);  // 帳密寫死在韌體，不需要每次寫 NVS
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+    lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.mode(WIFI_STA);
   const unsigned long deadline = millis() + wake::kWifiTimeoutMs;
 
@@ -152,14 +158,14 @@ bool connectWiFi() {
       return true;
     }
     // 分享器換了頻道或換了一台 AP，快取過期
-    Serial.println("WiFi 快取連線失敗，改一般連線");
+    Serial.printf("WiFi 快取連線失敗（最後斷線原因 %d），改一般連線\n", lastWifiDisconnectReason);
     wifiCacheValid = false;
     WiFi.disconnect();
   }
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   if (!waitWiFi(deadline)) {
-    Serial.println("WiFi 連線逾時");
+    Serial.printf("WiFi 連線逾時（status %d，最後斷線原因 %d）\n", (int)WiFi.status(), lastWifiDisconnectReason);
     return false;
   }
   wifiChannel = WiFi.channel();
