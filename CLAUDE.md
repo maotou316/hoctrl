@@ -146,7 +146,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `mifi_id`: 透過哪台隨身 WiFi 上網（如 `mifi-f8160cb4bc5f`），hoRelay2 讀得到分享器電量才有，
     **App 端必須容忍缺席**。分享器資料不在這裡，見下方「隨身 WiFi（分享器）」
 
-#### 隨身 WiFi（分享器）是獨立設備（hoRelay2 1.11.0 起）
+#### 隨身 WiFi（分享器）是獨立設備（hoRelay2 1.11.1 起）
 
 控制器連著 ASR 方案 MiFi（對 WiFi 閘道讀管理頁，帳密 admin/admin）時，代分享器發布狀態：
 
@@ -160,7 +160,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `power_in`: 0 沒插電；`charge`: 0 未充電／1 充電中／2 已充滿
   - `valid`: 連續讀取失敗 3 次轉 false；`age`: 距上次讀到的秒數
 - 同一台分享器下有多台控制器時，每台都會發到同一個 topic
-- 流程、陷阱與限制見 `ho_relay2/readme.md` 1.10.x～1.11.0 與 `.claude/rules/mifi-asr-login-quirks.md`
+- 流程、陷阱與限制見 `ho_relay2/readme.md` 1.10.x～1.11.1 與 `.claude/rules/mifi-asr-login-quirks.md`
 
 ### 4. OTA 韌體更新
 
