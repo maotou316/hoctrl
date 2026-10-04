@@ -13,7 +13,7 @@
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 #include <MD5Builder.h>         // 隨身 WiFi 管理頁的 HTTP Digest 認證
 
-const char* firmwareVersion = "1.10.1"; // 當前韌體版本
+const char* firmwareVersion = "1.10.2"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -626,6 +626,9 @@ const unsigned long MIFI_POLL_INTERVAL_MS = 60000;      // 讀到過資料：每
 const unsigned long MIFI_PROBE_INTERVAL_MS = 600000;    // 從沒讀到過：10 分鐘再試（多半不是這種機種）
 const uint16_t MIFI_HTTP_TIMEOUT_MS = 2000;
 const int MIFI_STALE_FAILS = 3;                         // 連續失敗幾次就把 valid 標成 false
+// 回應大小上限。status1 XML 實際只有幾 KB；不支援的設備（例如攔截網頁的公共 WiFi）
+// 可能對任何網址都回一大頁 HTML，不設上限會把整頁讀進記憶體
+const size_t MIFI_MAX_BODY = 16384;
 
 String mifiHost;                      // "http://{閘道 IP}"，換網路時更新
 String mifiNetKey;                    // 目前這台 AP 的識別（BSSID + 閘道），變了就重來
@@ -701,6 +704,32 @@ static bool xmlTagValue(const String& body, const char* tag, String& out) {
   return true;
 }
 
+// 只收前 cap bytes 的 Stream，滿了就讓 write() 回 0，
+// HTTPClient::writeToStream() 會因此中止並回 HTTPC_ERROR_STREAM_WRITE。
+// 用 writeToStream() 而不是自己讀 getStreamPtr()，是因為前者會處理 chunked 編碼
+class CappedStringStream : public Stream {
+ public:
+  CappedStringStream(String& out, size_t cap) : out_(out), cap_(cap) {}
+  size_t write(uint8_t c) override {
+    if (out_.length() >= cap_) return 0;
+    out_ += (char)c;
+    return 1;
+  }
+  size_t write(const uint8_t* buf, size_t n) override {
+    if (out_.length() + n > cap_) return 0;
+    out_.concat((const char*)buf, n);
+    return n;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+
+ private:
+  String& out_;
+  size_t cap_;
+};
+
 static bool mifiLogin() {
   mifiLoggedIn = false;
   WiFiClient client;
@@ -769,7 +798,19 @@ static bool mifiFetchStatus() {
   }
   http.addHeader("Authorization", authHeader);
   int code = http.GET();
-  String body = (code == 200) ? http.getString() : String();
+  String body;
+  if (code == 200) {
+    int size = http.getSize();  // -1 = 沒有 Content-Length（chunked 等），交給 CappedStringStream 擋
+    if (size > (int)MIFI_MAX_BODY) {
+      Serial.printf("MiFi：回應 %d bytes 超過上限，不讀\n", size);
+    } else {
+      CappedStringStream sink(body, MIFI_MAX_BODY);
+      if (http.writeToStream(&sink) < 0) {
+        Serial.println("MiFi：回應讀取中止（超過上限或連線中斷）");
+        body = "";
+      }
+    }
+  }
   http.end();
 
   String connect, level, charging, charge;
