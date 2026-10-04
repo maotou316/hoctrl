@@ -224,6 +224,22 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ## 版本記錄
 
+### 1.10.0
+
+**連上 LTE 隨身 WiFi 時，讀取隨身 WiFi 自己的電量，放進 status 的 `mifi` 物件。**
+
+- 只在 WiFi 閘道是 `192.168.100.1` 時才動作（Marvell/ASR 方案 MiFi，管理頁帳密 admin/admin），
+  其他網路完全不發 HTTP
+- 流程：`/login.cgi` 取 Digest challenge → 登入 → `xml_action.cgi?...file=status1` 讀 XML；
+  session 約 10 分鐘逾時會回空 body，找不到 `Battery_connect` 就重新登入再讀一次
+- 讀到過資料：每 60 秒輪詢；從沒讀到過（多半不是這種機種）：10 分鐘才再試
+- HTTP 逾時 2 秒、最壞阻塞約 12 秒，仍在 MQTT keepAlive 之內；OTA 中與按住重置鍵時不輪詢
+- `mifi` 欄位：`bat`（0 無電池／1 有）、`level`（分段字串如 `">20"`，機器不給精確數字）、
+  `power_in`（0 沒插電）、`charge`（0 未充電／1 充電中／2 已充滿）、
+  `valid`（連續失敗 3 次轉 false）、`age`（距上次讀到幾秒）。讀不到時整個物件不帶
+
+**實測狀態**：僅編譯通過（2026-10-04），尚未接實機隨身 WiFi 驗證。
+
 ### 1.9.0
 
 **WiFi 改用 Modem-sleep（`WIFI_PS_MIN_MODEM`），延長電池待機時間。**
