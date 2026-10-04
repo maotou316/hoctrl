@@ -13,7 +13,7 @@
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 #include <MD5Builder.h>         // 隨身 WiFi 管理頁的 HTTP Digest 認證
 
-const char* firmwareVersion = "1.10.0"; // 當前韌體版本
+const char* firmwareVersion = "1.10.1"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -601,12 +601,15 @@ void addBatteryToStatus(JsonDocument& doc) {
 
 // ── 隨身 WiFi（MiFi）電量讀取 ──
 //
-// 野外時設備連的是 LTE 隨身 WiFi。Marvell/ASR 方案的機種（管理頁 192.168.100.1，
-// 預設帳密 admin/admin）可以從管理頁的 status1 XML 讀到它自己的電池狀態，
-// 讀得到就放進 status JSON 的 "mifi" 物件；讀不到（不是這種機種、帳密被改）就不帶，
-// App 端必須容忍這個物件缺席。
+// 野外時設備連的是 LTE 隨身 WiFi。Marvell/ASR 方案的機種（預設帳密 admin/admin）
+// 可以從管理頁的 status1 XML 讀到它自己的電池狀態，讀得到就放進 status JSON 的
+// "mifi" 物件；讀不到（不是這種機種、帳密被改）就不帶，App 端必須容忍這個物件缺席。
 //
-// 只有 WiFi 閘道剛好是 192.168.100.1 才會發 HTTP，家用路由器下完全不碰。
+// 管理頁位址一律用「目前 WiFi 的閘道」，不寫死 IP：同方案的機器預設多半是
+// 192.168.100.1，但使用者可以改，不同品牌也不一定一樣。
+// 任何網路都會試，不是這種機種（家用路由器等）會在第一個請求就失敗
+// （沒有 WWW-Authenticate 或 404），之後 10 分鐘才再試一次，成本很低。
+// 換了 AP（BSSID 或閘道變了）就清掉舊資料與 session 重新來過。
 // HTTP 是阻塞的，連線／讀取逾時各 2 秒，最壞一輪（登入 2 次請求 + 讀取，失敗再重登重讀）
 // 約 12 秒，仍在 MQTT keepAlive 30 秒（broker 45 秒才踢）之內。
 //
@@ -617,8 +620,6 @@ void addBatteryToStatus(JsonDocument& doc) {
 //      nonce 沿用登入那個，nc 每個請求加 1
 // session 約 10 分鐘逾時，逾時後讀取回 200 但 body 是空的（不回 401），
 // 所以「找不到 Battery_connect」就重新登入再試一次。有人用瀏覽器登入管理頁會互踢，同一套機制涵蓋。
-const IPAddress MIFI_IP(192, 168, 100, 1);
-const char* MIFI_HOST = "http://192.168.100.1";
 const char* MIFI_USER = "admin";
 const char* MIFI_PASS = "admin";
 const unsigned long MIFI_POLL_INTERVAL_MS = 60000;      // 讀到過資料：每分鐘一次（電量只有分段變化）
@@ -626,6 +627,8 @@ const unsigned long MIFI_PROBE_INTERVAL_MS = 600000;    // 從沒讀到過：10 
 const uint16_t MIFI_HTTP_TIMEOUT_MS = 2000;
 const int MIFI_STALE_FAILS = 3;                         // 連續失敗幾次就把 valid 標成 false
 
+String mifiHost;                      // "http://{閘道 IP}"，換網路時更新
+String mifiNetKey;                    // 目前這台 AP 的識別（BSSID + 閘道），變了就重來
 String mifiRealm, mifiNonce, mifiQop, mifiHa1;
 uint32_t mifiNc = 0;
 bool mifiLoggedIn = false;
@@ -706,7 +709,7 @@ static bool mifiLogin() {
   http.setTimeout(MIFI_HTTP_TIMEOUT_MS);
 
   // 1. 取 challenge。HTTPClient 不先 collectHeaders() 就拿不到 WWW-Authenticate
-  if (!http.begin(client, String(MIFI_HOST) + "/login.cgi")) return false;
+  if (!http.begin(client, mifiHost + "/login.cgi")) return false;
   const char* wanted[] = {"WWW-Authenticate"};
   http.collectHeaders(wanted, 1);
   int code = http.GET();
@@ -730,7 +733,7 @@ static bool mifiLogin() {
   String ha2 = md5Hex("GET:/cgi/protected.cgi");
   String cnonce = mifiCnonce();
   String res = md5Hex(mifiHa1 + ":" + mifiNonce + ":00000001:" + cnonce + ":" + mifiQop + ":" + ha2);
-  String url = String(MIFI_HOST) + "/login.cgi?Action=Digest&username=" + MIFI_USER +
+  String url = mifiHost + "/login.cgi?Action=Digest&username=" + MIFI_USER +
                "&realm=" + urlEncode(mifiRealm) + "&nonce=" + urlEncode(mifiNonce) +
                "&response=" + res + "&qop=" + mifiQop + "&cnonce=" + cnonce + "&temp=asr";
   if (!http.begin(client, url)) return false;
@@ -761,7 +764,7 @@ static bool mifiFetchStatus() {
   HTTPClient http;
   http.setConnectTimeout(MIFI_HTTP_TIMEOUT_MS);
   http.setTimeout(MIFI_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, String(MIFI_HOST) + "/xml_action.cgi?method=get&module=duster&file=status1")) {
+  if (!http.begin(client, mifiHost + "/xml_action.cgi?method=get&module=duster&file=status1")) {
     return false;
   }
   http.addHeader("Authorization", authHeader);
@@ -791,15 +794,18 @@ void pollMifi() {
   // 韌體更新中、或使用者正按著重置鍵時不阻塞 loop
   if (isUpdating || buttonPressTime != 0) return;
 
-  if (WiFi.gatewayIP() != MIFI_IP) {
-    // 換到別的網路：清掉舊資料，免得把上一台隨身 WiFi 的電量當成現在的
-    if (mifiHasData || mifiLoggedIn || mifiNextPollAt != 0) {
-      mifiHasData = false;
-      mifiLoggedIn = false;
-      mifiFailCount = 0;
-      mifiNextPollAt = 0;
-    }
-    return;
+  IPAddress gw = WiFi.gatewayIP();
+  if (gw == IPAddress(0, 0, 0, 0)) return;  // DHCP 還沒拿到閘道
+
+  String netKey = WiFi.BSSIDstr() + "/" + gw.toString();
+  if (netKey != mifiNetKey) {
+    // 換到別台 AP：清掉舊資料，免得把上一台隨身 WiFi 的電量當成現在的
+    mifiNetKey = netKey;
+    mifiHost = String("http://") + gw.toString();
+    mifiHasData = false;
+    mifiLoggedIn = false;
+    mifiFailCount = 0;
+    mifiNextPollAt = 0;
   }
 
   if (mifiNextPollAt != 0 && (long)(millis() - mifiNextPollAt) < 0) return;
@@ -1776,7 +1782,7 @@ void loop()
     } else {
       mqttClient.loop();
 
-      // 隨身 WiFi 電量（只在閘道是 192.168.100.1 時才會真的發 HTTP，內部自帶 60 秒限頻）
+      // 隨身 WiFi 電量（對 WiFi 閘道發 HTTP，內部自帶限頻：讀到過 60 秒、沒讀到過 10 分鐘）
       pollMifi();
 
       // 每 3 秒發送一次保持連線的狀態更新（帶伺服器資訊）
