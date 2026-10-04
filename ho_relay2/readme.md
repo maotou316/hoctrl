@@ -224,10 +224,10 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ## 版本記錄
 
-### 1.11.2
+### 1.11.3
 
 - 分享器 ID 改成全部大寫的 `HOBAN-MIFI-{BSSID 去冒號}`，例如 `HOBAN-MIFI-F8160CB4BC5F`，
-  topic 隨之變成 `hoban/HOBAN-MIFI-F8160CB4BC5F/status`（**與 1.11.1 的 `mifi-f8160cb4bc5f` 不相容**）。
+  topic 隨之變成 `hoban/HOBAN-MIFI-F8160CB4BC5F/status`（**與 1.11.1 的 `mifi-f8160cb4bc5f` 不相容；1.11.2 未發佈，直接以 1.11.3 發出**）。
   控制器 status 的 `mifi_id` 同步改格式
 - 分享器訊息加上 `version`（分享器自己的韌體，取自管理頁 XML 的 `version_num`，實測
   `JZ10_ZHONGXING_20260123_V1.0.1`；讀不到為空字串）與 `via_version`（代為回報的控制器韌體版本）

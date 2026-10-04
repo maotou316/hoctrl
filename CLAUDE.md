@@ -146,7 +146,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `mifi_id`: 透過哪台隨身 WiFi 上網（如 `HOBAN-MIFI-F8160CB4BC5F`），hoRelay2 讀得到分享器電量才有，
     **App 端必須容忍缺席**。分享器資料不在這裡，見下方「隨身 WiFi（分享器）」
 
-#### 隨身 WiFi（分享器）是獨立設備（hoRelay2 1.11.1 起，ID 格式與版本欄位 1.11.2 起）
+#### 隨身 WiFi（分享器）是獨立設備（hoRelay2 1.11.1 起，ID 格式與版本欄位 1.11.3 起）
 
 控制器連著 ASR 方案 MiFi（對 WiFi 閘道讀管理頁，帳密 admin/admin）時，代分享器發布狀態：
 
