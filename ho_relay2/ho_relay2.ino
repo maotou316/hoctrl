@@ -13,7 +13,7 @@
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 #include <MD5Builder.h>         // 隨身 WiFi 管理頁的 HTTP Digest 認證
 
-const char* firmwareVersion = "1.10.6"; // 當前韌體版本
+const char* firmwareVersion = "1.11.0"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -257,6 +257,8 @@ void updateBatteryReading();
 void addBatteryToStatus(JsonDocument& doc);
 void pollMifi();
 void addMifiToStatus(JsonDocument& doc);
+void publishMifiStatus();
+String mifiDeviceId();
 void applyWiFiPowerSettings();
 
 // ── EEPROM 佈局 ──
@@ -867,6 +869,16 @@ void pollMifi() {
   if (mifiNextPollAt != 0 && (long)(millis() - mifiNextPollAt) < 0) return;
 
   bool ok = mifiReadOnce();
+
+  // 讀取最長阻塞約 24 秒，期間可能斷線或漫遊到別台 AP。身分變了就整筆作廢，
+  // 不然會把這台的電量掛到另一台分享器的 ID 下（或斷線時 BSSID 全 0 的 mifi-000000000000）。
+  // 不設 mifiNextPollAt：下一輪 loop 會因 netKey 不同而重置狀態並馬上重讀。
+  if (WiFi.status() != WL_CONNECTED ||
+      WiFi.BSSIDstr() + "/" + WiFi.gatewayIP().toString() != mifiNetKey) {
+    Serial.println("MiFi：讀取期間網路已變動，捨棄這筆");
+    return;
+  }
+
   if (ok) {
     mifiHasData = true;
     mifiLastOkAt = millis();
@@ -877,28 +889,64 @@ void pollMifi() {
     mifiFailCount++;
     Serial.printf("MiFi：讀取失敗（連續 %d 次）\n", mifiFailCount);
   }
+  // 讀到過資料才以分享器身分發布（讀失敗也發，讓訂閱端從 valid/age 看出資料變舊）
+  if (mifiHasData) publishMifiStatus();
+
   // 時間戳在阻塞呼叫之後才取
   mifiNextPollAt = millis() + ((ok || mifiHasData) ? MIFI_POLL_INTERVAL_MS : MIFI_PROBE_INTERVAL_MS);
   if (mifiNextPollAt == 0) mifiNextPollAt = 1;  // 0 是哨兵值，避開它
 }
 
-// 隨身 WiFi 的資訊與電量掛進 status JSON。只有讀到過電量（確定是支援的分享器）才帶，
-// 這樣 App 看到 mifi 物件就代表「設備連的是隨身 WiFi」。
-// ssid/rssi 與 wifi 物件重複，是刻意的：App 只看 mifi 就拿得到全部分享器資料。
-// 最壞（SSID 32 bytes）約 170 bytes，整包約 510 bytes，所以 setBufferSize() 由 512 放大到 768。
+// 分享器的設備 ID：mifi-{BSSID 小寫去冒號}，例如 mifi-f8160cb4bc5f。
+// 用分享器自己的 MAC 而不是控制器的 ID，換哪台控制器回報都是同一個 ID。
+String mifiDeviceId() {
+  String mac = WiFi.BSSIDstr();
+  mac.replace(":", "");
+  mac.toLowerCase();
+  return "mifi-" + mac;
+}
+
+// 以分享器自己的身分發布到 hoban/mifi-{MAC}/status，和控制器平行、不掛在控制器底下。
+// 每次輪詢（約 60 秒）發一則，不跟控制器每 3 秒的狀態走。
+// 同一台分享器下有多台控制器時，每台都會發到同一個 topic，via 標示是誰發的。
+//
+// 刻意「不用 retained」：這個 topic 沒有 LWT，控制器全部離開後沒人能把它改成 offline，
+// age 又是發布當下寫死的值 → 保留訊息會永遠停在 online／valid=true／age=0，
+// 新訂閱端會把幾天前的電量當成即時資料。代價是新訂閱端最多要等 60 秒才收到第一則；
+// 收到就代表「剛剛還有控制器讀到這台分享器」，超過幾分鐘沒收到就視為離線。
+void publishMifiStatus() {
+  if (!mqttClient.connected()) return;
+  String id = mifiDeviceId();
+  String topic = "hoban/" + id + "/status";
+
+  StaticJsonDocument<512> doc;
+  doc["device_id"] = id;
+  doc["model"] = "MiFi";
+  doc["status"] = "online";
+  doc["ssid"] = WiFi.SSID();
+  doc["ip"] = WiFi.gatewayIP().toString();  // 分享器本身的 IP（管理頁位址）
+  doc["mac"] = WiFi.BSSIDstr();
+  JsonObject battery = doc.createNestedObject("battery");
+  battery["bat"] = mifiBatConnect;      // 0 無電池，1 有
+  battery["level"] = mifiBatLevel;      // 分段字串，例如 ">20"
+  battery["power_in"] = mifiPowerIn;    // 0 沒插電
+  battery["charge"] = mifiChargeState;  // 0 未充電，1 充電中，2 已充滿
+  doc["valid"] = (mifiFailCount < MIFI_STALE_FAILS);
+  doc["age"] = (millis() - mifiLastOkAt) / 1000;
+  doc["via"] = getDeviceId();           // 代為回報的控制器
+  doc["rssi"] = WiFi.RSSI();            // 該控制器收到的分享器訊號
+
+  char buffer[512];
+  size_t len = serializeJson(doc, buffer, sizeof(buffer));
+  bool okPub = mqttClient.publish(topic.c_str(), (const uint8_t*)buffer, len, false);
+  Serial.printf("發布分享器狀態 %s - %s\n", topic.c_str(), okPub ? "成功" : "失敗");
+}
+
+// 控制器自己的 status 只帶「透過哪台分享器上網」的 ID，分享器資料在它自己的 topic
+// （見 publishMifiStatus()）。只有讀到過電量（確定是支援的分享器）才帶。
 void addMifiToStatus(JsonDocument& doc) {
   if (!mifiHasData) return;
-  JsonObject mifi = doc.createNestedObject("mifi");
-  mifi["ssid"] = WiFi.SSID();
-  mifi["rssi"] = WiFi.RSSI();
-  mifi["ip"] = WiFi.gatewayIP().toString();  // 分享器本身的 IP（管理頁位址）
-  mifi["mac"] = WiFi.BSSIDstr();             // 分享器的 MAC（BSSID）
-  mifi["bat"] = mifiBatConnect;
-  mifi["level"] = mifiBatLevel;
-  mifi["power_in"] = mifiPowerIn;
-  mifi["charge"] = mifiChargeState;
-  mifi["valid"] = (mifiFailCount < MIFI_STALE_FAILS);
-  mifi["age"] = (millis() - mifiLastOkAt) / 1000;
+  doc["mifi_id"] = mifiDeviceId();
 }
 
 // 開機按鈕自檢：短暫取樣兩支按鈕腳，整段都是 LOW 即判定卡住並停用其重置功能

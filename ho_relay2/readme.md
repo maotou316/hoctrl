@@ -224,6 +224,23 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ## 版本記錄
 
+### 1.11.0
+
+**隨身 WiFi（分享器）改成獨立設備，不再掛在控制器的 status 底下。**
+
+- 新 topic `hoban/mifi-{BSSID 小寫去冒號}/status`（例如 `hoban/mifi-f8160cb4bc5f/status`），
+  ID 用分享器自己的 MAC，換哪台控制器回報都一樣。欄位：`device_id`、`model:"MiFi"`、`status`、
+  `ssid`、`ip`、`mac`、`battery{bat, level, power_in, charge}`、`valid`、`age`、`via`（代為回報的控制器）、`rssi`
+- **不是 retained**：這個 topic 沒有 LWT，retained 會讓控制器全部離開後的舊電量永遠停在
+  online／valid=true，看起來像即時資料。新訂閱端最多等 60 秒收到第一則
+- 控制器 status 的 `mifi` 物件拿掉，改成只帶 `mifi_id`（**與 1.10.x 不相容**：照 1.10.x 讀
+  `status.mifi` 的訂閱端會讀不到，要改訂閱分享器 topic）
+- 讀取期間（最長約 24 秒）若斷線或換 AP，整筆作廢不發布，避免電量掛到錯的分享器 ID
+- **已知限制**：讀取是同步 HTTP，連著支援的分享器時每 60 秒約有 2 秒 `mqttClient.loop()` 不跑，
+  這段期間 App 的繼電器指令會延後到讀完才動作；重新登入時更久
+
+**實測狀態**：編譯通過；燒錄時 COM4 斷線，尚未實機驗證新 topic。
+
 ### 1.10.6
 
 - **修正隨身 WiFi 登入不成立（實機讀到電量的關鍵修正）**：登入請求 `/login.cgi?Action=Digest&...`

@@ -143,12 +143,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `mv`: 電池電壓（毫伏）
     - `percent`: 電量百分比，走 2S 鋰電放電曲線查表，非線性換算
     - `valid`: 讀值是否有效；還沒量到第一筆時為 false
-  - `mifi`: 隨身 WiFi 的電量（hoRelay2，對 WiFi 閘道讀 ASR 方案 MiFi 管理頁、讀得到才有，
-    **App 端必須容忍缺席**）。欄位與流程見 `ho_relay2/readme.md` 1.10.1～1.10.3
-    - `ssid`／`rssi`／`ip`（分享器 IP）／`mac`（分享器 BSSID）：分享器本身資訊
-    - `bat`: 0 無電池／1 有；`level`: 分段字串（如 `">20"`），不是數字
-    - `power_in`: 0 沒插電；`charge`: 0 未充電／1 充電中／2 已充滿
-    - `valid`: 連續讀取失敗 3 次轉 false；`age`: 距上次讀到的秒數
+  - `mifi_id`: 透過哪台隨身 WiFi 上網（如 `mifi-f8160cb4bc5f`），hoRelay2 讀得到分享器電量才有，
+    **App 端必須容忍缺席**。分享器資料不在這裡，見下方「隨身 WiFi（分享器）」
+
+#### 隨身 WiFi（分享器）是獨立設備（hoRelay2 1.11.0 起）
+
+控制器連著 ASR 方案 MiFi（對 WiFi 閘道讀管理頁，帳密 admin/admin）時，代分享器發布狀態：
+
+- **Topic**: `hoban/mifi-{BSSID 小寫去冒號}/status`，例如 `hoban/mifi-f8160cb4bc5f/status`
+- **約 60 秒一則、不是 retained**：沒有 LWT，retained 會讓離線很久的電量看起來像即時資料。
+  收到就代表剛剛有控制器讀到；幾分鐘沒收到就視為離線
+- **欄位**: `device_id`、`model`（`"MiFi"`）、`status`、`ssid`、`ip`（分享器 IP）、`mac`、
+  `battery{bat, level, power_in, charge}`、`valid`、`age`、`via`（代為回報的控制器 ID）、
+  `rssi`（該控制器收到的訊號）
+  - `bat`: 0 無電池／1 有；`level`: 分段字串（如 `">20"`），不是數字
+  - `power_in`: 0 沒插電；`charge`: 0 未充電／1 充電中／2 已充滿
+  - `valid`: 連續讀取失敗 3 次轉 false；`age`: 距上次讀到的秒數
+- 同一台分享器下有多台控制器時，每台都會發到同一個 topic
+- 流程、陷阱與限制見 `ho_relay2/readme.md` 1.10.x～1.11.0 與 `.claude/rules/mifi-asr-login-quirks.md`
 
 ### 4. OTA 韌體更新
 
