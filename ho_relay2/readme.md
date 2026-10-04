@@ -224,6 +224,21 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ## 版本記錄
 
+### 1.10.6
+
+- **修正隨身 WiFi 登入不成立（實機讀到電量的關鍵修正）**：登入請求 `/login.cgi?Action=Digest&...`
+  本身也要帶 `Authorization` header（格式同讀取，nc=00000001），之後讀取從 nc=00000002 起算。
+  原始規格漏了這條，沒帶的話登入照樣回 200，但讀 status1 只拿到
+  `<login_status>UNAUTHORIZED</login_status>`。依據是管理頁 `js/base/ajax_calls.js` 的 `authentication()`
+- **實測（2026-10-04）**：hoban-10b41d4afe30 連 HBTech（realm "Highwmg"，型號 JZ10_ZHONGXING），
+  開機 9 秒讀到 `mifi: {bat:1, level:">20", power_in:0, charge:0, valid:true}`
+
+### 1.10.4
+
+- **修正隨身 WiFi 永遠讀不到電量**：status1 實測要 1.6～1.9 秒才回（realm "Highwmg" 機種，
+  2026-10-04），原本讀取逾時 2 秒，加上 Modem-sleep 的收包延遲就超時。
+  連線逾時維持 2 秒（不支援的設備仍快速失敗），讀取逾時放寬到 8 秒；最壞阻塞約 24 秒
+
 ### 1.10.3
 
 - `mifi` 物件加上分享器本身的資訊：`ssid`（WiFi 名稱）、`rssi`（訊號強度）、

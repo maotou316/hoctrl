@@ -13,7 +13,7 @@
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 #include <MD5Builder.h>         // 隨身 WiFi 管理頁的 HTTP Digest 認證
 
-const char* firmwareVersion = "1.10.3"; // 當前韌體版本
+const char* firmwareVersion = "1.10.6"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -610,21 +610,25 @@ void addBatteryToStatus(JsonDocument& doc) {
 // 任何網路都會試，不是這種機種（家用路由器等）會在第一個請求就失敗
 // （沒有 WWW-Authenticate 或 404），之後 10 分鐘才再試一次，成本很低。
 // 換了 AP（BSSID 或閘道變了）就清掉舊資料與 session 重新來過。
-// HTTP 是阻塞的，連線／讀取逾時各 2 秒，最壞一輪（登入 2 次請求 + 讀取，失敗再重登重讀）
-// 約 12 秒，仍在 MQTT keepAlive 30 秒（broker 45 秒才踢）之內。
+// HTTP 是阻塞的。連線逾時 2 秒（不支援的設備很快失敗），讀取逾時 8 秒：
+// 實測（2026-10-04，realm "Highwmg" 機種）status1 要 1.6～1.9 秒才回，1.10.3 以前讀取也設 2 秒，
+// 加上 Modem-sleep 的收包延遲就超時，永遠讀不到。最壞一輪（登入 2 次請求 + 讀取，失敗再重登重讀）
+// 約 24 秒，仍在 MQTT keepAlive 30 秒（broker 45 秒才踢）之內。
 //
 // 認證流程（機器的 Digest 實作有自己的規矩，照抄，不要「修正」成標準 Digest）：
 //   1. GET /login.cgi 取 WWW-Authenticate 的 realm/nonce/qop
-//   2. GET /login.cgi?Action=Digest&...，HA2 = md5("GET:/cgi/protected.cgi")，nc 固定 00000001
+//   2. GET /login.cgi?Action=Digest&...，HA2 = md5("GET:/cgi/protected.cgi")，nc 固定 00000001；
+//      這個請求本身也要帶第 3 步格式的 Authorization（nc=00000001），否則 session 不成立
 //   3. GET /xml_action.cgi?...，Authorization 的 uri 固定寫 /cgi/xml_action.cgi（不是實際路徑），
-//      nonce 沿用登入那個，nc 每個請求加 1
+//      nonce 沿用登入那個，nc 每個請求加 1（登入用掉 1，第一次讀取是 00000002）
 // session 約 10 分鐘逾時，逾時後讀取回 200 但 body 是空的（不回 401），
 // 所以「找不到 Battery_connect」就重新登入再試一次。有人用瀏覽器登入管理頁會互踢，同一套機制涵蓋。
 const char* MIFI_USER = "admin";
 const char* MIFI_PASS = "admin";
 const unsigned long MIFI_POLL_INTERVAL_MS = 60000;      // 讀到過資料：每分鐘一次（電量只有分段變化）
 const unsigned long MIFI_PROBE_INTERVAL_MS = 600000;    // 從沒讀到過：10 分鐘再試（多半不是這種機種）
-const uint16_t MIFI_HTTP_TIMEOUT_MS = 2000;
+const uint16_t MIFI_CONNECT_TIMEOUT_MS = 2000;
+const uint16_t MIFI_READ_TIMEOUT_MS = 8000;
 const int MIFI_STALE_FAILS = 3;                         // 連續失敗幾次就把 valid 標成 false
 // 回應大小上限。status1 XML 實際只有幾 KB；不支援的設備（例如攔截網頁的公共 WiFi）
 // 可能對任何網址都回一大頁 HTML，不設上限會把整頁讀進記憶體
@@ -730,12 +734,26 @@ class CappedStringStream : public Stream {
   size_t cap_;
 };
 
+// 產生 xml_action.cgi 用的 Digest Authorization，每呼叫一次 nc 加 1。
+// 照抄管理頁 js/base/utils.js 的 getAuthHeader()：uri 固定 /cgi/xml_action.cgi
+static String mifiAuthHeader() {
+  mifiNc++;
+  char nc[9];
+  snprintf(nc, sizeof(nc), "%08x", (unsigned)mifiNc);
+  String cnonce = mifiCnonce();
+  String ha2 = md5Hex("GET:/cgi/xml_action.cgi");
+  String res = md5Hex(mifiHa1 + ":" + mifiNonce + ":" + nc + ":" + cnonce + ":" + mifiQop + ":" + ha2);
+  return String("Digest username=\"") + MIFI_USER + "\", realm=\"" + mifiRealm +
+         "\", nonce=\"" + mifiNonce + "\", uri=\"/cgi/xml_action.cgi\", response=\"" + res +
+         "\", qop=" + mifiQop + ", nc=" + nc + ", cnonce=\"" + cnonce + "\"";
+}
+
 static bool mifiLogin() {
   mifiLoggedIn = false;
   WiFiClient client;
   HTTPClient http;
-  http.setConnectTimeout(MIFI_HTTP_TIMEOUT_MS);
-  http.setTimeout(MIFI_HTTP_TIMEOUT_MS);
+  http.setConnectTimeout(MIFI_CONNECT_TIMEOUT_MS);
+  http.setTimeout(MIFI_READ_TIMEOUT_MS);
 
   // 1. 取 challenge。HTTPClient 不先 collectHeaders() 就拿不到 WWW-Authenticate
   if (!http.begin(client, mifiHost + "/login.cgi")) return false;
@@ -766,33 +784,30 @@ static bool mifiLogin() {
                "&realm=" + urlEncode(mifiRealm) + "&nonce=" + urlEncode(mifiNonce) +
                "&response=" + res + "&qop=" + mifiQop + "&cnonce=" + cnonce + "&temp=asr";
   if (!http.begin(client, url)) return false;
+  // 登入請求本身也要帶 Authorization（nc=00000001）。原始規格沒寫這條，
+  // 但管理頁 js/base/ajax_calls.js 的 authentication() 有帶；沒帶的話登入照樣回 200，
+  // session 卻不成立，之後讀 status1 只拿到 <login_status>UNAUTHORIZED</login_status>
+  // （2026-10-04 實機查到）。之前從電腦測會成功，是沿用了瀏覽器的 session。
+  mifiNc = 0;
+  http.addHeader("Authorization", mifiAuthHeader());
   code = http.GET();
   http.end();
   if (code != 200) {
     Serial.printf("MiFi：登入失敗（HTTP %d）\n", code);
     return false;
   }
-  mifiNc = 1;  // 登入用掉 00000001
   mifiLoggedIn = true;
   return true;
 }
 
 // 讀 status1 並解析電池欄位。找不到 Battery_connect（session 過期回空 body）就回 false
 static bool mifiFetchStatus() {
-  mifiNc++;
-  char nc[9];
-  snprintf(nc, sizeof(nc), "%08x", (unsigned)mifiNc);
-  String cnonce = mifiCnonce();
-  String ha2 = md5Hex("GET:/cgi/xml_action.cgi");
-  String res = md5Hex(mifiHa1 + ":" + mifiNonce + ":" + nc + ":" + cnonce + ":" + mifiQop + ":" + ha2);
-  String authHeader = String("Digest username=\"") + MIFI_USER + "\", realm=\"" + mifiRealm +
-                      "\", nonce=\"" + mifiNonce + "\", uri=\"/cgi/xml_action.cgi\", response=\"" + res +
-                      "\", qop=" + mifiQop + ", nc=" + nc + ", cnonce=\"" + cnonce + "\"";
+  String authHeader = mifiAuthHeader();
 
   WiFiClient client;
   HTTPClient http;
-  http.setConnectTimeout(MIFI_HTTP_TIMEOUT_MS);
-  http.setTimeout(MIFI_HTTP_TIMEOUT_MS);
+  http.setConnectTimeout(MIFI_CONNECT_TIMEOUT_MS);
+  http.setTimeout(MIFI_READ_TIMEOUT_MS);
   if (!http.begin(client, mifiHost + "/xml_action.cgi?method=get&module=duster&file=status1")) {
     return false;
   }
