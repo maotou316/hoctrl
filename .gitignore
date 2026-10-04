@@ -11,3 +11,7 @@
 # Python 位元碼快取（跑 tools/ 的模擬腳本時產生）
 __pycache__/
 *.pyc
+.worktrees/
+
+# publish.py 的本機私密檔（HoLuCam 發版 token 等，repo 公開，絕不可 commit）
+publish_secrets.json

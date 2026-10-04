@@ -8,6 +8,8 @@ hoRelay 韌體發布自動化腳本（支援 hoRelay1～3）
 
 環境變數（HoLuCam 後台登記用）:
   HOLUCAM_FIRMWARE_PUBLISH_TOKEN  後台發版 token；沒設就略過後台登記（黃色警告，不中止發版）
+                                  也可寫在同目錄的 publish_secrets.json（已 gitignore，
+                                  格式見 publish_secrets.example.json）；環境變數優先
   HOLUCAM_API_BASE                後台網址，預設 https://holucam.neuter.online
                                   （必須 https；只有 http://localhost、http://127.0.0.1 可用 http）
 
@@ -1026,8 +1028,31 @@ def _holucam_api_base():
     return (os.getenv('HOLUCAM_API_BASE') or HOLUCAM_API_BASE_DEFAULT).strip().rstrip('/')
 
 
+# 本機私密檔（已列入 .gitignore，repo 是公開的，token 絕不可寫進原始碼）
+PUBLISH_SECRETS_FILE = Path(__file__).resolve().parent / 'publish_secrets.json'
+
+
+def _load_publish_secrets():
+    """讀本機私密檔；檔案不存在回 {}，格式壞掉印紅字後回 {}（不印出內容）。"""
+    if not PUBLISH_SECRETS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(PUBLISH_SECRETS_FILE.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError) as e:
+        print_color(f"❌ 無法讀取 {PUBLISH_SECRETS_FILE.name}：{type(e).__name__}，請檢查 JSON 格式", Colors.RED)
+        return {}
+    if not isinstance(data, dict):
+        print_color(f"❌ {PUBLISH_SECRETS_FILE.name} 最外層必須是 JSON 物件", Colors.RED)
+        return {}
+    return data
+
+
 def _holucam_publish_token():
-    return (os.getenv('HOLUCAM_FIRMWARE_PUBLISH_TOKEN') or '').strip()
+    # 環境變數優先，其次才是本機私密檔
+    token = os.getenv('HOLUCAM_FIRMWARE_PUBLISH_TOKEN')
+    if not token:
+        token = _load_publish_secrets().get('HOLUCAM_FIRMWARE_PUBLISH_TOKEN')
+    return (token if isinstance(token, str) else '').strip()
 
 
 # 只有本機測試可以用 http；其他一律要 https，否則 token 會以明文送出去。
@@ -1112,7 +1137,8 @@ def register_holucam_backend(model, version, download_url, changelog, min_versio
     print_header(f"登記 HoLuCam 後台：{model}")
     token = _holucam_publish_token()
     if not token:
-        print_color("⚠ 未設定 HOLUCAM_FIRMWARE_PUBLISH_TOKEN，略過 HoLuCam 後台登記"
+        print_color("⚠ 未設定 HOLUCAM_FIRMWARE_PUBLISH_TOKEN（環境變數與 publish_secrets.json 都沒有），"
+                    "略過 HoLuCam 後台登記"
                     "（新版 HoLuCam App 會看不到這一版，請之後到後台韌體頁手動登記）", Colors.YELLOW)
         return 'skipped', '未設定 HOLUCAM_FIRMWARE_PUBLISH_TOKEN'
 

@@ -212,6 +212,8 @@ $env:HOLUCAM_FIRMWARE_PUBLISH_TOKEN = "（向後台管理者索取）"
 python publish.py 2 -c "修正 WiFi 連接問題"
 ```
 
+不想設環境變數的話，把 `publish_secrets.example.json` 複製成 `publish_secrets.json`（同目錄，已列入 `.gitignore`）並填入 token。環境變數有設時以環境變數為準。**本 repo 是公開的，token 絕不可寫進 `publish.py` 或任何會 commit 的檔案。**
+
 ### 上傳優先順序
 
 1. **GitHub Releases**（需安裝 gh CLI）— 上傳至 `maotou316/hoctrl-firmware`
