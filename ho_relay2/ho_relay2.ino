@@ -13,7 +13,7 @@
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 #include <MD5Builder.h>         // 隨身 WiFi 管理頁的 HTTP Digest 認證
 
-const char* firmwareVersion = "1.10.2"; // 當前韌體版本
+const char* firmwareVersion = "1.10.3"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -867,11 +867,17 @@ void pollMifi() {
   if (mifiNextPollAt == 0) mifiNextPollAt = 1;  // 0 是哨兵值，避開它
 }
 
-// 隨身 WiFi 電量掛進 status JSON，約多 90 bytes。PubSubClient 緩衝區 512，
-// 加上 battery 後整包仍在 450 bytes 以內，再加欄位前要重算。
+// 隨身 WiFi 的資訊與電量掛進 status JSON。只有讀到過電量（確定是支援的分享器）才帶，
+// 這樣 App 看到 mifi 物件就代表「設備連的是隨身 WiFi」。
+// ssid/rssi 與 wifi 物件重複，是刻意的：App 只看 mifi 就拿得到全部分享器資料。
+// 最壞（SSID 32 bytes）約 170 bytes，整包約 510 bytes，所以 setBufferSize() 由 512 放大到 768。
 void addMifiToStatus(JsonDocument& doc) {
   if (!mifiHasData) return;
   JsonObject mifi = doc.createNestedObject("mifi");
+  mifi["ssid"] = WiFi.SSID();
+  mifi["rssi"] = WiFi.RSSI();
+  mifi["ip"] = WiFi.gatewayIP().toString();  // 分享器本身的 IP（管理頁位址）
+  mifi["mac"] = WiFi.BSSIDstr();             // 分享器的 MAC（BSSID）
   mifi["bat"] = mifiBatConnect;
   mifi["level"] = mifiBatLevel;
   mifi["power_in"] = mifiPowerIn;
@@ -2301,7 +2307,8 @@ bool quickConnectToIndex(int index) {
   // 約 200 bytes 加上 topic 35 bytes 就已逼近上限——publish() 會靜默回傳 false，
   // 序列埠卻照印「已發布狀態」。2026-08-16 實測：訂閱 45 秒只收到 3 則，而不是
   // 每 3 秒一則。放大到 512 才夠這份 JSON 用。
-  mqttClient.setBufferSize(512);
+  // 1.10.3 加了 mifi 物件（隨身 WiFi 資訊與電量），最壞整包約 510 bytes，再放大到 768。
+  mqttClient.setBufferSize(768);
 
   unsigned long startTime = millis();
   const char* deviceId = getDeviceId();
@@ -2379,7 +2386,8 @@ bool quickConnectCustom() {
   // 約 200 bytes 加上 topic 35 bytes 就已逼近上限——publish() 會靜默回傳 false，
   // 序列埠卻照印「已發布狀態」。2026-08-16 實測：訂閱 45 秒只收到 3 則，而不是
   // 每 3 秒一則。放大到 512 才夠這份 JSON 用。
-  mqttClient.setBufferSize(512);
+  // 1.10.3 加了 mifi 物件（隨身 WiFi 資訊與電量），最壞整包約 510 bytes，再放大到 768。
+  mqttClient.setBufferSize(768);
 
   unsigned long startTime = millis();
   const char* deviceId = getDeviceId();

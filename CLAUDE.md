@@ -144,7 +144,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `percent`: 電量百分比，走 2S 鋰電放電曲線查表，非線性換算
     - `valid`: 讀值是否有效；還沒量到第一筆時為 false
   - `mifi`: 隨身 WiFi 的電量（hoRelay2，對 WiFi 閘道讀 ASR 方案 MiFi 管理頁、讀得到才有，
-    **App 端必須容忍缺席**）。欄位與流程見 `ho_relay2/readme.md` 1.10.1
+    **App 端必須容忍缺席**）。欄位與流程見 `ho_relay2/readme.md` 1.10.1～1.10.3
+    - `ssid`／`rssi`／`ip`（分享器 IP）／`mac`（分享器 BSSID）：分享器本身資訊
     - `bat`: 0 無電池／1 有；`level`: 分段字串（如 `">20"`），不是數字
     - `power_in`: 0 沒插電；`charge`: 0 未充電／1 充電中／2 已充滿
     - `valid`: 連續讀取失敗 3 次轉 false；`age`: 距上次讀到的秒數
