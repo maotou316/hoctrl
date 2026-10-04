@@ -13,7 +13,7 @@
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 #include <MD5Builder.h>         // 隨身 WiFi 管理頁的 HTTP Digest 認證
 
-const char* firmwareVersion = "1.11.1"; // 當前韌體版本
+const char* firmwareVersion = "1.11.2"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -646,6 +646,7 @@ int mifiBatConnect = -1;              // Battery_connect：0 無電池，1 有
 String mifiBatLevel;                  // Battery_voltage：分段字串（例如 ">20"），機器不給精確數字
 int mifiPowerIn = -1;                 // Battery_charging：0 沒插電
 int mifiChargeState = -1;             // Battery_charge：0 未充電，1 充電中，2 已充滿
+String mifiFwVersion;                 // 分享器自己的韌體版本（sysinfo 的 version_num），讀不到為空
 unsigned long mifiLastOkAt = 0;
 int mifiFailCount = 0;
 unsigned long mifiNextPollAt = 0;     // 0 = 立刻可試
@@ -837,6 +838,8 @@ static bool mifiFetchStatus() {
   mifiBatLevel = level;
   mifiPowerIn = xmlTagValue(body, "Battery_charging", charging) ? charging.toInt() : -1;
   mifiChargeState = xmlTagValue(body, "Battery_charge", charge) ? charge.toInt() : -1;
+  String fw;
+  mifiFwVersion = xmlTagValue(body, "version_num", fw) ? fw : String();
   return true;
 }
 
@@ -897,16 +900,16 @@ void pollMifi() {
   if (mifiNextPollAt == 0) mifiNextPollAt = 1;  // 0 是哨兵值，避開它
 }
 
-// 分享器的設備 ID：mifi-{BSSID 小寫去冒號}，例如 mifi-f8160cb4bc5f。
+// 分享器的設備 ID：HOBAN-MIFI-{BSSID 大寫去冒號}，例如 HOBAN-MIFI-F8160CB4BC5F（全部大寫，2026-10-04 指定）。
 // 用分享器自己的 MAC 而不是控制器的 ID，換哪台控制器回報都是同一個 ID。
 String mifiDeviceId() {
   String mac = WiFi.BSSIDstr();
   mac.replace(":", "");
-  mac.toLowerCase();
-  return "mifi-" + mac;
+  mac.toUpperCase();
+  return "HOBAN-MIFI-" + mac;
 }
 
-// 以分享器自己的身分發布到 hoban/mifi-{MAC}/status，和控制器平行、不掛在控制器底下。
+// 以分享器自己的身分發布到 hoban/HOBAN-MIFI-{MAC}/status，和控制器平行、不掛在控制器底下。
 // 每次輪詢（約 60 秒）發一則，不跟控制器每 3 秒的狀態走。
 // 同一台分享器下有多台控制器時，每台都會發到同一個 topic，via 標示是誰發的。
 //
@@ -919,9 +922,10 @@ void publishMifiStatus() {
   String id = mifiDeviceId();
   String topic = "hoban/" + id + "/status";
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   doc["device_id"] = id;
   doc["model"] = "MiFi";
+  doc["version"] = mifiFwVersion;        // 分享器自己的韌體，例如 JZ10_ZHONGXING_20260123_V1.0.1
   doc["status"] = "online";
   doc["ssid"] = WiFi.SSID();
   doc["ip"] = WiFi.gatewayIP().toString();  // 分享器本身的 IP（管理頁位址）
@@ -934,9 +938,11 @@ void publishMifiStatus() {
   doc["valid"] = (mifiFailCount < MIFI_STALE_FAILS);
   doc["age"] = (millis() - mifiLastOkAt) / 1000;
   doc["via"] = getDeviceId();           // 代為回報的控制器
+  doc["via_version"] = firmwareVersion;  // 該控制器的韌體版本
   doc["rssi"] = WiFi.RSSI();            // 該控制器收到的分享器訊號
 
-  char buffer[512];
+  // SSID 32 bytes、分享器版本字串 40 bytes 時約 470 bytes，加 topic 仍在 setBufferSize(768) 內
+  char buffer[640];
   size_t len = serializeJson(doc, buffer, sizeof(buffer));
   bool okPub = mqttClient.publish(topic.c_str(), (const uint8_t*)buffer, len, false);
   Serial.printf("發布分享器狀態 %s - %s\n", topic.c_str(), okPub ? "成功" : "失敗");
