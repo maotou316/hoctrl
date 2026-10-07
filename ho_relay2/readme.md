@@ -224,6 +224,16 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ## 版本記錄
 
+### 1.11.5
+
+- 分享器訊息的 `battery` 加上 `percent`（整數）：`level` 是純數字時才帶，分段值（如 `">20"`）不帶
+- 實測兩種 ASR 方案機種（2026-10-07）：
+  - JZ10_ZHONGXING（硬體 NZ_SSG_V20，管理頁 192.168.100.1）：`Battery_voltage` 只給分段 `">20"`。
+    `Engineer_parameter`、`device_management` 都沒有更細的電池資料，只開 53／80 port，沒有其他管道
+  - MF808_HP（韌體 MF808_HP_V51_SER_DE_LA_260116_CN，管理頁 192.168.0.1）：`Battery_voltage` 給精確百分比
+    `"70"`；`Battery_charging` 出現規格外的 3，它的管理頁只看 `Battery_charge` 判斷充電
+- `power_in` 維持原樣轉發，文件註明各機種定義不同、判斷充電要看 `charge`
+
 ### 1.11.3
 
 - 分享器 ID 改成全部大寫的 `HOBAN-MIFI-{BSSID 去冒號}`，例如 `HOBAN-MIFI-F8160CB4BC5F`，

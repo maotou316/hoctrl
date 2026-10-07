@@ -932,8 +932,19 @@ void publishMifiStatus() {
   doc["mac"] = WiFi.BSSIDstr();
   JsonObject battery = doc.createNestedObject("battery");
   battery["bat"] = mifiBatConnect;      // 0 無電池，1 有
-  battery["level"] = mifiBatLevel;      // 分段字串，例如 ">20"
-  battery["power_in"] = mifiPowerIn;    // 0 沒插電
+  battery["level"] = mifiBatLevel;      // 分享器原始字串：分段（如 ">20"）或數字（如 "70"）
+  // level 是純數字（MF808_HP 這類機種給的是精確百分比）才另外帶 percent；
+  // 分段值（JZ10_ZHONGXING 的 ">20"）換算不出數字，就不帶，訂閱端要容忍缺席
+  if (mifiBatLevel.length() > 0 && mifiBatLevel.length() <= 3) {
+    bool digits = true;
+    for (size_t i = 0; i < mifiBatLevel.length(); i++) {
+      if (!isdigit((unsigned char)mifiBatLevel[i])) { digits = false; break; }
+    }
+    if (digits && mifiBatLevel.toInt() <= 100) battery["percent"] = mifiBatLevel.toInt();
+  }
+  // power_in 原樣轉發 Battery_charging，各機種定義不同（MF808_HP 出現過規格外的 3，
+  // 它的管理頁也不看這欄），判斷充電狀態請看 charge
+  battery["power_in"] = mifiPowerIn;
   battery["charge"] = mifiChargeState;  // 0 未充電，1 充電中，2 已充滿
   doc["valid"] = (mifiFailCount < MIFI_STALE_FAILS);
   doc["age"] = (millis() - mifiLastOkAt) / 1000;
