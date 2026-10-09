@@ -231,10 +231,12 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 - 實測 M603SX（韌體 `M603SX2.6_FI_DANENG_SL_V01.01.02P42U28_02`，管理頁 192.168.0.1，2026-10-09）：
   - 電量只有 `battery_pers` 格數 `"0"`～`"4"`，`battery_vol_percent` 等欄位都是空的 →
     `percent` 用「格數 × 25」換算（誤差最大約 ±12%），`level` 帶原始格數（例 `"3/4"`）
-  - `battery_charging` `"1"` = 充電中 → `charge` 1；這款不區分「已充滿」
+  - `battery_charging` `"1"` = 充電中 → `charge` 1、`power_in` 1；不在充電時 `power_in` 送 -1（未知）——
+    它的意思是「正在充電」不是 ASR 的「有沒有插電」，充滿時是 0，照抄會誤報沒插電。這款不區分「已充滿」
   - 讀取不需要 Referer。實測時電腦瀏覽器已登入，**未登入能否讀到格數尚未驗證**：
-    讀到空值才 `POST /reqproc/proc_post goformId=LOGIN&password=Base64(admin)`，10 分鐘最多試一次
-    （這款開了 LOGIN_SECURITY_SUPPORT，連續打錯密碼會鎖管理頁）
+    讀到空值才 `POST /reqproc/proc_post goformId=LOGIN&password=Base64(admin)`。這款開了
+    LOGIN_SECURITY_SUPPORT（連續打錯密碼會鎖管理頁），所以 `loginfo` 已是 ok 仍讀不到就不登入、
+    被拒一次就在這個網路停手、其餘 10 分鐘最多一次；一輪阻塞超過 15 秒就不再登入／重讀，留給下一輪
 
 ### 1.11.5
 

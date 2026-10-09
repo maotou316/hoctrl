@@ -616,7 +616,7 @@ void addBatteryToStatus(JsonDocument& doc) {
 // HTTP 是阻塞的。連線逾時 2 秒（不支援的設備很快失敗），讀取逾時 8 秒：
 // 實測（2026-10-04，realm "Highwmg" 機種）status1 要 1.6～1.9 秒才回，1.10.3 以前讀取也設 2 秒，
 // 加上 Modem-sleep 的收包延遲就超時，永遠讀不到。最壞一輪（登入 2 次請求 + 讀取，失敗再重登重讀）
-// 約 24 秒，仍在 MQTT keepAlive 30 秒（broker 45 秒才踢）之內。
+// 約 24 秒，仍在 MQTT keepAlive 30 秒（broker 45 秒才踢）之內。reqproc 機種另有 15 秒預算（見下方 reqproc 段）。
 //
 // 認證流程（機器的 Digest 實作有自己的規矩，照抄，不要「修正」成標準 Digest）：
 //   1. GET /login.cgi 取 WWW-Authenticate 的 realm/nonce/qop
@@ -653,7 +653,9 @@ int mifiBatPercent = -1;              // 機種本身沒給數字、由格數換
 // 管理頁的方案。同一個網路（netKey）認定一次就不再試另一種，換網路時重設
 enum MifiKind { MIFI_KIND_UNKNOWN, MIFI_KIND_ASR, MIFI_KIND_REQPROC };
 MifiKind mifiKind = MIFI_KIND_UNKNOWN;
-unsigned long mifiReqprocLoginAt = 0;  // 上次嘗試 reqproc 登入的時間，0 = 沒試過
+unsigned long mifiReqprocLoginAt = 0;  // 上次嘗試 reqproc 登入的時間
+bool mifiReqprocLoginTried = false;    // 這個網路試過登入沒（不拿 LoginAt == 0 當哨兵，millis 繞回會撞上）
+bool mifiReqprocLoginBlocked = false;   // 這個網路登入被拒過（密碼不是 admin）：不再試，免得鎖住管理頁
 unsigned long mifiLastOkAt = 0;
 int mifiFailCount = 0;
 unsigned long mifiNextPollAt = 0;     // 0 = 立刻可試
@@ -868,9 +870,13 @@ static bool mifiReadAsr() {
 //   誤差最大約 ±12%。battery_charging "1" = 充電中
 // - 登入：POST /reqproc/proc_post，goformId=LOGIN&password=Base64(密碼)（管理頁 PASSWORD_ENCODE=true），
 //   result "0" 或 "4" 成功。實測時電腦的瀏覽器已登入（loginfo=ok），**沒登入時 battery_pers 是否
-//   照給尚未驗證**，所以只在讀到空值時才登入，而且 10 分鐘最多試一次：
-//   這款開了 LOGIN_SECURITY_SUPPORT，密碼錯太多次會把管理頁鎖住，不能每分鐘狂試
+//   照給尚未驗證**，所以只在讀到空值時才登入。這款開了 LOGIN_SECURITY_SUPPORT，密碼錯太多次會把
+//   管理頁鎖住，所以：loginfo 已是 ok 還讀不到（這台本來就不給電量）不登入；被拒一次就在這個網路停手；
+//   其餘 10 分鐘最多試一次
+// - 阻塞預算：一次 pollMifi 之內，前面已花超過 MIFI_REQPROC_BUDGET_MS 就不再發登入／重讀，
+//   最壞約 ASR 探測 10 秒＋GET 10 秒＋登入 10 秒 ≈ 20～30 秒，與 ASR 一輪同級
 const unsigned long MIFI_REQPROC_LOGIN_INTERVAL_MS = 600000;
+const unsigned long MIFI_REQPROC_BUDGET_MS = 15000;
 const size_t MIFI_REQPROC_MAX_BODY = 2048;
 
 // 讀一次 proc_get，解析成功（是 JSON 物件）才回 true
@@ -904,34 +910,50 @@ static bool mifiReqprocLogin() {
   if (!http.begin(client, mifiHost + "/reqproc/proc_post")) return false;
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
   int code = http.POST("goformId=LOGIN&password=" + urlEncode(base64::encode(MIFI_PASS)));
-  String body = (code == 200 && http.getSize() <= (int)MIFI_REQPROC_MAX_BODY) ? http.getString() : String();
+  String body;
+  if (code == 200 && http.getSize() <= (int)MIFI_REQPROC_MAX_BODY) {
+    CappedStringStream sink(body, MIFI_REQPROC_MAX_BODY);  // getSize() == -1（chunked）也要擋上限
+    if (http.writeToStream(&sink) < 0) body = "";
+  }
   http.end();
   StaticJsonDocument<128> doc;
   if (deserializeJson(doc, body) != DeserializationError::Ok) {
-    Serial.printf("MiFi(reqproc)：登入失敗（HTTP %d）\n", code);
-    return false;
+    Serial.printf("MiFi(reqproc)：登入沒有回應（HTTP %d）\n", code);
+    return false;  // 網路問題，不算被拒，之後照間隔再試
   }
   const String res = doc["result"].as<String>();  // 字串或數字都收
   const bool ok = res == "0" || res == "4";
-  Serial.printf("MiFi(reqproc)：登入%s（result %s）\n", ok ? "成功" : "失敗", res.c_str());
+  if (!ok) mifiReqprocLoginBlocked = true;  // 密碼被拒：這個網路不再試，免得累積錯誤次數鎖住管理頁
+  Serial.printf("MiFi(reqproc)：登入%s（result %s）\n", ok ? "成功" : "被拒，這個網路不再嘗試", res.c_str());
   return ok;
 }
 
-// battery_pers 必須是單一數字 0～4，否則視為沒讀到（空字串＝多半是沒登入）
+// battery_pers 必須是 0～4（字串或數字都收），否則視為沒讀到（空字串＝多半是沒登入）
 static int reqprocBars(JsonDocument& doc) {
-  const char* p = doc["battery_pers"] | "";
+  JsonVariant v = doc["battery_pers"];
+  if (v.is<int>()) {
+    int n = v.as<int>();
+    return (n >= 0 && n <= 4) ? n : -1;
+  }
+  const char* p = v | "";
   if (strlen(p) != 1 || p[0] < '0' || p[0] > '4') return -1;
   return p[0] - '0';
 }
 
-static bool mifiReadReqproc() {
+static bool mifiReadReqproc(unsigned long startedAt) {
   StaticJsonDocument<512> doc;
   if (!mifiReqprocGet(doc)) return false;  // 不是這種機種：404 或不是 JSON
   int bars = reqprocBars(doc);
   if (bars < 0) {
-    if (mifiReqprocLoginAt != 0 && millis() - mifiReqprocLoginAt < MIFI_REQPROC_LOGIN_INTERVAL_MS) return false;
+    // 已登入還讀不到 → 這台本來就不給電量（家用 4G 路由器等），登入也沒用，別去累積錯誤次數
+    const char* loginfo = doc["loginfo"] | "";
+    if (strcmp(loginfo, "ok") == 0 || mifiReqprocLoginBlocked) return false;
+    if (mifiReqprocLoginTried && millis() - mifiReqprocLoginAt < MIFI_REQPROC_LOGIN_INTERVAL_MS) return false;
+    if (millis() - startedAt > MIFI_REQPROC_BUDGET_MS) return false;  // 這輪已經阻塞太久，下一輪再登入
+    mifiReqprocLoginTried = true;
     mifiReqprocLoginAt = millis();
     if (!mifiReqprocLogin()) return false;
+    if (millis() - startedAt > MIFI_REQPROC_BUDGET_MS) return false;  // 登入花太久，重讀留給下一輪
     doc.clear();
     if (!mifiReqprocGet(doc)) return false;
     bars = reqprocBars(doc);
@@ -942,7 +964,9 @@ static bool mifiReadReqproc() {
   mifiBatConnect = 1;
   mifiBatLevel = String(bars) + "/4";  // 原始格數，非純數字 → publish 不會把它當百分比
   mifiBatPercent = bars * 25;
-  mifiPowerIn = charging[0] ? atoi(charging) : -1;
+  // battery_charging 是「正在充電」，不是 ASR 的「有沒有插電」：插著電但已充滿時是 0，
+  // 照抄會被當成沒插電。只有充電中能確定有插電，其餘填 -1（未知）
+  mifiPowerIn = isCharging ? 1 : -1;
   mifiChargeState = isCharging ? 1 : 0;  // 這款不區分「已充滿」
   mifiFwVersion = String(doc["wa_inner_version"] | "");
   return true;
@@ -950,6 +974,7 @@ static bool mifiReadReqproc() {
 
 // 依機種分派。還沒認定機種時先試 ASR（不是 ASR 的機器 /login.cgi 會很快 404），再試 reqproc
 static bool mifiReadOnce() {
+  const unsigned long startedAt = millis();
   if (mifiKind != MIFI_KIND_REQPROC) {
     if (mifiReadAsr()) {
       mifiKind = MIFI_KIND_ASR;
@@ -957,7 +982,7 @@ static bool mifiReadOnce() {
     }
     if (mifiKind == MIFI_KIND_ASR) return false;
   }
-  if (mifiReadReqproc()) {
+  if (mifiReadReqproc(startedAt)) {
     mifiKind = MIFI_KIND_REQPROC;
     return true;
   }
@@ -982,6 +1007,8 @@ void pollMifi() {
     mifiNextPollAt = 0;
     mifiKind = MIFI_KIND_UNKNOWN;
     mifiReqprocLoginAt = 0;
+    mifiReqprocLoginTried = false;
+    mifiReqprocLoginBlocked = false;
     mifiBatPercent = -1;
   }
 
