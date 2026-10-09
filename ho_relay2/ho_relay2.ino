@@ -655,6 +655,7 @@ enum MifiKind { MIFI_KIND_UNKNOWN, MIFI_KIND_ASR, MIFI_KIND_REQPROC };
 MifiKind mifiKind = MIFI_KIND_UNKNOWN;
 unsigned long mifiReqprocLoginAt = 0;  // 上次嘗試 reqproc 登入的時間
 bool mifiReqprocLoginTried = false;    // 這個網路試過登入沒（不拿 LoginAt == 0 當哨兵，millis 繞回會撞上）
+bool mifiRetrySoon = false;            // 登入成功但這輪沒預算重讀：下一輪照一般間隔（60 秒）來讀，免得 session 過期
 bool mifiReqprocLoginBlocked = false;   // 這個網路登入被拒過（密碼不是 admin）：不再試，免得鎖住管理頁
 unsigned long mifiLastOkAt = 0;
 int mifiFailCount = 0;
@@ -953,7 +954,10 @@ static bool mifiReadReqproc(unsigned long startedAt) {
     mifiReqprocLoginTried = true;
     mifiReqprocLoginAt = millis();
     if (!mifiReqprocLogin()) return false;
-    if (millis() - startedAt > MIFI_REQPROC_BUDGET_MS) return false;  // 登入花太久，重讀留給下一輪
+    if (millis() - startedAt > MIFI_REQPROC_BUDGET_MS) {  // 登入花太久，重讀留給下一輪
+      mifiRetrySoon = true;
+      return false;
+    }
     doc.clear();
     if (!mifiReqprocGet(doc)) return false;
     bars = reqprocBars(doc);
@@ -982,6 +986,8 @@ static bool mifiReadOnce() {
     }
     if (mifiKind == MIFI_KIND_ASR) return false;
   }
+  // ASR 那段失敗可能已阻塞到 24 秒（登入＋讀取＋重登＋重讀），再發 reqproc 會超過 MQTT keepAlive
+  if (mifiKind == MIFI_KIND_UNKNOWN && millis() - startedAt > MIFI_REQPROC_BUDGET_MS) return false;
   if (mifiReadReqproc(startedAt)) {
     mifiKind = MIFI_KIND_REQPROC;
     return true;
@@ -1040,7 +1046,8 @@ void pollMifi() {
   if (mifiHasData) publishMifiStatus();
 
   // 時間戳在阻塞呼叫之後才取
-  mifiNextPollAt = millis() + ((ok || mifiHasData) ? MIFI_POLL_INTERVAL_MS : MIFI_PROBE_INTERVAL_MS);
+  mifiNextPollAt = millis() + ((ok || mifiHasData || mifiRetrySoon) ? MIFI_POLL_INTERVAL_MS : MIFI_PROBE_INTERVAL_MS);
+  mifiRetrySoon = false;
   if (mifiNextPollAt == 0) mifiNextPollAt = 1;  // 0 是哨兵值，避開它
 }
 
