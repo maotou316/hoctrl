@@ -224,6 +224,18 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ## 版本記錄
 
+### 1.12.0
+
+- 隨身 WiFi 支援第二種管理頁方案 **reqproc**（GoAhead「Demo-Webs」，API `/reqproc/proc_get`）。
+  同一個網路先試 ASR（`/login.cgi`），不是再試 reqproc，認定後不再試另一種，換網路重新判斷
+- 實測 M603SX（韌體 `M603SX2.6_FI_DANENG_SL_V01.01.02P42U28_02`，管理頁 192.168.0.1，2026-10-09）：
+  - 電量只有 `battery_pers` 格數 `"0"`～`"4"`，`battery_vol_percent` 等欄位都是空的 →
+    `percent` 用「格數 × 25」換算（誤差最大約 ±12%），`level` 帶原始格數（例 `"3/4"`）
+  - `battery_charging` `"1"` = 充電中 → `charge` 1；這款不區分「已充滿」
+  - 讀取不需要 Referer。實測時電腦瀏覽器已登入，**未登入能否讀到格數尚未驗證**：
+    讀到空值才 `POST /reqproc/proc_post goformId=LOGIN&password=Base64(admin)`，10 分鐘最多試一次
+    （這款開了 LOGIN_SECURITY_SUPPORT，連續打錯密碼會鎖管理頁）
+
 ### 1.11.5
 
 - 分享器訊息的 `battery` 加上 `percent`（整數）：`level` 是純數字時才帶，分段值（如 `">20"`）不帶
