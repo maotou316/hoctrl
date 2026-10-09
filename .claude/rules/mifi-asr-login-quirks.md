@@ -33,3 +33,16 @@ session 是**以 IP 綁定**的。電腦上開過管理頁（瀏覽器登入過�
 ESP32-C3 序列埠常讀不到（見 `flash-and-serial-trustworthiness.md` 規則四）。
 這次是暫時在 status JSON 加 `mifi_err` 欄位，放「失敗在哪一步 + HTTP code + body 前 120 字」，
 從 MQTT 讀出來才看到 UNAUTHORIZED。查完要拿掉。
+
+## 4. 電量精度看機種，不是韌體能改的
+
+同是 ASR 方案（realm "Highwmg"、同一套管理頁），`Battery_voltage` 的內容因機種而異：
+
+| 機種（status1 的 version_num） | Battery_voltage | Battery_charging |
+|---|---|---|
+| JZ10_ZHONGXING_20260123_V1.0.1 | 只給分段 `">20"` | 0 |
+| MF808_HP_V51_SER_DE_LA_260116_CN | 精確百分比 `"70"` | 3（規格外） |
+
+管理頁 JS 只是把值接上「%」顯示，不自己算。JZ10 機種已確認沒有其他管道
+（`Engineer_parameter` 全空、只開 53／80 port），不要再花時間挖。
+`Battery_charging` 各機種定義不同，MF808 的管理頁完全不看，判斷充電一律用 `Battery_charge`。
