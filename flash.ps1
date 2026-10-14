@@ -5,6 +5,7 @@
 #   .\flash.ps1 -Model 2 -Upload     # 編譯並燒錄 ho_relay2（自動偵測 COM 埠）
 #   .\flash.ps1 -Upload -KeepConfig  # 燒錄但不抹 flash（保留 EEPROM 的 WiFi/MQTT 設定）
 #   .\flash.ps1 -Upload -Port COM17  # 手動指定埠
+#   .\flash.ps1 -Model 2 -Upload -SkipCompile  # 量產：沿用上次編譯結果直接燒（設備 ID 取自 MAC，同一份 bin 通用）
 #
 # 註：這裡用的是 A:\server\arduino-cli 的 arduino-cli 1.3.1，不是 VSCode Arduino
 #     擴充自帶的 0.31.0。擴充的板子清單解析不了 esp32 core 3.3.7，所以改走指令。
@@ -14,6 +15,7 @@ param(
     [string]$Model = '2',
     [switch]$Upload,
     [switch]$KeepConfig,
+    [switch]$SkipCompile,
     [string]$Port = ''
 )
 
@@ -97,14 +99,29 @@ if ($KeepConfig) {
 }
 
 # ── 編譯 ──
-Write-Host "`n[1/2] 編譯中…" -ForegroundColor Cyan
-$libDir = Join-Path $root 'libraries'
-& $cli compile --fqbn $fqbn --libraries $libDir --output-dir $outDir $sketch
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "編譯失敗" -ForegroundColor Red
-    exit $LASTEXITCODE
+# EraseFlash 只影響燒錄、不影響產出的 bin，所以 -KeepConfig 切換不必重編
+if ($SkipCompile) {
+    $bin = Join-Path $outDir "$($cfg.Dir).ino.bin"
+    if (-not (Test-Path $bin)) {
+        Write-Host "找不到既有編譯結果：$bin，請先不帶 -SkipCompile 編譯一次" -ForegroundColor Red
+        exit 1
+    }
+    $binTime = (Get-Item $bin).LastWriteTime
+    Write-Host "`n[1/2] 略過編譯，沿用 $binTime 的編譯結果" -ForegroundColor Yellow
+    $ino = Join-Path $sketch "$($cfg.Dir).ino"
+    if ((Test-Path $ino) -and (Get-Item $ino).LastWriteTime -gt $binTime) {
+        Write-Host "警告：$($cfg.Dir).ino 在編譯後又被改過，燒進去的不是最新程式碼" -ForegroundColor Red
+    }
+} else {
+    Write-Host "`n[1/2] 編譯中…" -ForegroundColor Cyan
+    $libDir = Join-Path $root 'libraries'
+    & $cli compile --fqbn $fqbn --libraries $libDir --output-dir $outDir $sketch
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "編譯失敗" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+    Write-Host "編譯完成 → $outDir" -ForegroundColor Green
 }
-Write-Host "編譯完成 → $outDir" -ForegroundColor Green
 
 if (-not $Upload) {
     Write-Host "`n（未指定 -Upload，略過燒錄）" -ForegroundColor Gray
