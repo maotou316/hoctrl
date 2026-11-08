@@ -55,3 +55,8 @@ ESP32-C3 序列埠常讀不到（見 `flash-and-serial-trustworthiness.md` 規�
   只取 `swver`，其他欄位不要帶進 MQTT
 - 拆新機種的方法：抓管理頁首頁引用的 JS（新式介面是單一個 Vite bundle，伺服器強制 gzip，
   curl 要加 `--compressed`），搜 `battery` 找到畫面用的欄位，再往回找它是哪個 API 填的
+- **goform**（PLERY_R802，2026-11-08 實測，**韌體未支援**）：中興微 Sanechips-Webs，和 reqproc 同家族、
+  欄位同名，但路徑是 `/goform/goform_get_cmd_process?isTest=false&multi_data=1&cmd=...`。
+  電量欄位要登入才有：`POST /goform/goform_set_cmd_process`，`goformId=LOGIN&username=Base64&password=Base64`，
+  result "0"／"4" 成功；錯 5 次鎖 300 秒，登入前先讀 `psw_fail_num_str` 看剩幾次。
+  `has_battery` 欄位直接說有沒有電池（R802 是 "no"）。要支援時併入 reqproc 邏輯即可
