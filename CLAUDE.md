@@ -148,7 +148,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 #### 隨身 WiFi（分享器）是獨立設備（hoRelay2 1.11.1 起，ID 格式與版本欄位 1.11.3 起）
 
-控制器連著 ASR 方案或 reqproc 方案（M603SX，1.12.0 起）MiFi（對 WiFi 閘道讀管理頁，帳密 admin/admin）時，代分享器發布狀態：
+控制器連著 ASR 方案、reqproc 方案（M603SX，1.12.0 起）或 hbapi 方案（HB5410I，不用登入）MiFi（對 WiFi 閘道讀管理頁，帳密 admin/admin）時，代分享器發布狀態：
 
 - **Topic**: `hoban/HOBAN-MIFI-{BSSID 大寫去冒號}/status`，例如 `hoban/HOBAN-MIFI-F8160CB4BC5F/status`（ID 全部大寫）
 - **約 60 秒一則、不是 retained**：沒有 LWT，retained 會讓離線很久的電量看起來像即時資料。
@@ -161,6 +161,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `percent`: 整數 0～100，**訂閱端要容忍缺席**。`level` 是純數字時照抄；M603SX 是格數 × 25 的概略值；分段值不帶
   - `power_in`: 原樣轉發 `Battery_charging`，各機種定義不同（MF808_HP 出現規格外的 3），**不要拿來判斷充電**
   - `charge`: 0 未充電／1 充電中／2 已充滿（判斷充電狀態看這個）
+  - `bat` 為 0（沒有電池）時 `battery` 只有 `bat`，其他欄位都不帶
+- `cell`（目前只有 hbapi 機種有，**訂閱端要容忍缺席**）：`mode`（如 `"LTE"`、`"No Service"`）、`operator`（電信業者）、`signal`（訊號格數）、`sim`（1 = 正常）、`internet`（1 = 已連網）
   - `valid`: 連續讀取失敗 3 次轉 false；`age`: 距上次讀到的秒數
 - 同一台分享器下有多台控制器時，每台都會發到同一個 topic
 - 流程、陷阱與限制見 `ho_relay2/readme.md` 1.10.x～1.11.1 與 `.claude/rules/mifi-asr-login-quirks.md`

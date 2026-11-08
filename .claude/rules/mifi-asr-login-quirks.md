@@ -46,3 +46,12 @@ ESP32-C3 序列埠常讀不到（見 `flash-and-serial-trustworthiness.md` 規�
 管理頁 JS 只是把值接上「%」顯示，不自己算。JZ10 機種已確認沒有其他管道
 （`Engineer_parameter` 全空、只開 53／80 port），不要再花時間挖。
 `Battery_charging` 各機種定義不同，MF808 的管理頁完全不看，判斷充電一律用 `Battery_charge`。
+
+## 5. 不是 ASR 的機種
+
+- **reqproc**（M603SX）：見 `ho_relay2/readme.md` 1.12.0，密碼錯太多次會鎖管理頁，登入要節制
+- **hbapi**（HB5410I）：`POST /hbapi-json`，讀狀態**不用登入**。`batteryStatus "disable"` = 沒有電池，
+  此時 `batteryLevel` 的 100 是預設值，不要當成滿電。`system_getdeviceinfo` 未登入就會吐 IMEI，
+  只取 `swver`，其他欄位不要帶進 MQTT
+- 拆新機種的方法：抓管理頁首頁引用的 JS（新式介面是單一個 Vite bundle，伺服器強制 gzip，
+  curl 要加 `--compressed`），搜 `battery` 找到畫面用的欄位，再往回找它是哪個 API 填的
